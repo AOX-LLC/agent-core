@@ -1,16 +1,21 @@
+import asyncio
 import json
 import shutil
+import sqlite3
 from collections.abc import Callable
+from contextlib import closing
 from pathlib import Path
 from typing import Any
 
 import pytest
 
 from aox_agent_core import Message, Provider, Role
+from aox_agent_core.audit import AuditEvent, SQLAuditLog
 from aox_agent_core.cli import main
 from aox_agent_core.config import SecretAction
 from aox_agent_core.models import ProviderRequest
 from aox_agent_core.replay import DirectoryCassetteStore, PatternScrubber, RecordingProvider
+from aox_agent_core.storage import open_database
 from support import ScriptedProvider, response
 
 EXAMPLE_CASSETTES = Path(__file__).parents[1] / "examples" / "replays"
@@ -116,3 +121,46 @@ def test_missing_directory_is_a_usage_error(
 ) -> None:
     assert main(["cassettes", "check", str(tmp_path / "absent")]) == 2
     assert "is not a directory" in capsys.readouterr().err
+
+
+async def seeded_audit_url(tmp_path: Path) -> str:
+    url = f"sqlite:///{tmp_path / 'audit.sqlite3'}"
+    log = SQLAuditLog(open_database(url))
+    for number in range(3):
+        await log.append(
+            AuditEvent(action="model.call", actor_id="svc-1", subject_id=f"t-{number}")
+        )
+    return url
+
+
+async def test_audit_verify_reports_an_intact_chain(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    url = await seeded_audit_url(tmp_path)
+    head = await SQLAuditLog(open_database(url)).head()
+
+    exit_code = await asyncio.to_thread(
+        main, ["audit", "verify", url, "--anchor-seq", "3", "--anchor-hash", head.record_hash]
+    )
+
+    assert exit_code == 0
+    assert "OK: 3 records, chain intact and matches the anchor" in capsys.readouterr().out
+
+
+async def test_audit_verify_fails_on_an_edited_row(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    url = await seeded_audit_url(tmp_path)
+    path = url.removeprefix("sqlite:///")
+    with closing(sqlite3.connect(path)) as connection, connection:
+        connection.execute("DROP TRIGGER agent_core_audit_no_update")
+        connection.execute("UPDATE agent_core_audit SET actor_id = 'svc-2' WHERE seq = 2")
+
+    assert await asyncio.to_thread(main, ["audit", "verify", url]) == 1
+    assert "FAILED: Record 2 was altered" in capsys.readouterr().out
+
+
+def test_audit_verify_needs_a_url_and_a_whole_anchor(capsys: pytest.CaptureFixture[str]) -> None:
+    assert main(["audit", "verify"]) == 2
+    assert main(["audit", "verify", "sqlite:///x.sqlite3", "--anchor-seq", "1"]) == 2
+    assert "together" in capsys.readouterr().err

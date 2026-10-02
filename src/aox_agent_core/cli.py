@@ -1,6 +1,8 @@
-"""The aox-agent-core command line: `aox-agent-core cassettes check <dir>`."""
+"""The aox-agent-core command line: `cassettes check <dir>` and `audit verify [url]`."""
 
 import argparse
+import asyncio
+import os
 import sys
 from collections import defaultdict
 from collections.abc import Sequence
@@ -8,11 +10,14 @@ from pathlib import Path
 
 from pydantic import ValidationError
 
-from aox_agent_core.config import load_config
-from aox_agent_core.errors import AgentCoreError, CassetteFormatError
+from aox_agent_core.audit.sql import SQLAuditLog
+from aox_agent_core.audit.types import AuditHead
+from aox_agent_core.config import AUDIT_DATABASE_URL_ENV, load_config
+from aox_agent_core.errors import AgentCoreError, AuditIntegrityError, CassetteFormatError
 from aox_agent_core.replay.cassette import Cassette, request_hash
 from aox_agent_core.replay.scrub import PatternScrubber
 from aox_agent_core.replay.store import parse_cassette, recorded_content
+from aox_agent_core.storage import open_database
 
 REDACTION_MARKER = "[REDACTED:"
 
@@ -21,6 +26,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     """Run the command line and return the exit code: 0 clean, 1 problems, 2 error."""
     parser = argparse.ArgumentParser(prog="aox-agent-core")
     commands = parser.add_subparsers(dest="command", required=True)
+
     cassettes = commands.add_parser("cassettes", help="work with replay cassettes")
     cassette_commands = cassettes.add_subparsers(dest="cassette_command", required=True)
     check = cassette_commands.add_parser(
@@ -34,13 +40,35 @@ def main(argv: Sequence[str] | None = None) -> int:
         ),
     )
     check.add_argument("directory", type=Path)
+
+    audit = commands.add_parser("audit", help="work with the audit log")
+    audit_commands = audit.add_subparsers(dest="audit_command", required=True)
+    verify = audit_commands.add_parser(
+        "verify",
+        help="check the audit chain",
+        description=(
+            "Walk the audit log's hash chain and print its head. Pass the head you "
+            "saved earlier with --anchor-seq and --anchor-hash: without an anchor the "
+            "chain cannot show that it was not rewritten or cut short. Exits 1 if the "
+            "check fails. The URL is read from AGENT_CORE_AUDIT_DATABASE_URL if omitted."
+        ),
+    )
+    verify.add_argument("url", nargs="?")
+    verify.add_argument("--anchor-seq", type=int)
+    verify.add_argument("--anchor-hash")
     arguments = parser.parse_args(argv)
 
-    if not arguments.directory.is_dir():
-        print(f"error: {arguments.directory} is not a directory", file=sys.stderr)
+    if arguments.command == "audit":
+        return _verify_audit(arguments.url, arguments.anchor_seq, arguments.anchor_hash)
+    return _check_cassettes_command(arguments.directory)
+
+
+def _check_cassettes_command(directory: Path) -> int:
+    if not directory.is_dir():
+        print(f"error: {directory} is not a directory", file=sys.stderr)
         return 2
     try:
-        problems = check_cassettes(arguments.directory)
+        problems = check_cassettes(directory)
     except AgentCoreError as error:
         print(f"error: {error}", file=sys.stderr)
         return 2
@@ -49,7 +77,34 @@ def main(argv: Sequence[str] | None = None) -> int:
     if problems:
         print(f"{len(problems)} problem(s) found.", file=sys.stderr)
         return 1
-    print(f"All cassettes in {arguments.directory} are valid.")
+    print(f"All cassettes in {directory} are valid.")
+    return 0
+
+
+def _verify_audit(url: str | None, anchor_seq: int | None, anchor_hash: str | None) -> int:
+    if (anchor_seq is None) != (anchor_hash is None):
+        print("error: pass --anchor-seq and --anchor-hash together", file=sys.stderr)
+        return 2
+    database_url = url or os.environ.get(AUDIT_DATABASE_URL_ENV, "").strip()
+    if not database_url:
+        print(f"error: pass a database URL or set {AUDIT_DATABASE_URL_ENV}", file=sys.stderr)
+        return 2
+    try:
+        log = SQLAuditLog(open_database(database_url))
+        anchor = (
+            AuditHead(seq=anchor_seq, record_hash=anchor_hash)
+            if anchor_seq is not None and anchor_hash is not None
+            else None
+        )
+        head = asyncio.run(log.verify(expected_head=anchor))
+    except AuditIntegrityError as error:
+        print(f"FAILED: {error}")
+        return 1
+    except (AgentCoreError, ValidationError) as error:
+        print(f"error: {error}", file=sys.stderr)
+        return 2
+    anchored = " and matches the anchor" if anchor is not None else " (no anchor given)"
+    print(f"OK: {head.seq} records, chain intact{anchored}. Head: {head.seq} {head.record_hash}")
     return 0
 
 
