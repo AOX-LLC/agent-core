@@ -113,6 +113,7 @@ A `PromptRef` call is keyed by its content: `replay_key()` in `aox_agent_core.re
 - Editing a template, system prompt or output schema without bumping the prompt's version raises `StaleRecordingError`.
 - The key uses the tier after routing. A price-table change can make a budget drop pick a lower tier, which changes the key; the miss then says the routed tier differs from the recorded one.
 - A structured-output retry is attempt 2 and has its own recording.
+- Prompted recordings do not belong to a cassette: `replay.cassette` and `use_cassette(name)` separate only unprompted ones, so identical prompted calls in two tests share one file.
 - A recording made on another model replays as that model and is priced at that model's rate on the provider it was recorded with. If the API answered with a name the price table lacks, such as an alias, the rate of the model the recorded request named applies. If neither has a price any more, replay raises `ConfigError`.
 
 A call without a `PromptRef` is keyed by the hash of the whole request plus how many times that request was made before, under `requests/<cassette>/`. That hash covers the JSON schema the Anthropic SDK generates for an output model, so upgrading `anthropic` or `pydantic` can change it, and replay then misses. A prompted key holds only the schema's name, but its recording stores a hash of the generated schema, so the same upgrade raises `StaleRecordingError` on structured prompted recordings; record them again.
