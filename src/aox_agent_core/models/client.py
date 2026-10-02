@@ -7,6 +7,7 @@ from typing import Any, TypeVar, overload
 from pydantic import BaseModel, SecretStr
 
 from aox_agent_core.config import AgentCoreConfig, Tier, load_config
+from aox_agent_core.credentials import resolve_api_key
 from aox_agent_core.errors import EventLoopRunningError
 from aox_agent_core.models.provider import ModelProvider
 from aox_agent_core.models.router import Router
@@ -38,7 +39,7 @@ class AgentClient:
         router: Router | None = None,
     ) -> None:
         self._config = config if config is not None else load_config()
-        self._api_key = SecretStr(api_key) if isinstance(api_key, str) else api_key
+        self._api_key = resolve_api_key(api_key) if api_key is not None else None
         self._provider = provider
         self._router = router
 

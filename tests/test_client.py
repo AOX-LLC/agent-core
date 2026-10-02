@@ -5,7 +5,7 @@ import pytest
 from pydantic import ValidationError
 
 from aox_agent_core import AgentClient, Mode, Tier
-from aox_agent_core.errors import EventLoopRunningError
+from aox_agent_core.errors import EventLoopRunningError, MissingCredentialsError
 from aox_agent_core.models import RouteRequest
 
 
@@ -13,6 +13,12 @@ def test_client_builds_in_replay_mode_without_a_key() -> None:
     client = AgentClient()
 
     assert client.config.mode is Mode.REPLAY
+
+
+@pytest.mark.parametrize("blank_key", ["", "   "])
+def test_client_rejects_a_blank_api_key(blank_key: str) -> None:
+    with pytest.raises(MissingCredentialsError):
+        AgentClient(api_key=blank_key)
 
 
 def test_call_sync_refuses_to_run_inside_an_event_loop() -> None:
