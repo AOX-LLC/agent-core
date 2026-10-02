@@ -1,0 +1,60 @@
+{
+  "format_version": 2,
+  "prompt": null,
+  "replay_hash": "24169234a25d1289f69da09b3a2ed6423441f351832920055858bbdb9991896e",
+  "request": {
+    "effort": null,
+    "max_tokens": 16000,
+    "messages": [
+      {
+        "attachments": [],
+        "content": "Subject: Need a copy of last quarter's invoice\n\nCould you send a PDF of invoice INV-2002? Our accountant needs it sometime next week.",
+        "role": "user"
+      }
+    ],
+    "model": "claude-haiku-4-5-20251001",
+    "output_schema": {
+      "additionalProperties": false,
+      "properties": {
+        "queue": {
+          "enum": [
+            "billing",
+            "technical",
+            "account"
+          ],
+          "title": "Queue",
+          "type": "string"
+        },
+        "summary": {
+          "title": "Summary",
+          "type": "string"
+        },
+        "urgent": {
+          "title": "Urgent",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "queue",
+        "urgent",
+        "summary"
+      ],
+      "title": "TicketTriage",
+      "type": "object"
+    },
+    "provider": "anthropic",
+    "system": "You triage support tickets for a fictional software company."
+  },
+  "response": {
+    "model": "claude-haiku-4-5-20251001",
+    "stop_reason": "end_turn",
+    "text": "{\"queue\":\"billing\",\"urgent\":false,\"summary\":\"Customer requesting copy of invoice INV-2002 for accounting purposes, needed by end of next week\"}",
+    "usage": {
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 0,
+      "input_tokens": 298,
+      "output_tokens": 36
+    }
+  },
+  "sequence": 0
+}

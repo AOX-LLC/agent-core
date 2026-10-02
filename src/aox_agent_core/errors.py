@@ -99,10 +99,6 @@ class CassetteFormatError(ReplayError):
     """A cassette file is unreadable, malformed or of an unsupported format version."""
 
 
-class CassetteConflictError(ReplayError):
-    """Another recorder wrote the same cassette during this run, so it was not overwritten."""
-
-
 class SecretInRecordingError(ReplayError):
     """A secret was found in a recording, so the recording was not written."""
 

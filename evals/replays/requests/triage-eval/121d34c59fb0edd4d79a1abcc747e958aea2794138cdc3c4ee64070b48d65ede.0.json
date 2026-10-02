@@ -1,0 +1,60 @@
+{
+  "format_version": 2,
+  "prompt": null,
+  "replay_hash": "121d34c59fb0edd4d79a1abcc747e958aea2794138cdc3c4ee64070b48d65ede",
+  "request": {
+    "effort": null,
+    "max_tokens": 16000,
+    "messages": [
+      {
+        "attachments": [],
+        "content": "Subject: Close our account\n\nWe are winding down this project and would like to close our account and export our data. There is no deadline.",
+        "role": "user"
+      }
+    ],
+    "model": "claude-haiku-4-5-20251001",
+    "output_schema": {
+      "additionalProperties": false,
+      "properties": {
+        "queue": {
+          "enum": [
+            "billing",
+            "technical",
+            "account"
+          ],
+          "title": "Queue",
+          "type": "string"
+        },
+        "summary": {
+          "title": "Summary",
+          "type": "string"
+        },
+        "urgent": {
+          "title": "Urgent",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "queue",
+        "urgent",
+        "summary"
+      ],
+      "title": "TicketTriage",
+      "type": "object"
+    },
+    "provider": "anthropic",
+    "system": "You triage support tickets for a fictional software company."
+  },
+  "response": {
+    "model": "claude-haiku-4-5-20251001",
+    "stop_reason": "end_turn",
+    "text": "{\"queue\": \"account\", \"urgent\": false, \"summary\": \"Customer requests account closure and data export for completed project\"}",
+    "usage": {
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 0,
+      "input_tokens": 295,
+      "output_tokens": 29
+    }
+  },
+  "sequence": 0
+}

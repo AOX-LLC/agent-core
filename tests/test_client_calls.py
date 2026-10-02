@@ -13,7 +13,7 @@ from aox_agent_core.errors import (
     ReplayMissError,
     StructuredOutputError,
 )
-from aox_agent_core.replay import DirectoryCassetteStore, PatternScrubber, RecordingProvider
+from aox_agent_core.replay import DirectoryRecordingStore, PatternScrubber, RecordingProvider
 from aox_agent_core.tracing import attributes
 from support import ScriptedProvider, make_config, response
 
@@ -195,7 +195,7 @@ def test_call_sync_reuses_one_event_loop() -> None:
 
 def test_replay_mode_serves_a_recorded_cassette(tmp_path: Path) -> None:
     config = make_config(tmp_path, replay={"cassette": "recorded"}, **TASKS)
-    store = DirectoryCassetteStore(tmp_path, scrubber=PatternScrubber())
+    store = DirectoryRecordingStore(tmp_path, scrubber=PatternScrubber())
     recording = RecordingProvider(ScriptedProvider(response(VALID)), store, "recorded")
     with AgentClient(config, provider=recording) as recorder:
         recorder.call_sync("triage this", output=Triage, task="extraction")

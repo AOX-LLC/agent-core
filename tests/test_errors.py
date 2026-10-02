@@ -30,7 +30,6 @@ EXPECTED_PARENTS: dict[type[Exception], type[Exception]] = {
     errors.ReplayMissError: ReplayError,
     errors.StaleRecordingError: ReplayError,
     errors.CassetteFormatError: ReplayError,
-    errors.CassetteConflictError: ReplayError,
     errors.SecretInRecordingError: ReplayError,
     errors.ApprovalError: AgentCoreError,
     errors.ApprovalNotFoundError: ApprovalError,

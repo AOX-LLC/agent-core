@@ -1,7 +1,12 @@
 """The Amazon Bedrock provider interface. Not implemented in this release."""
 
+from typing import TYPE_CHECKING
+
 from aox_agent_core.errors import ProviderRequestError
 from aox_agent_core.models.types import ProviderRequest, ProviderResponse
+
+if TYPE_CHECKING:
+    from aox_agent_core.replay.keys import PromptKey
 
 
 class BedrockProvider:
@@ -15,7 +20,9 @@ class BedrockProvider:
     def __init__(self, *, region: str) -> None:
         self._region = region
 
-    async def complete(self, request: ProviderRequest) -> ProviderResponse:
+    async def complete(
+        self, request: ProviderRequest, *, prompt_key: "PromptKey | None" = None
+    ) -> ProviderResponse:
         raise ProviderRequestError(
             "The Bedrock provider is not implemented yet; route this tier to provider "
             "'anthropic' or use replay mode."

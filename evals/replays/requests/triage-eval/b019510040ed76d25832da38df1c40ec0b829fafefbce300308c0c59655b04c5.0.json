@@ -1,0 +1,60 @@
+{
+  "format_version": 2,
+  "prompt": null,
+  "replay_hash": "b019510040ed76d25832da38df1c40ec0b829fafefbce300308c0c59655b04c5",
+  "request": {
+    "effort": null,
+    "max_tokens": 16000,
+    "messages": [
+      {
+        "attachments": [],
+        "content": "Subject: CSV export has wrong column order\n\nThe exported CSV lists the date column after the amount. It is a minor annoyance, nothing is broken.",
+        "role": "user"
+      }
+    ],
+    "model": "claude-haiku-4-5-20251001",
+    "output_schema": {
+      "additionalProperties": false,
+      "properties": {
+        "queue": {
+          "enum": [
+            "billing",
+            "technical",
+            "account"
+          ],
+          "title": "Queue",
+          "type": "string"
+        },
+        "summary": {
+          "title": "Summary",
+          "type": "string"
+        },
+        "urgent": {
+          "title": "Urgent",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "queue",
+        "urgent",
+        "summary"
+      ],
+      "title": "TicketTriage",
+      "type": "object"
+    },
+    "provider": "anthropic",
+    "system": "You triage support tickets for a fictional software company."
+  },
+  "response": {
+    "model": "claude-haiku-4-5-20251001",
+    "stop_reason": "end_turn",
+    "text": "{\"queue\": \"technical\", \"urgent\": false, \"summary\": \"CSV export has incorrect column order - date appears after amount column\"}",
+    "usage": {
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 0,
+      "input_tokens": 297,
+      "output_tokens": 31
+    }
+  },
+  "sequence": 0
+}

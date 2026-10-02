@@ -4,6 +4,7 @@ import asyncio
 import os
 import weakref
 from collections.abc import Mapping
+from typing import TYPE_CHECKING
 
 import anthropic
 from anthropic.types import JSONOutputFormatParam, MessageParam, OutputConfigParam
@@ -18,6 +19,9 @@ from aox_agent_core.errors import (
     RateLimitedError,
 )
 from aox_agent_core.models.types import ProviderRequest, ProviderResponse, Usage
+
+if TYPE_CHECKING:
+    from aox_agent_core.replay.keys import PromptKey
 
 # The SDK merges this variable into every request's headers even when the key
 # and base URL are passed explicitly, so it could override the library's own
@@ -61,7 +65,9 @@ class AnthropicProvider:
             asyncio.AbstractEventLoop, anthropic.AsyncAnthropic
         ] = weakref.WeakKeyDictionary()
 
-    async def complete(self, request: ProviderRequest) -> ProviderResponse:
+    async def complete(
+        self, request: ProviderRequest, *, prompt_key: "PromptKey | None" = None
+    ) -> ProviderResponse:
         """Send one request and return the normalized response.
 
         Raises RateLimitedError on HTTP 429, ProviderUnavailableError on a 5xx

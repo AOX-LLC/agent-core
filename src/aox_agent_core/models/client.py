@@ -33,7 +33,7 @@ from aox_agent_core.models.types import (
 )
 from aox_agent_core.replay.providers import RecordingProvider, ReplayProvider
 from aox_agent_core.replay.scrub import PatternScrubber
-from aox_agent_core.replay.store import DirectoryCassetteStore
+from aox_agent_core.replay.store import DirectoryRecordingStore
 from aox_agent_core.tracing import attributes, get_tracer
 
 OutputModelT = TypeVar("OutputModelT", bound=BaseModel)
@@ -291,13 +291,13 @@ class AgentClient:
             live, self._cassette_store(known_secret=api_key), self._config.replay.cassette
         )
 
-    def _cassette_store(self, known_secret: SecretStr | None = None) -> DirectoryCassetteStore:
+    def _cassette_store(self, known_secret: SecretStr | None = None) -> DirectoryRecordingStore:
         replay = self._config.replay
         scrubber = PatternScrubber(
             extra_patterns=replay.extra_secret_patterns,
             known_secrets=(known_secret,) if known_secret is not None else (),
         )
-        return DirectoryCassetteStore(
+        return DirectoryRecordingStore(
             replay.cassette_dir, scrubber=scrubber, on_secret=replay.on_secret
         )
 

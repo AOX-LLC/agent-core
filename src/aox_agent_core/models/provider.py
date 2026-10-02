@@ -1,8 +1,12 @@
 """The boundary between the library and a model provider."""
 
-from typing import Protocol
+from typing import TYPE_CHECKING, Protocol
 
 from aox_agent_core.models.types import ProviderRequest, ProviderResponse
+
+if TYPE_CHECKING:
+    # Only for annotations: the replay package imports this module.
+    from aox_agent_core.replay.keys import PromptKey
 
 
 class ModelProvider(Protocol):
@@ -11,9 +15,14 @@ class ModelProvider(Protocol):
     Implementations: the Anthropic API, Amazon Bedrock, and the replay and
     recording providers. Errors are raised as ProviderError subclasses with the
     SDK's own error chained as __cause__.
+
+    prompt_key is set for calls made with a PromptRef. Replay and recording
+    providers key recordings by it; live providers ignore it.
     """
 
-    async def complete(self, request: ProviderRequest) -> ProviderResponse: ...
+    async def complete(
+        self, request: ProviderRequest, *, prompt_key: "PromptKey | None" = None
+    ) -> ProviderResponse: ...
 
 
 async def close_provider(provider: ModelProvider) -> None:

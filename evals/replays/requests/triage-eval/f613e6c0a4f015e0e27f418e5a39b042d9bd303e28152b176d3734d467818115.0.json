@@ -1,0 +1,60 @@
+{
+  "format_version": 2,
+  "prompt": null,
+  "replay_hash": "f613e6c0a4f015e0e27f418e5a39b042d9bd303e28152b176d3734d467818115",
+  "request": {
+    "effort": null,
+    "max_tokens": 16000,
+    "messages": [
+      {
+        "attachments": [],
+        "content": "Subject: Cannot reset my password\n\nThe reset link for user@example.com says it has expired every time. I need to get into my account before a client meeting in one hour.",
+        "role": "user"
+      }
+    ],
+    "model": "claude-haiku-4-5-20251001",
+    "output_schema": {
+      "additionalProperties": false,
+      "properties": {
+        "queue": {
+          "enum": [
+            "billing",
+            "technical",
+            "account"
+          ],
+          "title": "Queue",
+          "type": "string"
+        },
+        "summary": {
+          "title": "Summary",
+          "type": "string"
+        },
+        "urgent": {
+          "title": "Urgent",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "queue",
+        "urgent",
+        "summary"
+      ],
+      "title": "TicketTriage",
+      "type": "object"
+    },
+    "provider": "anthropic",
+    "system": "You triage support tickets for a fictional software company."
+  },
+  "response": {
+    "model": "claude-haiku-4-5-20251001",
+    "stop_reason": "end_turn",
+    "text": "{\"queue\": \"account\", \"urgent\": true, \"summary\": \"Password reset link repeatedly expires for user@example.com; customer needs access urgently for client meeting in one hour\"}",
+    "usage": {
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 0,
+      "input_tokens": 303,
+      "output_tokens": 42
+    }
+  },
+  "sequence": 0
+}
