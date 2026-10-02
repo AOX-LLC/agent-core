@@ -2,6 +2,7 @@
 
 import asyncio
 import sqlite3
+import threading
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -279,3 +280,26 @@ async def test_appends_stay_safe_when_the_server_defaults_to_repeatable_read(
     await asyncio.gather(*(log.append(event(number)) for number in range(10)))
 
     assert (await log.verify()).seq == 10
+
+
+async def test_verify_walks_in_batches_off_the_event_loop(
+    control_database: ControlDatabase, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(audit_sql, "READ_BATCH_SIZE", 2)
+    log = await filled_log(control_database, 5)
+    threads: set[str] = set()
+    hash_record = compute_record_hash
+
+    def hash_and_note_thread(record: UnsealedAuditRecord) -> str:
+        threads.add(threading.current_thread().name)
+        return hash_record(record)
+
+    monkeypatch.setattr(audit_sql, "compute_record_hash", hash_and_note_thread)
+    drop_triggers(control_database)
+    control_database.superuser_raw(
+        f"UPDATE {audit_sql.AUDIT_TABLE} SET actor_id = 'someone-else' WHERE seq = 5"
+    )
+
+    with pytest.raises(AuditIntegrityError, match="Record 5 was altered"):
+        await log.verify()
+    assert threading.main_thread().name not in threads

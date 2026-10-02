@@ -13,6 +13,7 @@ superuser who drops the triggers and edits rows. It cannot detect a rewritten
 chain on its own; compare against a head kept elsewhere (verify's expected_head).
 """
 
+import asyncio
 import json
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime
@@ -179,26 +180,27 @@ class SQLAuditLog:
         expected_head, shows the log has not been rewritten or cut short since that
         head was taken. Raises AuditIntegrityError on any mismatch.
         """
-        rows = await self.database.run(partial(_rows_after, after_seq=0, limit=None))
+        return await asyncio.to_thread(self._verify_sync, expected_head)
+
+    def _verify_sync(self, expected_head: AuditHead | None) -> AuditHead:
+        """The walk itself, on a worker thread and in batches, so a long log neither
+        blocks the event loop nor has to fit in memory."""
         head = AuditHead(seq=0, record_hash=GENESIS_HASH)
         anchored_hash = (
             GENESIS_HASH if expected_head is not None and expected_head.seq == 0 else None
         )
-        for row in rows:
-            record = record_from_row(row)
-            if record.seq != head.seq + 1:
-                raise AuditIntegrityError(
-                    f"Record {head.seq + 1} is missing: the next record is {record.seq}."
-                )
-            if record.prev_hash != head.record_hash:
-                raise AuditIntegrityError(
-                    f"Record {record.seq} does not link to record {head.seq}."
-                )
-            if compute_record_hash(record) != record.record_hash:
-                raise AuditIntegrityError(f"Record {record.seq} was altered after it was written.")
-            head = AuditHead(seq=record.seq, record_hash=record.record_hash)
-            if expected_head is not None and record.seq == expected_head.seq:
-                anchored_hash = record.record_hash
+        while True:
+            rows = self.database.run_sync(
+                partial(_rows_after, after_seq=head.seq, limit=READ_BATCH_SIZE)
+            )
+            for row in rows:
+                record = record_from_row(row)
+                _check_link(record, head)
+                head = AuditHead(seq=record.seq, record_hash=record.record_hash)
+                if expected_head is not None and record.seq == expected_head.seq:
+                    anchored_hash = record.record_hash
+            if len(rows) < READ_BATCH_SIZE:
+                break
 
         if expected_head is not None:
             _check_anchor(head, expected_head, anchored_hash)
@@ -216,6 +218,18 @@ class SQLAuditLog:
                 session, _postgres_triggers(session), {UPDATE_DELETE_TRIGGER, TRUNCATE_TRIGGER}
             )
         self._protections_checked = True
+
+
+def _check_link(record: AuditRecord, previous: AuditHead) -> None:
+    """Raise AuditIntegrityError unless `record` follows `previous` and its hash holds."""
+    if record.seq != previous.seq + 1:
+        raise AuditIntegrityError(
+            f"Record {previous.seq + 1} is missing: the next record is {record.seq}."
+        )
+    if record.prev_hash != previous.record_hash:
+        raise AuditIntegrityError(f"Record {record.seq} does not link to record {previous.seq}.")
+    if compute_record_hash(record) != record.record_hash:
+        raise AuditIntegrityError(f"Record {record.seq} was altered after it was written.")
 
 
 def _check_anchor(head: AuditHead, expected: AuditHead, anchored_hash: str | None) -> None:
