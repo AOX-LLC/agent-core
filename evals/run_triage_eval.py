@@ -49,7 +49,7 @@ async def run(client: AgentClient) -> Scorecard:
     suite = EvalSuite.from_jsonl(CASES_PATH, name="triage")
     target = model_call_target(client, output=TicketTriage, task="extraction", system=SYSTEM_PROMPT)
     runner = EvalRunner([FieldMatch(["queue", "urgent"])], concurrency=4)
-    return await runner.run(suite, target)
+    return await runner.run(suite, target, mode=client.config.mode)
 
 
 def main() -> None:

@@ -1,11 +1,12 @@
 import json
+from datetime import UTC, datetime
 from decimal import Decimal
 from pathlib import Path
 
 import pytest
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
 
-from aox_agent_core import AgentClient, Tier
+from aox_agent_core import AgentClient, Mode, Tier
 from aox_agent_core.errors import EvalError
 from aox_agent_core.evals import (
     EvalCase,
@@ -13,12 +14,15 @@ from aox_agent_core.evals import (
     EvalSuite,
     ExactMatch,
     FieldMatch,
+    Scorecard,
     TargetOutput,
     model_call_target,
     render_scorecard_markdown,
     write_scorecard_json,
 )
 from support import ScriptedProvider, make_config, response
+
+NOW = datetime(2026, 10, 2, 12, 0, tzinfo=UTC)
 
 
 def write_suite(tmp_path: Path, *lines: str) -> Path:
@@ -103,6 +107,9 @@ async def test_runner_reports_accuracy_failures_latency_and_cost() -> None:
     assert scorecard.results[2].error == "RuntimeError: provider timed out"
     assert scorecard.cost_total_usd == Decimal("0.003")
     assert scorecard.cost_per_case_usd == Decimal("0.00075")
+    assert scorecard.mode is None
+    assert scorecard.latency_p50_ms is not None
+    assert scorecard.latency_p95_ms is not None
     assert 0 <= scorecard.latency_p50_ms <= scorecard.latency_p95_ms
 
 
@@ -159,3 +166,83 @@ async def test_target_errors_are_scrubbed_in_the_scorecard() -> None:
     assert scorecard.results[0].error == (
         "RuntimeError: request failed with key [REDACTED:anthropic_api_key]"
     )
+
+
+def two_case_suite() -> EvalSuite:
+    return EvalSuite(
+        name="sample",
+        cases=(
+            EvalCase(id="ok", input="1", expected="a"),
+            EvalCase(id="bad", input="2", expected="b"),
+        ),
+    )
+
+
+async def answer_a(case: EvalCase) -> TargetOutput:
+    return TargetOutput(output="a")
+
+
+async def test_replayed_run_reports_its_mode_and_no_latency(tmp_path: Path) -> None:
+    scorecard = await EvalRunner([ExactMatch()]).run(two_case_suite(), answer_a, mode=Mode.REPLAY)
+    write_scorecard_json(scorecard, tmp_path / "scorecard.json")
+    markdown = render_scorecard_markdown(scorecard)
+
+    document = json.loads((tmp_path / "scorecard.json").read_text())
+    assert document["mode"] == "replay"
+    assert document["latency_p50_ms"] is None
+    assert document["latency_p95_ms"] is None
+    assert all(result["latency_ms"] is None for result in document["results"])
+    assert "Mode: replay. Responses came from recordings, so no latency is reported" in markdown
+    assert "| 2 | 1 | 50.0% | n/a | n/a |" in markdown
+
+
+async def test_live_run_reports_its_mode_and_real_latency() -> None:
+    scorecard = await EvalRunner([ExactMatch()]).run(two_case_suite(), answer_a, mode=Mode.LIVE)
+    markdown = render_scorecard_markdown(scorecard)
+
+    assert scorecard.mode is Mode.LIVE
+    assert scorecard.latency_p50_ms is not None
+    assert "Mode: live." in markdown
+    assert " ms |" in markdown
+
+
+def test_a_replayed_scorecard_cannot_carry_latency() -> None:
+    with pytest.raises(ValidationError, match="must not report latency"):
+        Scorecard(
+            suite="sample",
+            mode=Mode.REPLAY,
+            started_at=NOW,
+            finished_at=NOW,
+            results=(),
+            accuracy=0,
+            latency_p50_ms=1.0,
+            latency_p95_ms=None,
+            cost_total_usd=Decimal(0),
+            cost_per_case_usd=Decimal(0),
+        )
+
+
+async def test_failures_render_with_their_reasons() -> None:
+    """Failure rendering is covered here, independent of how the live suite scores."""
+    suite = EvalSuite(
+        name="sample",
+        cases=(
+            EvalCase(id="right", input="1", expected={"queue": "billing", "urgent": True}),
+            EvalCase(id="wrong-field", input="2", expected={"queue": "billing", "urgent": True}),
+            EvalCase(id="crashed", input="3", expected={"queue": "billing", "urgent": True}),
+        ),
+    )
+
+    async def target(case: EvalCase) -> TargetOutput:
+        if case.id == "crashed":
+            raise RuntimeError("upstream | timeout")
+        urgent = case.id == "right"
+        return TargetOutput(output={"queue": "billing", "urgent": urgent})
+
+    scorecard = await EvalRunner([FieldMatch(["queue", "urgent"])]).run(suite, target)
+    markdown = render_scorecard_markdown(scorecard)
+
+    assert "### Failed cases (2)" in markdown
+    assert "| wrong-field | field_match: mismatched: urgent |" in markdown
+    assert "| crashed | RuntimeError: upstream \\| timeout |" in markdown
+    assert "| right |" not in markdown

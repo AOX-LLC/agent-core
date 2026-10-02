@@ -16,6 +16,7 @@ from pydantic import (
 )
 
 from aox_agent_core._model import FrozenModel
+from aox_agent_core.config import Mode
 from aox_agent_core.errors import EvalError
 
 SCORECARD_FORMAT_VERSION: Final = 1
@@ -93,12 +94,16 @@ class Score(FrozenModel):
 
 
 class CaseResult(FrozenModel):
-    """Everything recorded for one case. error is set when the target raised."""
+    """Everything recorded for one case. error is set when the target raised.
+
+    latency_ms is None when the run replayed recordings, whose timing says
+    nothing about the model.
+    """
 
     case_id: CaseId
     output: JsonValue = None
     scores: tuple[Score, ...] = ()
-    latency_ms: NonNegativeMs
+    latency_ms: NonNegativeMs | None
     cost_usd: NonNegativeUsd
     error: str | None = None
 
@@ -108,18 +113,33 @@ class Scorecard(FrozenModel):
 
     accuracy is the share of cases whose every score passed. A case that errored
     or has no scores counts as failed.
+
+    mode is how the target's model calls were served, or None when unknown. A
+    replayed run has no latency figures: its timing measures reading recordings,
+    not the model, so reporting it as latency would mislead.
     """
 
     format_version: Literal[1] = SCORECARD_FORMAT_VERSION
     suite: str
+    mode: Mode | None = None
     started_at: AwareDatetime
     finished_at: AwareDatetime
     results: tuple[CaseResult, ...]
     accuracy: UnitInterval
-    latency_p50_ms: NonNegativeMs
-    latency_p95_ms: NonNegativeMs
+    latency_p50_ms: NonNegativeMs | None
+    latency_p95_ms: NonNegativeMs | None
     cost_total_usd: NonNegativeUsd
     cost_per_case_usd: NonNegativeUsd
+
+    @model_validator(mode="after")
+    def _replay_reports_no_latency(self) -> Self:
+        if self.mode is not Mode.REPLAY:
+            return self
+        latencies = [self.latency_p50_ms, self.latency_p95_ms]
+        latencies += [result.latency_ms for result in self.results]
+        if any(latency is not None for latency in latencies):
+            raise ValueError("a replayed run must not report latency")
+        return self
 
     def failures(self) -> Sequence[CaseResult]:
         """Results that errored, have no scores, or have a failed score."""

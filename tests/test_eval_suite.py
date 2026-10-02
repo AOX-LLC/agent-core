@@ -21,6 +21,9 @@ def test_triage_eval_replays_and_writes_both_scorecards(tmp_path: Path) -> None:
 
     scorecard = json.loads(scorecard_path.read_text())
     assert completed.stdout.startswith("## Eval scorecard: triage")
+    assert "Mode: replay." in completed.stdout
+    assert scorecard["mode"] == "replay"
+    assert scorecard["latency_p50_ms"] is None
     assert len(scorecard["results"]) == 10
     assert scorecard["accuracy"] >= 0.7
     assert float(scorecard["cost_total_usd"]) > 0

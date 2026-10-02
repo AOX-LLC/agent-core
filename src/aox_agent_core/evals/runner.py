@@ -10,7 +10,7 @@ from typing import Protocol
 
 from pydantic import BaseModel, JsonValue
 
-from aox_agent_core.config import Tier
+from aox_agent_core.config import Mode, Tier
 from aox_agent_core.evals.types import (
     CaseResult,
     EvalCase,
@@ -54,8 +54,15 @@ class EvalRunner:
         self._scorers = tuple(scorers)
         self._concurrency = concurrency
 
-    async def run(self, suite: EvalSuite, target: EvalTarget) -> Scorecard:
-        """Run the suite and return its scorecard, results in the suite's case order."""
+    async def run(
+        self, suite: EvalSuite, target: EvalTarget, *, mode: Mode | None = None
+    ) -> Scorecard:
+        """Run the suite and return its scorecard, results in the suite's case order.
+
+        Pass the mode the target's model calls run in (client.config.mode). In
+        replay mode the scorecard carries no latency, since replay timing is not
+        model latency.
+        """
         started_at = datetime.now(UTC)
         slots = asyncio.Semaphore(self._concurrency)
 
@@ -64,7 +71,9 @@ class EvalRunner:
                 return await self._run_case(case, target)
 
         results = await asyncio.gather(*(run_case(case) for case in suite.cases))
-        return _scorecard(suite.name, started_at, datetime.now(UTC), tuple(results))
+        if mode is Mode.REPLAY:
+            results = [result.model_copy(update={"latency_ms": None}) for result in results]
+        return _scorecard(suite.name, mode, started_at, datetime.now(UTC), tuple(results))
 
     async def _run_case(self, case: EvalCase, target: EvalTarget) -> CaseResult:
         started = time.perf_counter()
@@ -118,7 +127,11 @@ def model_call_target(
 
 
 def _scorecard(
-    suite: str, started_at: datetime, finished_at: datetime, results: tuple[CaseResult, ...]
+    suite: str,
+    mode: Mode | None,
+    started_at: datetime,
+    finished_at: datetime,
+    results: tuple[CaseResult, ...],
 ) -> Scorecard:
     # The suite has at least one case, so the divisions and percentiles below are safe.
     passed = [
@@ -126,16 +139,17 @@ def _scorecard(
         for result in results
         if result.error is None and result.scores and all(score.passed for score in result.scores)
     ]
-    latencies = sorted(result.latency_ms for result in results)
+    latencies = sorted(result.latency_ms for result in results if result.latency_ms is not None)
     total_cost = sum((result.cost_usd for result in results), Decimal(0))
     return Scorecard(
         suite=suite,
+        mode=mode,
         started_at=started_at,
         finished_at=finished_at,
         results=results,
         accuracy=len(passed) / len(results),
-        latency_p50_ms=_percentile(latencies, 50),
-        latency_p95_ms=_percentile(latencies, 95),
+        latency_p50_ms=_percentile(latencies, 50) if latencies else None,
+        latency_p95_ms=_percentile(latencies, 95) if latencies else None,
         cost_total_usd=total_cost,
         cost_per_case_usd=total_cost / len(results),
     )
