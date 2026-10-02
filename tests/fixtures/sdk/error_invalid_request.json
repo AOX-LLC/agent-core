@@ -1,0 +1,8 @@
+{
+  "type": "error",
+  "error": {
+    "type": "invalid_request_error",
+    "message": "messages: roles must alternate between \"user\" and \"assistant\""
+  },
+  "request_id": "req_fixture_002"
+}

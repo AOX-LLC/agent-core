@@ -28,8 +28,11 @@ EXPECTED_EXPORTS = {
     ],
     "aox_agent_core.models": [
         "AgentClient",
+        "AnthropicProvider",
+        "BedrockProvider",
         "CallResult",
         "ConfigRouter",
+        "LiveProviders",
         "Message",
         "ModelProvider",
         "Prompt",
