@@ -1,4 +1,9 @@
-"""Every error the library raises, rooted at AgentCoreError.
+"""The library's errors, rooted at AgentCoreError.
+
+Operational failures (configuration, credentials, providers, replay, approvals,
+audit, evals) raise these classes. Two other exceptions are part of the
+contract: building a library model from invalid input raises
+pydantic.ValidationError, and a bad argument to a constructor raises ValueError.
 
 The hierarchy is public API: consumers catch these classes, so a class is never
 renamed or moved to a different parent without a major version.
@@ -106,7 +111,11 @@ class AuditWriteError(AuditError):
 
 
 class AuditPayloadRejectedError(AuditError):
-    """An audit payload contained a forbidden key, a secret, or was too large."""
+    """A payload string looked like a secret when the event was appended.
+
+    Forbidden keys, floats and oversized payloads are caught earlier, as a
+    ValidationError when the AuditEvent is built.
+    """
 
 
 class EvalError(AgentCoreError):
