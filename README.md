@@ -90,7 +90,7 @@ def test_triage(use_cassette):
 
 ## Bedrock
 
-The Bedrock provider is an interface only in this release. `bedrock.tier_models` maps the mid and large tiers to Bedrock model IDs, priced under `pricing.bedrock`. The small tier has no Bedrock default: Claude Haiku 4.5 reaches end of life on Bedrock no sooner than 2026-10-16, so a project routing the small tier to Bedrock must choose and price the model itself.
+The Bedrock provider is an interface only in this release. Setting a tier's `provider = "bedrock"` without a `model` picks that tier's model from `bedrock.tier_models`, priced under `pricing.bedrock`: the mid and large tiers have defaults. The small tier has none: Claude Haiku 4.5 reaches end of life on Bedrock no sooner than 2026-10-16, so moving the small tier to Bedrock without naming and pricing a model is a configuration error.
 
 ## Development
 

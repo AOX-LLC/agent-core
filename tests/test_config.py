@@ -255,3 +255,31 @@ def test_anthropic_base_url_must_be_https_or_loopback(
     else:
         with pytest.raises(ConfigError, match="base_url"):
             load_config(override, environ=NO_ENVIRONMENT)
+
+
+def test_tier_moved_to_bedrock_takes_the_bedrock_default_model(tmp_path: Path) -> None:
+    override = write_override(tmp_path, '[routing.tiers.mid]\nprovider = "bedrock"\n')
+
+    config = load_config(override, environ=NO_ENVIRONMENT)
+
+    mid = config.routing.tiers[Tier.MID]
+    assert (mid.provider, mid.model) == (Provider.BEDROCK, "anthropic.claude-sonnet-5-5")
+    assert config.price_for(mid.provider, mid.model).input_usd_per_mtok > 0
+
+
+def test_small_tier_cannot_move_to_bedrock_without_a_model(tmp_path: Path) -> None:
+    override = write_override(tmp_path, '[routing.tiers.small]\nprovider = "bedrock"\n')
+
+    with pytest.raises(ConfigError, match="small tier has no default Bedrock model"):
+        load_config(override, environ=NO_ENVIRONMENT)
+
+
+def test_explicit_bedrock_model_is_kept(tmp_path: Path) -> None:
+    override = write_override(
+        tmp_path,
+        '[routing.tiers.large]\nprovider = "bedrock"\nmodel = "anthropic.claude-sonnet-5-5"\n',
+    )
+
+    large = load_config(override, environ=NO_ENVIRONMENT).routing.tiers[Tier.LARGE]
+
+    assert large.model == "anthropic.claude-sonnet-5-5"

@@ -207,8 +207,10 @@ class AnthropicConfig(FrozenModel):
 class BedrockConfig(FrozenModel):
     """Amazon Bedrock region and the Bedrock model ID for each tier.
 
-    A tier missing from tier_models has no Bedrock default; a project that routes
-    that tier to Bedrock must name the model itself.
+    When a project's config sets a tier's provider to "bedrock" without naming a
+    model, load_config fills in that tier's model from tier_models. A tier
+    missing from tier_models has no Bedrock default, and moving it to Bedrock
+    without a model is a ConfigError.
     """
 
     region: Annotated[str, StringConstraints(pattern=r"^[a-z]{2}(-[a-z]+)+-\d$")] = "us-east-1"
@@ -294,7 +296,9 @@ def load_config(
         override = _read_toml(override_path)
         _reject_password_in_audit_url(override, override_path)
         _anchor_cassette_dir(override, override_path)
+        bedrock_tiers_without_model = _bedrock_tiers_without_model(override)
         document = _merge_tables(document, override)
+        _fill_bedrock_models(document, bedrock_tiers_without_model)
 
     mode_override = env.get(MODE_ENV, "").strip()
     if mode_override:
@@ -308,6 +312,34 @@ def load_config(
         return AgentCoreConfig.model_validate(document)
     except ValidationError as error:
         raise ConfigError(f"Invalid agent-core configuration:\n{error}") from error
+
+
+def _bedrock_tiers_without_model(override: dict[str, Any]) -> list[str]:
+    """Tiers the override moves to Bedrock without naming a model."""
+    routing = override.get("routing")
+    tiers = routing.get("tiers") if isinstance(routing, dict) else None
+    if not isinstance(tiers, dict):
+        return []
+    return [
+        tier
+        for tier, table in tiers.items()
+        if isinstance(table, dict)
+        and table.get("provider") == Provider.BEDROCK.value
+        and "model" not in table
+    ]
+
+
+def _fill_bedrock_models(document: dict[str, Any], tiers: list[str]) -> None:
+    """Give each tier moved to Bedrock without a model its bedrock.tier_models default."""
+    defaults = document.get("bedrock", {}).get("tier_models", {})
+    for tier in tiers:
+        if tier not in defaults:
+            raise ConfigError(
+                f"routing.tiers.{tier} moves to Bedrock without a model, and the {tier} tier "
+                f"has no default Bedrock model; set routing.tiers.{tier}.model and price it "
+                "under pricing.bedrock."
+            )
+        document["routing"]["tiers"][tier]["model"] = defaults[tier]
 
 
 def _anchor_cassette_dir(override: dict[str, Any], path: Path) -> None:
