@@ -32,6 +32,7 @@ POSTGRES_DEFAULT_PORT = 5432
 # Row-value comparisons, which approval listing uses, arrived in SQLite 3.15.
 SQLITE_MINIMUM_VERSION = (3, 15, 0)
 POSTGRES_ROLE_NAME = re.compile(r"[a-z_][a-z0-9_]{0,62}")
+TABLE_NAME = re.compile(r"[a-z_][a-z0-9_]{0,62}")
 
 
 class Dialect(StrEnum):
@@ -204,8 +205,10 @@ def open_database(url: str | SecretStr) -> Database:
 
 def table_columns(session: Session, table: str) -> set[str]:
     """The column names of a table in the session's database; empty if there is no table."""
+    if not TABLE_NAME.fullmatch(table):
+        raise ValueError(f"{table!r} is not a plain table name.")
     if session.dialect is Dialect.SQLITE:
-        # PRAGMA arguments cannot be bound; callers pass the library's own table names.
+        # PRAGMA arguments cannot be bound, so the name is checked above.
         return {row[1] for row in session.execute(f"PRAGMA table_info({table})")}
     return {
         row[0]

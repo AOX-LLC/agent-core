@@ -1,5 +1,6 @@
 """Run contexts in audit records and approvals, and refusal of 0.1.0a1 tables."""
 
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -26,6 +27,7 @@ from aox_agent_core.errors import (
     ConfigError,
 )
 from aox_agent_core.replay import PatternScrubber, SecretFinding
+from aox_agent_core.storage import open_database, table_columns
 from databases import ControlDatabase
 
 RUN = RunContext(run_id="run-0001", external_ids={"workflow_id": "wf-7"})
@@ -263,3 +265,10 @@ def _update_triggers(database: ControlDatabase) -> list[str]:
     if database.backend == "sqlite":
         return [f"DROP TRIGGER {audit_sql.UPDATE_TRIGGER}"]
     return [f"DROP TRIGGER {audit_sql.UPDATE_DELETE_TRIGGER} ON {audit_sql.AUDIT_TABLE}"]
+
+
+def test_table_columns_refuses_a_name_that_is_not_an_identifier(tmp_path: Path) -> None:
+    database = open_database(f"sqlite:///{tmp_path / 'x.sqlite3'}")
+
+    with pytest.raises(ValueError, match="not a plain table name"):
+        database.run_sync(lambda session: table_columns(session, "x); DROP TABLE y; --"))
