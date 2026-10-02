@@ -355,3 +355,50 @@ def test_largest_safe_integer_and_booleans_are_fine() -> None:
 def test_in_memory_sqlite_is_refused(url: str) -> None:
     with pytest.raises(ConfigError, match="in-memory"):
         open_database(url)
+
+
+async def test_superuser_session_wearing_the_app_role_is_refused(
+    control_database: ControlDatabase,
+) -> None:
+    if control_database.backend != "postgres":
+        pytest.skip("roles exist only on Postgres")
+    assert control_database.superuser_url is not None
+    url = f"{control_database.superuser_url}?options=-c%20role%3Dagent_core_app"
+
+    with pytest.raises(ConfigError, match="may only INSERT and SELECT"):
+        await SQLAuditLog(open_database(url)).append(event(1))
+
+
+async def test_insert_or_replace_on_an_existing_event_id_is_refused(tmp_path: Path) -> None:
+    database = sqlite_database(tmp_path)
+    log = await filled_log(database)
+
+    with pytest.raises(sqlite3.DatabaseError, match="append-only"):
+        database.raw(
+            f"INSERT OR REPLACE INTO {audit_sql.AUDIT_TABLE} ({audit_sql.COLUMNS}) "
+            "SELECT 4, schema_version, event_id, occurred_at, action, actor_id, subject_id, "
+            f"payload, prev_hash, record_hash FROM {audit_sql.AUDIT_TABLE} WHERE seq = 2"
+        )
+
+    assert (await log.verify()).seq == 3
+
+
+async def test_a_temporary_table_cannot_stand_in_for_the_audit_table(
+    control_database: ControlDatabase,
+) -> None:
+    if control_database.backend != "postgres":
+        pytest.skip("search_path shadowing is a Postgres concern")
+    await filled_log(control_database)
+
+    forge_after_gap = (
+        f"INSERT INTO public.{audit_sql.AUDIT_TABLE} ({audit_sql.COLUMNS}) "
+        "SELECT 1001, schema_version, 'forged-event', occurred_at, action, actor_id, "
+        f"subject_id, payload, prev_hash, record_hash FROM public.{audit_sql.AUDIT_TABLE} "
+        "WHERE seq = 3"
+    )
+
+    with psycopg.connect(control_database.url, autocommit=True) as app:
+        # Shadow the table with one whose MAX(seq) makes seq 1001 look like the next record.
+        app.execute(f"CREATE TEMP TABLE {audit_sql.AUDIT_TABLE} AS SELECT 1000::bigint AS seq")
+        with pytest.raises(psycopg.Error, match="append-only"):
+            app.execute(forge_after_gap)

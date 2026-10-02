@@ -75,25 +75,35 @@ SQLITE_SCHEMA: Final = (
     BEGIN SELECT RAISE(ABORT, '{AUDIT_TABLE} is append-only'); END""",
     f"""CREATE TRIGGER {DELETE_TRIGGER} BEFORE DELETE ON {AUDIT_TABLE}
     BEGIN SELECT RAISE(ABORT, '{AUDIT_TABLE} is append-only'); END""",
-    # Inserts land only right after the last record. Besides keeping the sequence
-    # gapless, this stops INSERT OR REPLACE, which deletes the row it replaces
-    # without firing the delete trigger.
+    # Inserts land only right after the last record, with an event_id not seen
+    # before. Besides keeping the sequence gapless, this stops INSERT OR REPLACE,
+    # which deletes the row it conflicts with (on seq or event_id) without firing
+    # the delete trigger.
     f"""CREATE TRIGGER {APPEND_TRIGGER} BEFORE INSERT ON {AUDIT_TABLE}
     WHEN NEW.seq <> (SELECT COALESCE(MAX(seq), 0) FROM {AUDIT_TABLE}) + 1
+        OR EXISTS (SELECT 1 FROM {AUDIT_TABLE} WHERE event_id = NEW.event_id)
     BEGIN SELECT RAISE(ABORT, '{AUDIT_TABLE} is append-only'); END""",
 )
 
 POSTGRES_SCHEMA: Final = (
     _TABLE_DDL,
-    f"""CREATE FUNCTION {AUDIT_TABLE}_refuse_change() RETURNS trigger LANGUAGE plpgsql AS $$
+    # Both trigger functions pin search_path and reach the table through the
+    # trigger's own schema and name, so a temporary table of the same name cannot
+    # stand in for the audit table.
+    f"""CREATE FUNCTION {AUDIT_TABLE}_refuse_change() RETURNS trigger LANGUAGE plpgsql
+    SET search_path = pg_catalog, pg_temp AS $$
     BEGIN RAISE EXCEPTION '{AUDIT_TABLE} is append-only'; END $$""",
     f"""CREATE TRIGGER {UPDATE_DELETE_TRIGGER} BEFORE UPDATE OR DELETE ON {AUDIT_TABLE}
     FOR EACH ROW EXECUTE FUNCTION {AUDIT_TABLE}_refuse_change()""",
     f"""CREATE TRIGGER {TRUNCATE_TRIGGER} BEFORE TRUNCATE ON {AUDIT_TABLE}
     FOR EACH STATEMENT EXECUTE FUNCTION {AUDIT_TABLE}_refuse_change()""",
-    f"""CREATE FUNCTION {AUDIT_TABLE}_append_at_end() RETURNS trigger LANGUAGE plpgsql AS $$
+    f"""CREATE FUNCTION {AUDIT_TABLE}_append_at_end() RETURNS trigger LANGUAGE plpgsql
+    SET search_path = pg_catalog, pg_temp AS $$
+    DECLARE last_seq bigint;
     BEGIN
-        IF NEW.seq <> (SELECT COALESCE(MAX(seq), 0) FROM {AUDIT_TABLE}) + 1 THEN
+        EXECUTE format('SELECT COALESCE(MAX(seq), 0) FROM %I.%I', TG_TABLE_SCHEMA, TG_TABLE_NAME)
+            INTO last_seq;
+        IF NEW.seq <> last_seq + 1 THEN
             RAISE EXCEPTION '{AUDIT_TABLE} is append-only';
         END IF;
         RETURN NEW;
@@ -289,14 +299,16 @@ def _require_triggers(session: Session, present: set[str], required: frozenset[s
 
 # The connecting role must not be able to change the audit table, directly or
 # through any role it can SET ROLE to, whether or not it inherits that role's
-# privileges. Every role the current user is a member of is checked for
+# privileges. Every role that the current user or the session user (the one that
+# logged in, which SET ROLE NONE returns to) is a member of is checked for
 # superuser, ownership, and table- or column-level change rights.
 _ROLE_CHECK_SQL = """
 SELECT
     c.oid IS NOT NULL,
     EXISTS (
         SELECT 1 FROM pg_roles m
-        WHERE pg_has_role(current_user, m.oid, 'MEMBER')
+        WHERE (pg_has_role(current_user, m.oid, 'MEMBER')
+               OR pg_has_role(session_user, m.oid, 'MEMBER'))
           AND (
               m.rolsuper
               OR m.oid = c.relowner
