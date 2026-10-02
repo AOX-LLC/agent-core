@@ -54,7 +54,7 @@ def test_request_key_is_sha256_of_canonical_json() -> None:
     import hashlib
 
     canonical = json.dumps(
-        request().model_dump(mode="json", exclude_none=True),
+        request().model_dump(mode="json", exclude_defaults=True),
         sort_keys=True,
         separators=(",", ":"),
         ensure_ascii=False,

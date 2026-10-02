@@ -44,11 +44,12 @@ def request_hash(request: ProviderRequest) -> str:
     """Return the SHA-256 hex digest that identifies a request in a cassette.
 
     The digest covers the request as canonical JSON: keys sorted, no insignificant
-    whitespace, UTF-8, with fields that are None left out. Text is hashed as given,
+    whitespace, UTF-8, with fields left at their defaults (None, no attachments)
+    left out, so adding an optional field keeps existing hashes. Text is hashed as given,
     without Unicode normalization.
 
     For structured calls the request includes the JSON schema the Anthropic SDK
     generates from the output model, so upgrading anthropic or pydantic can change
     the hash; recordings then miss and must be recorded again.
     """
-    return sha256_of(request.model_dump(mode="json", exclude_none=True))
+    return sha256_of(request.model_dump(mode="json", exclude_defaults=True))

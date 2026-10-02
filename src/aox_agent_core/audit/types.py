@@ -118,13 +118,14 @@ def _forbidden_keys(value: JsonValue) -> set[str]:
     if not isinstance(value, dict):
         return set()
 
-    forbidden = {key for key in value if _is_forbidden_key(key)}
+    forbidden = {key for key in value if is_secret_shaped_key(key)}
     for nested in value.values():
         forbidden |= _forbidden_keys(nested)
     return forbidden
 
 
-def _is_forbidden_key(key: str) -> bool:
+def is_secret_shaped_key(key: str) -> bool:
+    """True when a key, lowercased and stripped to letters and digits, ends in a secret word."""
     normalized = re.sub(r"[^a-z0-9]", "", key.lower())
     return normalized.endswith(FORBIDDEN_KEY_SUFFIXES)
 

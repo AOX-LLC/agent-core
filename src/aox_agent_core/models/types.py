@@ -7,12 +7,13 @@ those can reach a recording.
 
 from decimal import Decimal
 from enum import StrEnum
-from typing import Annotated, Generic, TypeVar
+from typing import Annotated, Generic, Self, TypeVar
 
-from pydantic import Field, JsonValue
+from pydantic import Field, JsonValue, model_validator
 
 from aox_agent_core._model import FrozenModel
 from aox_agent_core.config import Effort, Mode, Provider, Tier
+from aox_agent_core.models.attachments import Attachment
 
 OutputT = TypeVar("OutputT")
 
@@ -27,10 +28,17 @@ class Role(StrEnum):
 
 
 class Message(FrozenModel):
-    """One conversation turn."""
+    """One conversation turn. Attachments are sent before the text of a user turn."""
 
     role: Role
     content: Annotated[str, Field(min_length=1)]
+    attachments: tuple[Attachment, ...] = ()
+
+    @model_validator(mode="after")
+    def _only_user_turns_carry_attachments(self) -> Self:
+        if self.attachments and self.role is not Role.USER:
+            raise ValueError("only user messages can carry attachments")
+        return self
 
 
 class Usage(FrozenModel):
