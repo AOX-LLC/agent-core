@@ -31,5 +31,9 @@ def _no_network(monkeypatch: pytest.MonkeyPatch) -> None:
     def refuse_connection(*_args: object, **_kwargs: object) -> None:
         raise NetworkBlockedError("Tests must not open network connections.")
 
+    def refuse_lookup(*_args: object, **_kwargs: object) -> None:
+        raise NetworkBlockedError("Tests must not resolve host names.")
+
     monkeypatch.setattr(socket.socket, "connect", refuse_connection)
     monkeypatch.setattr(socket.socket, "connect_ex", refuse_connection)
+    monkeypatch.setattr(socket, "getaddrinfo", refuse_lookup)
