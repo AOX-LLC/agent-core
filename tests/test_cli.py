@@ -185,3 +185,14 @@ def test_audit_verify_refuses_a_missing_sqlite_file(
     assert main(["audit", "verify", f"sqlite:///{missing}"]) == 2
     assert "no audit database" in capsys.readouterr().err
     assert not missing.parent.exists()
+
+
+def test_audit_verify_refuses_a_database_without_an_audit_table(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    other = tmp_path / "other.sqlite3"
+    with closing(sqlite3.connect(other)) as connection, connection:
+        connection.execute("CREATE TABLE unrelated (a INTEGER)")
+
+    assert main(["audit", "verify", f"sqlite:///{other}"]) == 2
+    assert "no audit log table" in capsys.readouterr().err

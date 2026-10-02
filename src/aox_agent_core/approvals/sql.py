@@ -9,7 +9,6 @@ a Database, in the same transaction as the change.
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
-from functools import partial
 from typing import Any, Final, TypeVar
 from uuid import UUID, uuid4
 
@@ -64,7 +63,7 @@ CREATE TABLE {APPROVALS_TABLE} (
 )"""
 
 _PENDING_INDEX_DDL = (
-    f"CREATE INDEX agent_core_approvals_pending ON {APPROVALS_TABLE} (status, created_at)"
+    f"CREATE INDEX agent_core_approvals_pending ON {APPROVALS_TABLE} (status, created_at, id)"
 )
 
 SCHEMA: Final = (
@@ -74,6 +73,9 @@ SCHEMA: Final = (
 )
 
 DEFAULT_PENDING_LIMIT = 100
+# Pages read while a custom policy filters; larger than most limits, so a policy
+# that rejects many requests needs few round trips.
+PENDING_PAGE_SIZE = 500
 
 _COLUMNS = (
     "id, action, summary, payload_sha256, requested_by, required_role, created_at, "
@@ -209,23 +211,28 @@ class SQLApprovalQueue:
             return []
         now = self._now()
         narrowed_to = principal if uses_default_policy else None
-        eligible: list[ApprovalRequest] = []
-        after: ApprovalRequest | None = None
-        while len(eligible) < limit:
-            page = await self.database.run(
-                partial(
-                    _load_pending_page, now=now, after=after, narrowed_to=narrowed_to, limit=limit
+        page_size = limit if uses_default_policy else max(limit, PENDING_PAGE_SIZE)
+
+        # All pages are read in one transaction on the worker thread, so a policy
+        # that rejects many requests costs one connection, not one per page.
+        def collect(session: Session) -> list[ApprovalRequest]:
+            eligible: list[ApprovalRequest] = []
+            after: ApprovalRequest | None = None
+            while len(eligible) < limit:
+                page = _load_pending_page(
+                    session, now=now, after=after, narrowed_to=narrowed_to, limit=page_size
                 )
-            )
-            eligible += [
-                request
-                for request in page
-                if self._policy.evaluate(principal, request, now=now).allowed
-            ]
-            if len(page) < limit:
-                break
-            after = page[-1]
-        return eligible[:limit]
+                eligible += [
+                    request
+                    for request in page
+                    if self._policy.evaluate(principal, request, now=now).allowed
+                ]
+                if len(page) < page_size:
+                    break
+                after = page[-1]
+            return eligible[:limit]
+
+        return await self.database.run(collect)
 
     async def resolve(
         self,
@@ -503,9 +510,10 @@ def _load_pending_page(
     conditions = ["status = ?", "expires_at > ?"]
     parameters: list[Any] = [ApprovalStatus.PENDING.value, canonical_timestamp(now)]
     if after is not None:
-        conditions.append("(created_at > ? OR (created_at = ? AND id > ?))")
-        created_at = canonical_timestamp(after.created_at)
-        parameters += [created_at, created_at, str(after.id)]
+        # A row-value comparison lets the (status, created_at, id) index seek straight
+        # to the page start, even when many requests share a created_at.
+        conditions.append("(created_at, id) > (?, ?)")
+        parameters += [canonical_timestamp(after.created_at), str(after.id)]
     if narrowed_to is not None:
         roles = sorted(narrowed_to.roles)
         conditions.append(f"required_role IN ({', '.join('?' for _ in roles)})")

@@ -27,6 +27,7 @@ from aox_agent_core.errors import ConfigError
 ResultT = TypeVar("ResultT")
 
 SQLITE_BUSY_TIMEOUT_SECONDS = 30.0
+POSTGRES_DEFAULT_PORT = 5432
 POSTGRES_ROLE_NAME = re.compile(r"[a-z_][a-z0-9_]{0,62}")
 
 
@@ -113,9 +114,10 @@ class SQLiteDatabase(Database):
     @contextmanager
     def _transaction(self, *, write: bool) -> Iterator[Session]:
         if not write and not self.path.exists():
-            # A file that does not exist reads as an empty database; reading never
-            # creates it, so a mistyped path is not silently turned into a new log.
-            connection = sqlite3.connect(":memory:", isolation_level=None)
+            # A file that does not exist reads as an empty, read-only database:
+            # reading never creates it, so a mistyped path is not silently turned
+            # into a new log, and a write sent as a read fails instead of vanishing.
+            connection = sqlite3.connect("file::memory:?mode=ro", uri=True, isolation_level=None)
         else:
             self.path.parent.mkdir(parents=True, exist_ok=True)
             connection = sqlite3.connect(
@@ -148,6 +150,11 @@ class PostgresDatabase(Database):
         # schemas or privileges, so they are not treated as the same database.
         settings = self._psycopg.conninfo.conninfo_to_dict(self._url.get_secret_value())
         settings.pop("password", None)
+        # Spellings of the same address are one database: host names are case
+        # insensitive, and a TCP host without a port means the default port.
+        if "host" in settings:
+            settings["host"] = str(settings["host"]).lower()
+            settings.setdefault("port", str(POSTGRES_DEFAULT_PORT))
         return (self.dialect.value, *(f"{key}={value}" for key, value in sorted(settings.items())))
 
     @contextmanager

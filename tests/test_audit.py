@@ -410,3 +410,10 @@ async def test_reading_a_missing_sqlite_file_does_not_create_it(tmp_path: Path) 
 
     assert (await log.verify()).seq == 0
     assert not missing.parent.exists()
+
+
+def test_a_write_sent_as_a_read_on_a_missing_file_fails_loudly(tmp_path: Path) -> None:
+    database = open_database(f"sqlite:///{tmp_path / 'absent.sqlite3'}")
+
+    with pytest.raises(sqlite3.OperationalError, match="readonly"):
+        database.run_sync(lambda session: session.execute("CREATE TABLE stray (a INTEGER)"))

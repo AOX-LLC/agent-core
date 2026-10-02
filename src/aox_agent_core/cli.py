@@ -11,7 +11,7 @@ from urllib.parse import urlsplit
 
 from pydantic import ValidationError
 
-from aox_agent_core.audit.sql import SQLAuditLog
+from aox_agent_core.audit.sql import SQLAuditLog, audit_table_exists
 from aox_agent_core.audit.types import AuditHead
 from aox_agent_core.config import AUDIT_DATABASE_URL_ENV, load_config
 from aox_agent_core.errors import AgentCoreError, AuditIntegrityError, CassetteFormatError
@@ -106,6 +106,9 @@ def _verify_audit(url: str | None, anchor_seq: int | None, anchor_hash: str | No
         database = open_database(database_url)
         if isinstance(database, SQLiteDatabase) and not database.path.is_file():
             print(f"error: no audit database at {database.path}", file=sys.stderr)
+            return 2
+        if not audit_table_exists(database):
+            print("error: this database has no audit log table", file=sys.stderr)
             return 2
         log = SQLAuditLog(database)
         anchor = (

@@ -258,6 +258,11 @@ def _check_link(record: AuditRecord, previous: AuditHead) -> None:
         raise AuditIntegrityError(f"Record {record.seq} was altered after it was written.")
 
 
+def audit_table_exists(database: Database) -> bool:
+    """True when the database holds an audit table, so a check of it means something."""
+    return database.run_sync(_table_is_readable)
+
+
 def _check_anchor(head: AuditHead, expected: AuditHead, anchored_hash: str | None) -> None:
     """Fail unless the walked log still contains the expected head at its seq."""
     if expected.seq > head.seq:

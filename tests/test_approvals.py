@@ -18,6 +18,7 @@ from aox_agent_core.approvals import (
     ResolveVerdict,
     RoleApproverPolicy,
 )
+from aox_agent_core.approvals import sql as approvals_sql
 from aox_agent_core.approvals.sql import SQLApprovalQueue
 from aox_agent_core.audit.sql import SQLAuditLog
 from aox_agent_core.errors import (
@@ -454,3 +455,42 @@ def test_postgres_urls_differing_in_user_or_options_are_different_databases() ->
     assert not open_database(base.replace("agent_core_app", "other")).same_database(same)
     assert not open_database(f"{base}?options=-c%20search_path%3Dother").same_database(same)
     assert open_database(base.replace("app@", "app:secret@")).same_database(same)
+    assert open_database("postgresql://agent_core_app@LocalHost:4202/audit").same_database(
+        open_database("postgresql://agent_core_app@localhost:4202/audit")
+    )
+    default_port = "postgresql://agent_core_app@db.example/audit"
+    assert open_database(default_port).same_database(
+        open_database("postgresql://agent_core_app@db.example:5432/audit")
+    )
+
+
+async def test_custom_policy_listing_pages_through_tied_timestamps(
+    control_database: ControlDatabase, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(approvals_sql, "PENDING_PAGE_SIZE", 3)
+
+    class EveryThird(RoleApproverPolicy):
+        def __init__(self, wanted: set[UUID]) -> None:
+            self.wanted = wanted
+
+        def evaluate(
+            self, principal: Principal, request: ApprovalRequest, *, now: datetime
+        ) -> ResolveVerdict:
+            if request.id not in self.wanted:
+                return ResolveVerdict(allowed=False, reason=DenialReason.MISSING_ROLE)
+            return super().evaluate(principal, request, now=now)
+
+    policy = EveryThird(set())
+    queue = SQLApprovalQueue(
+        control_database.database,
+        audit_log=SQLAuditLog(control_database.database),
+        policy=policy,
+        clock=Clock(),  # every request shares one created_at
+    )
+    submitted_ids = [(await submitted(queue)).id for _ in range(10)]
+    in_listing_order = sorted(submitted_ids, key=str)
+    policy.wanted = set(in_listing_order[::3])
+
+    listed = [request.id for request in await queue.list_pending(APPROVER, limit=10)]
+
+    assert listed == in_listing_order[::3]
