@@ -19,7 +19,8 @@ from aox_agent_core.evals.types import (
     Scorecard,
     TargetOutput,
 )
-from aox_agent_core.models.client import AgentClient
+from aox_agent_core.models.client import ModelClient
+from aox_agent_core.models.prompts import PromptRef
 from aox_agent_core.replay.scrub import PatternScrubber
 
 # The system under test: takes one case and returns its output and cost.
@@ -98,24 +99,37 @@ class EvalRunner:
 
 
 def model_call_target(
-    client: AgentClient,
+    client: ModelClient,
     *,
+    prompt: PromptRef | None = None,
     output: type[BaseModel] | None = None,
     tier: Tier | None = None,
     task: str | None = None,
     system: str | None = None,
 ) -> EvalTarget:
-    """A target that sends each case's input (a string) as the prompt.
+    """A target that makes one model call per case.
 
+    Without `prompt`, each case's input must be a string and is sent as the
+    prompt. With a PromptRef, each case's input must be an object and becomes
+    the prompt's inputs, so every case replays by its own content-addressed key.
     Structured output is returned as its JSON form, so FieldMatch can compare it,
-    and the call's cost is carried into the scorecard. A non-string input raises
-    TypeError, which the runner records as that case's failure.
+    and the call's cost is carried into the scorecard. An input of the wrong
+    shape raises TypeError, which the runner records as that case's failure.
     """
 
     async def call(case: EvalCase) -> TargetOutput:
-        if not isinstance(case.input, str):
-            raise TypeError(f"case {case.id} input must be a string prompt")
-        result = await client.call(case.input, output=output, tier=tier, task=task, system=system)
+        if prompt is not None:
+            if not isinstance(case.input, dict):
+                raise TypeError(f"case {case.id} input must be an object of prompt inputs")
+            result = await client.call(
+                prompt, inputs=case.input, output=output, tier=tier, task=task
+            )
+        else:
+            if not isinstance(case.input, str):
+                raise TypeError(f"case {case.id} input must be a string prompt")
+            result = await client.call(
+                case.input, output=output, tier=tier, task=task, system=system
+            )
         produced: JsonValue = (
             result.output.model_dump(mode="json")
             if isinstance(result.output, BaseModel)
