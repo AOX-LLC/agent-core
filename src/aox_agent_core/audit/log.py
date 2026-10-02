@@ -17,7 +17,9 @@ class AuditLog(Protocol):
     async def append(self, event: AuditEvent) -> AuditRecord:
         """Append one event and return the stored record.
 
-        Raises AuditPayloadRejectedError if a payload string looks like a secret.
+        The event is re-validated first, since its payload dict may have been
+        changed after construction. Raises AuditPayloadRejectedError if a payload
+        string looks like a secret.
         """
         ...
 

@@ -7,7 +7,7 @@ from uuid import UUID
 
 from pydantic import AwareDatetime, Field, JsonValue, field_validator
 
-from aox_agent_core._model import ActionName, FrozenModel, PrincipalId, Sha256Hex
+from aox_agent_core._model import ActionName, FrozenModel, PrincipalId, Sha256Hex, SubjectId
 
 AUDIT_SCHEMA_VERSION: Final = 1
 GENESIS_HASH: Final = "0" * 64
@@ -35,14 +35,19 @@ class AuditEvent(FrozenModel):
 
     The payload must be small, JSON-serializable metadata: ids, counts, hashes,
     reason codes. Never credentials, headers, prompt or completion text, or
-    personal data; record a content hash and a reference instead. Forbidden keys
-    and oversized payloads fail validation here; the audit log additionally scans
-    payload strings for secrets when appending.
+    personal data; record a content hash and a reference instead.
+
+    Numbers must be integers. Floats are rejected because databases reformat
+    them, which would change the hashed bytes; write amounts such as costs as
+    decimal strings ("0.0123").
+
+    Forbidden keys, floats and oversized payloads fail validation here; the
+    audit log re-validates on append and also scans payload strings for secrets.
     """
 
     action: ActionName
     actor_id: PrincipalId
-    subject_id: Annotated[str, Field(min_length=1, max_length=200)] | None = None
+    subject_id: SubjectId | None = None
     payload: dict[str, JsonValue] = Field(default_factory=dict)
 
     @field_validator("payload")
@@ -54,6 +59,9 @@ class AuditEvent(FrozenModel):
         if forbidden:
             raise ValueError(f"payload has forbidden keys: {', '.join(forbidden)}")
 
+        if _contains_float(payload):
+            raise ValueError("payload numbers must be integers; write decimals as strings")
+
         size = len(json.dumps(payload, separators=(",", ":")).encode())
         if size > MAX_PAYLOAD_BYTES:
             raise ValueError(f"payload is {size} bytes; the limit is {MAX_PAYLOAD_BYTES}")
@@ -64,7 +72,9 @@ class UnsealedAuditRecord(FrozenModel):
     """Every field of an audit record except its own hash: the input to the hash.
 
     seq starts at 1 and has no gaps; prev_hash is the previous record's
-    record_hash, or GENESIS_HASH for the first record.
+    record_hash, or GENESIS_HASH for the first record. Backends store the
+    payload as its canonical JSON text, never as a reformatting type such as
+    Postgres jsonb, so verify() hashes exactly the bytes append() hashed.
     """
 
     schema_version: Literal[1] = AUDIT_SCHEMA_VERSION
@@ -73,7 +83,7 @@ class UnsealedAuditRecord(FrozenModel):
     occurred_at: AwareDatetime
     action: ActionName
     actor_id: PrincipalId
-    subject_id: str | None
+    subject_id: SubjectId | None
     payload: dict[str, JsonValue]
     prev_hash: Sha256Hex
 
@@ -106,3 +116,13 @@ def _forbidden_keys(value: JsonValue) -> set[str]:
 def _is_forbidden_key(key: str) -> bool:
     normalized = re.sub(r"[^a-z0-9]", "", key.lower())
     return normalized.endswith(FORBIDDEN_KEY_SUFFIXES)
+
+
+def _contains_float(value: JsonValue) -> bool:
+    if isinstance(value, float):
+        return True
+    if isinstance(value, list):
+        return any(_contains_float(item) for item in value)
+    if isinstance(value, dict):
+        return any(_contains_float(item) for item in value.values())
+    return False

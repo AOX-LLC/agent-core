@@ -75,6 +75,20 @@ def test_audit_payload_allows_token_counts_and_hashes() -> None:
     assert event.payload["input_tokens"] == 120
 
 
+@pytest.mark.parametrize(
+    "payload", [{"cost_usd": 0.0123}, {"latency": float("nan")}, {"items": [1, 2.5]}]
+)
+def test_audit_payload_rejects_floats(payload: dict[str, JsonValue]) -> None:
+    with pytest.raises(ValidationError, match="integers"):
+        AuditEvent(action="model.call", actor_id="svc-triage", payload=payload)
+
+
+@pytest.mark.parametrize("subject_id", ["jane@example.com", "has space", ""])
+def test_audit_subject_must_be_opaque(subject_id: str) -> None:
+    with pytest.raises(ValidationError):
+        AuditEvent(action="model.call", actor_id="svc-triage", subject_id=subject_id)
+
+
 def test_audit_payload_size_is_capped() -> None:
     with pytest.raises(ValidationError, match="limit"):
         AuditEvent(
