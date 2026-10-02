@@ -155,11 +155,13 @@ def _import_psycopg() -> Any:
 
 
 def install_postgres_schema(owner_url: str | SecretStr, *, app_role: str) -> None:
-    """Create the audit table, its triggers and grants, as the owner role.
+    """Create the audit and approval tables, their triggers and grants, as the owner role.
 
     Run once per database by an operator, never by the application. The owner
-    keeps every privilege; `app_role` may only INSERT and SELECT on the audit table.
+    keeps every privilege; `app_role` may only INSERT and SELECT on the audit
+    table, and SELECT, INSERT and UPDATE on the approvals table.
     """
+    from aox_agent_core.approvals import sql as approvals_sql
     from aox_agent_core.audit import sql as audit_sql
 
     if not POSTGRES_ROLE_NAME.fullmatch(app_role):
@@ -170,6 +172,8 @@ def install_postgres_schema(owner_url: str | SecretStr, *, app_role: str) -> Non
     statements = (
         *audit_sql.POSTGRES_SCHEMA,
         *audit_sql.postgres_grants(app_role),
+        *approvals_sql.SCHEMA,
+        *approvals_sql.postgres_grants(app_role),
     )
 
     def install(session: Session) -> None:

@@ -1,0 +1,294 @@
+"""Approvals on SQLite and Postgres: who may resolve, compare-and-set, single use, audited."""
+
+import asyncio
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
+from typing import Any
+from uuid import UUID, uuid4
+
+import pytest
+
+from aox_agent_core.approvals import (
+    ApprovalRequest,
+    ApprovalStatus,
+    Decision,
+    DenialReason,
+    Principal,
+    PrincipalKind,
+    RoleApproverPolicy,
+)
+from aox_agent_core.approvals.sql import SQLApprovalQueue
+from aox_agent_core.audit.sql import SQLAuditLog
+from aox_agent_core.errors import (
+    ApprovalAlreadyResolvedError,
+    ApprovalExpiredError,
+    ApprovalNotFoundError,
+    ApprovalNotGrantedError,
+    ApprovalPayloadMismatchError,
+    NotAuthorizedToResolveError,
+)
+from databases import ControlDatabase, sqlite_database
+
+REQUESTER = Principal(id="agent-intake", kind=PrincipalKind.AGENT)
+APPROVER = Principal(id="user-17", kind=PrincipalKind.HUMAN, roles=frozenset({"ops.approver"}))
+OTHER_APPROVER = Principal(
+    id="user-23", kind=PrincipalKind.HUMAN, roles=frozenset({"ops.approver"})
+)
+AGENT_WITH_ROLE = Principal(id="agent-reviewer", kind=PrincipalKind.AGENT, roles=APPROVER.roles)
+HUMAN_REQUESTER = Principal(id="agent-intake", kind=PrincipalKind.HUMAN, roles=APPROVER.roles)
+PAYLOAD = {"contact_id": "c-1001", "phone": "+1-555-0100"}
+NOW = datetime(2026, 10, 2, 12, 0, tzinfo=UTC)
+
+
+class Clock:
+    def __init__(self) -> None:
+        self.now = NOW
+
+    def __call__(self) -> datetime:
+        return self.now
+
+
+def queue_for(database: ControlDatabase, clock: Clock | None = None) -> SQLApprovalQueue:
+    log = SQLAuditLog(database.database)
+    return SQLApprovalQueue(database.database, audit_log=log, clock=clock or Clock())
+
+
+async def submitted(queue: SQLApprovalQueue, requester: Principal = REQUESTER) -> ApprovalRequest:
+    return await queue.submit(
+        action="crm.update_contact",
+        summary="Update the sample contact's phone number",
+        payload=PAYLOAD,
+        requested_by=requester,
+        required_role="ops.approver",
+        ttl_seconds=3_600,
+    )
+
+
+async def audit_actions(database: ControlDatabase) -> list[tuple[str, str, Any]]:
+    log = SQLAuditLog(database.database)
+    return [
+        (record.action, record.actor_id, record.payload.get("reason"))
+        async for record in log.iter_records()
+    ]
+
+
+async def test_approve_then_consume_once(control_database: ControlDatabase) -> None:
+    queue = queue_for(control_database)
+    request = await submitted(queue)
+
+    approved = await queue.resolve(request.id, decision=Decision.APPROVE, principal=APPROVER)
+    consumed = await queue.consume(request.id, action="crm.update_contact", payload=PAYLOAD)
+
+    assert (approved.status, approved.resolved_by) == (ApprovalStatus.APPROVED, "user-17")
+    assert consumed.status is ApprovalStatus.CONSUMED
+    assert await queue.get(request.id) == consumed
+    with pytest.raises(ApprovalAlreadyResolvedError):
+        await queue.consume(request.id, action="crm.update_contact", payload=PAYLOAD)
+    assert await audit_actions(control_database) == [
+        ("approval.requested", "agent-intake", None),
+        ("approval.resolved", "user-17", None),
+        ("approval.consumed", "agent-intake", None),
+        ("approval.consume_denied", "agent-intake", "not_open"),
+    ]
+    assert (await SQLAuditLog(control_database.database).verify()).seq == 4
+
+
+@pytest.mark.parametrize(
+    ("principal", "reason"),
+    [
+        (
+            Principal(id="agent-reviewer", kind=PrincipalKind.AGENT, roles=APPROVER.roles),
+            "not_human",
+        ),
+        (Principal(id="user-40", kind=PrincipalKind.HUMAN), "missing_role"),
+    ],
+)
+async def test_unauthorized_resolvers_are_refused_and_audited(
+    control_database: ControlDatabase, principal: Principal, reason: str
+) -> None:
+    queue = queue_for(control_database)
+    request = await submitted(queue)
+
+    with pytest.raises(NotAuthorizedToResolveError, match=reason):
+        await queue.resolve(request.id, decision=Decision.APPROVE, principal=principal)
+
+    assert (await queue.get(request.id)).status is ApprovalStatus.PENDING
+    assert (await audit_actions(control_database))[-1] == (
+        "approval.resolve_denied",
+        principal.id,
+        reason,
+    )
+
+
+async def test_self_approval_is_refused(control_database: ControlDatabase) -> None:
+    queue = queue_for(control_database)
+    request = await submitted(queue, requester=APPROVER)
+
+    with pytest.raises(NotAuthorizedToResolveError, match="self_approval"):
+        await queue.resolve(request.id, decision=Decision.APPROVE, principal=APPROVER)
+
+    assert (await queue.get(request.id)).status is ApprovalStatus.PENDING
+    assert (await audit_actions(control_database))[-1][2] == "self_approval"
+
+
+async def test_expired_request_cannot_be_resolved(control_database: ControlDatabase) -> None:
+    clock = Clock()
+    queue = queue_for(control_database, clock)
+    request = await submitted(queue)
+    clock.now = NOW + timedelta(hours=1)
+
+    with pytest.raises(ApprovalExpiredError):
+        await queue.resolve(request.id, decision=Decision.APPROVE, principal=APPROVER)
+
+
+async def test_resolution_is_once_only(control_database: ControlDatabase) -> None:
+    queue = queue_for(control_database)
+    request = await submitted(queue)
+    await queue.resolve(request.id, decision=Decision.REJECT, principal=APPROVER, reason="no")
+
+    with pytest.raises(ApprovalAlreadyResolvedError):
+        await queue.resolve(request.id, decision=Decision.APPROVE, principal=OTHER_APPROVER)
+    with pytest.raises(ApprovalNotGrantedError):
+        await queue.consume(request.id, action="crm.update_contact", payload=PAYLOAD)
+
+
+async def test_concurrent_resolutions_have_one_winner(control_database: ControlDatabase) -> None:
+    queue = queue_for(control_database)
+    request = await submitted(queue)
+
+    outcomes = await asyncio.gather(
+        queue.resolve(request.id, decision=Decision.APPROVE, principal=APPROVER),
+        queue.resolve(request.id, decision=Decision.REJECT, principal=OTHER_APPROVER),
+        return_exceptions=True,
+    )
+
+    winners = [outcome for outcome in outcomes if isinstance(outcome, ApprovalRequest)]
+    losers = [outcome for outcome in outcomes if isinstance(outcome, BaseException)]
+    assert len(winners) == 1
+    assert [type(loser) for loser in losers] == [ApprovalAlreadyResolvedError]
+
+
+@pytest.mark.parametrize(
+    ("action", "payload"),
+    [
+        ("crm.update_contact", {**PAYLOAD, "phone": "+1-555-0199"}),
+        ("crm.delete_contact", PAYLOAD),
+    ],
+    ids=["changed-payload", "different-action"],
+)
+async def test_consume_is_bound_to_action_and_payload(
+    control_database: ControlDatabase, action: str, payload: dict[str, str]
+) -> None:
+    queue = queue_for(control_database)
+    request = await submitted(queue)
+    await queue.resolve(request.id, decision=Decision.APPROVE, principal=APPROVER)
+
+    with pytest.raises(ApprovalPayloadMismatchError):
+        await queue.consume(request.id, action=action, payload=payload)
+
+    assert (await queue.get(request.id)).status is ApprovalStatus.APPROVED
+
+
+async def test_pending_request_cannot_be_consumed(control_database: ControlDatabase) -> None:
+    queue = queue_for(control_database)
+    request = await submitted(queue)
+
+    with pytest.raises(ApprovalNotGrantedError):
+        await queue.consume(request.id, action="crm.update_contact", payload=PAYLOAD)
+
+
+async def test_approval_expires_before_use(control_database: ControlDatabase) -> None:
+    clock = Clock()
+    queue = queue_for(control_database, clock)
+    request = await submitted(queue)
+    await queue.resolve(request.id, decision=Decision.APPROVE, principal=APPROVER)
+    clock.now = NOW + timedelta(hours=2)
+
+    with pytest.raises(ApprovalExpiredError):
+        await queue.consume(request.id, action="crm.update_contact", payload=PAYLOAD)
+
+
+async def test_unknown_request_is_reported_and_audited(control_database: ControlDatabase) -> None:
+    queue = queue_for(control_database)
+
+    with pytest.raises(ApprovalNotFoundError):
+        await queue.resolve(uuid4(), decision=Decision.APPROVE, principal=APPROVER)
+    assert (await audit_actions(control_database))[-1][2] == "not_found"
+
+
+async def test_list_pending_shows_only_what_the_principal_may_resolve(
+    control_database: ControlDatabase,
+) -> None:
+    queue = queue_for(control_database)
+    request = await submitted(queue)
+
+    assert [pending.id for pending in await queue.list_pending(APPROVER)] == [request.id]
+    assert await queue.list_pending(REQUESTER) == []
+
+
+async def test_failed_audit_write_rolls_back_the_resolution(
+    control_database: ControlDatabase, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    queue = queue_for(control_database)
+    request = await submitted(queue)
+
+    def fail(*_args: object) -> None:
+        raise RuntimeError("audit write failed")
+
+    monkeypatch.setattr(SQLAuditLog, "append_in", fail)
+    with pytest.raises(RuntimeError, match="audit write failed"):
+        await queue.resolve(request.id, decision=Decision.APPROVE, principal=APPROVER)
+    monkeypatch.undo()
+
+    assert (await queue.get(request.id)).status is ApprovalStatus.PENDING
+
+
+async def test_audit_log_on_another_database_still_records(tmp_path: Path) -> None:
+    approvals_db = sqlite_database(tmp_path / "approvals")
+    audit_db = sqlite_database(tmp_path / "audit")
+    queue = SQLApprovalQueue(approvals_db.database, audit_log=SQLAuditLog(audit_db.database))
+
+    await submitted(queue)
+
+    assert [action for action, _, _ in await audit_actions(audit_db)] == ["approval.requested"]
+
+
+@pytest.mark.parametrize(
+    ("principal", "status", "expired", "reason"),
+    [
+        (Principal(id="svc-batch", kind=PrincipalKind.SERVICE), "pending", False, "not_human"),
+        (APPROVER.model_copy(update={"roles": frozenset()}), "pending", False, "missing_role"),
+        (HUMAN_REQUESTER, "pending", False, "self_approval"),
+        (APPROVER, "approved", False, "not_pending"),
+        (APPROVER, "pending", True, "expired"),
+        (APPROVER, "pending", False, None),
+    ],
+)
+def test_role_policy_checks_in_order(
+    principal: Principal, status: str, expired: bool, reason: str | None
+) -> None:
+    resolved: dict[str, Any] = (
+        {"decision": Decision.APPROVE, "resolved_by": "user-99", "resolved_at": NOW}
+        if status == "approved"
+        else {}
+    )
+    request = ApprovalRequest.model_validate(
+        {
+            "id": UUID("00000000-0000-4000-8000-000000000001"),
+            "action": "crm.update_contact",
+            "summary": "s",
+            "payload_sha256": "a" * 64,
+            "requested_by": "agent-intake",
+            "required_role": "ops.approver",
+            "created_at": NOW,
+            "expires_at": NOW + timedelta(hours=1),
+            "status": ApprovalStatus(status),
+            **resolved,
+        }
+    )
+    now = NOW + timedelta(hours=2) if expired else NOW
+
+    verdict = RoleApproverPolicy().evaluate(principal, request, now=now)
+
+    assert verdict.reason == (DenialReason(reason) if reason else None)
+    assert verdict.allowed is (reason is None)

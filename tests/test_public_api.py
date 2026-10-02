@@ -71,6 +71,8 @@ EXPECTED_EXPORTS = {
         "PrincipalKind",
         "ResolveVerdict",
         "RoleApproverPolicy",
+        "SQLApprovalQueue",
+        "approval_payload_hash",
     ],
     "aox_agent_core.audit": [
         "AUDIT_SCHEMA_VERSION",
