@@ -28,6 +28,9 @@ max_tokens = 16000
 
 # Prices are US dollars per million tokens, written as strings so they parse
 # to exact decimals. Re-check them against the source before every release.
+# Tables merge key by key, so a project overriding a price must restate every
+# field of that model, and that provider's as_of and source; otherwise the
+# defaults' values and date silently remain.
 
 [pricing.anthropic]
 as_of = 2026-10-02

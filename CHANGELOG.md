@@ -13,6 +13,8 @@ Pre-releases are spelled the PEP 440 way, so tags look like `v0.1.0a1`.
 - Package layout and public interfaces (protocols, config models) as stubs.
 - Configuration with packaged defaults: tier models and dated Anthropic and Bedrock prices.
 - API key read only from an explicit argument or `AGENT_CORE_ANTHROPIC_API_KEY`.
+- Audit database URL from `AGENT_CORE_AUDIT_DATABASE_URL`; a password in a config file is refused.
+- Approvals are bound to their action and payload and are single-use.
 - Error hierarchy.
 - Extras `bedrock`, `postgres`, `otel` and `testing`.
 - CI: lint, types and tests on Python 3.11 to 3.14, package check and gitleaks.
