@@ -9,12 +9,17 @@ from typing import Any
 
 import pytest
 
-from aox_agent_core import Message, Provider, Role
+from aox_agent_core import Message, PromptRef, Provider, Role, Tier
 from aox_agent_core.audit import AuditEvent, SQLAuditLog
 from aox_agent_core.cli import main
 from aox_agent_core.config import SecretAction
 from aox_agent_core.models import ProviderRequest
-from aox_agent_core.replay import DirectoryRecordingStore, PatternScrubber, RecordingProvider
+from aox_agent_core.replay import (
+    DirectoryRecordingStore,
+    PatternScrubber,
+    PromptKey,
+    RecordingProvider,
+)
 from aox_agent_core.storage import open_database
 from support import ScriptedProvider, response
 
@@ -142,6 +147,38 @@ async def test_redacted_cassette_passes_the_check(
 
     assert main(["cassettes", "check", str(tmp_path)]) == 0
     assert fake_key not in only_recording(tmp_path).read_text()
+
+
+async def test_redacted_prompted_recording_passes_the_check(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    fake_key = "sk-ant-" + "p" * 24
+    redacting = DirectoryRecordingStore(
+        tmp_path, scrubber=PatternScrubber(), on_secret=SecretAction.REDACT
+    )
+    recorder = RecordingProvider(ScriptedProvider(response("ok")), redacting, "redacted")
+    prompt = PromptRef(id="notes.summarize", version=1, template="Summarize ${note}")
+    key = PromptKey.for_call(
+        prompt,
+        tier=Tier.SMALL,
+        output_schema=None,
+        output_json_schema=None,
+        inputs={"note": f"key {fake_key}"},
+        attachments=(),
+        attempt=1,
+    )
+    await recorder.complete(
+        ProviderRequest(
+            provider=Provider.ANTHROPIC,
+            model="claude-haiku-4-5-20251001",
+            messages=(Message(role=Role.USER, content=f"Summarize key {fake_key}"),),
+            max_tokens=10,
+        ),
+        prompt_key=key,
+    )
+
+    assert main(["cassettes", "check", str(tmp_path)]) == 0, capsys.readouterr().out
+    assert only_recording(tmp_path).stem == key.key
 
 
 def test_unreadable_file_is_a_problem_not_a_crash(

@@ -11,7 +11,6 @@ expected. Recording a key again replaces its file.
 import json
 import os
 import tempfile
-from collections.abc import Iterator
 from pathlib import Path
 from typing import Any, Final
 
@@ -52,15 +51,15 @@ class DirectoryRecordingStore:
         self._scrubber = scrubber
         self._on_secret = on_secret
 
-    def prompt_path(self, prompt: PromptKey) -> Path:
-        """Where the recording of a prompted call lives."""
+    def prompt_path(self, prompt: PromptKey, key: str | None = None) -> Path:
+        """Where the recording of a prompted call lives: under `key`, or else prompt.key."""
         # PromptId allows no '/' and cannot start with '.', so this stays under the root.
         return (
             self.directory
             / PROMPTS_DIRECTORY
             / prompt.prompt_id
             / f"v{prompt.version}"
-            / f"{prompt.key}.json"
+            / f"{key if key is not None else prompt.key}.json"
         )
 
     def request_path(self, cassette: CassetteName, request_key: str, sequence: int) -> Path:
@@ -68,8 +67,13 @@ class DirectoryRecordingStore:
         return self.directory / REQUESTS_DIRECTORY / cassette / f"{request_key}.{sequence}.json"
 
     def path_of(self, recording: Recording, *, cassette: CassetteName) -> Path:
+        """Where a recording belongs, by the key it was recorded under.
+
+        That is replay_hash, not a key recomputed from the stored fields: in a
+        redacted recording those no longer match what was sent.
+        """
         if recording.prompt is not None:
-            return self.prompt_path(recording.prompt)
+            return self.prompt_path(recording.prompt, recording.replay_hash)
         return self.request_path(cassette, recording.replay_hash, recording.sequence)
 
     def load(self, path: Path) -> Recording | None:
@@ -85,14 +89,6 @@ class DirectoryRecordingStore:
         except (OSError, UnicodeDecodeError) as error:
             raise CassetteFormatError(f"Cannot read recording {path}: {error}") from error
         return parse_recording(text, source=path)
-
-    def prompt_recordings(self, prompt_id: str, version: int) -> Iterator[Recording]:
-        """Every recording of one prompt version, for explaining a miss."""
-        version_directory = self.directory / PROMPTS_DIRECTORY / prompt_id / f"v{version}"
-        for path in sorted(version_directory.glob("*.json")):
-            recording = self.load(path)
-            if recording is not None:
-                yield recording
 
     def save(self, recording: Recording, *, cassette: CassetteName) -> Path:
         """Write a recording, replacing any earlier one at its path, and return the path."""

@@ -2,6 +2,7 @@
 
 import hashlib
 import json
+import shutil
 from pathlib import Path
 from typing import Any
 
@@ -203,6 +204,49 @@ async def test_an_edit_without_a_version_bump_is_stale_not_silent(
         await replay.complete(
             request(), prompt_key=prompt_key(changed_prompt, output_json_schema=changed_schema)
         )
+
+
+async def test_a_schema_only_change_points_at_a_dependency_upgrade(tmp_path: Path) -> None:
+    recorder = RecordingProvider(ScriptedProvider(response("old")), store(tmp_path), "default")
+    await recorder.complete(request(), prompt_key=prompt_key())
+    replay = ReplayProvider(store(tmp_path), "default")
+
+    with pytest.raises(StaleRecordingError, match="upgrading anthropic or pydantic"):
+        await replay.complete(
+            request(), prompt_key=prompt_key(output_json_schema={"type": "object", "x": 1})
+        )
+
+
+async def test_a_broken_sibling_file_does_not_hide_the_miss(tmp_path: Path) -> None:
+    version_directory = tmp_path / "prompts" / "receipts.extract" / "v3"
+    version_directory.mkdir(parents=True)
+    (version_directory / "garbage.json").write_text("{not json")
+    replay = ReplayProvider(store(tmp_path), "default")
+
+    with pytest.raises(ReplayMissError) as caught:
+        await replay.complete(request(), prompt_key=prompt_key())
+
+    assert caught.value.key == prompt_key().key
+
+
+async def test_a_copied_prompted_recording_is_refused(tmp_path: Path) -> None:
+    recorder = RecordingProvider(ScriptedProvider(response("a")), store(tmp_path), "default")
+    await recorder.complete(request(), prompt_key=prompt_key())
+    other = prompt_key(inputs={"text": "Total 99.00"})
+    shutil.copy(store(tmp_path).prompt_path(prompt_key()), store(tmp_path).prompt_path(other))
+
+    with pytest.raises(CassetteFormatError, match="copied or renamed"):
+        await ReplayProvider(store(tmp_path), "default").complete(request(), prompt_key=other)
+
+
+async def test_a_renamed_unprompted_recording_is_refused(tmp_path: Path) -> None:
+    recorder = RecordingProvider(ScriptedProvider(response("a")), store(tmp_path), "seq")
+    await recorder.complete(request())
+    (path,) = (tmp_path / "requests" / "seq").glob("*.json")
+    path.rename(path.with_name(f"{request_hash(request('other'))}.0.json"))
+
+    with pytest.raises(CassetteFormatError, match="copied or renamed"):
+        await ReplayProvider(store(tmp_path), "seq").complete(request("other"))
 
 
 # Unprompted recordings

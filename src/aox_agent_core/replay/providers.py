@@ -4,7 +4,8 @@ from collections import Counter
 from pathlib import Path
 
 from aox_agent_core._model import CassetteName
-from aox_agent_core.errors import ReplayMissError, StaleRecordingError
+from aox_agent_core.config import Tier
+from aox_agent_core.errors import CassetteFormatError, ReplayMissError, StaleRecordingError
 from aox_agent_core.models.provider import ModelProvider, close_provider
 from aox_agent_core.models.types import ProviderRequest, ProviderResponse
 from aox_agent_core.replay.keys import PromptKey, request_hash
@@ -45,6 +46,14 @@ class ReplayProvider:
                 key=key,
                 path=str(path),
             )
+        if recording.prompt is not None or (recording.replay_hash, recording.sequence) != (
+            key,
+            sequence,
+        ):
+            raise CassetteFormatError(
+                f"{path} does not hold the recording of request {key}, call {sequence + 1}; "
+                "it was copied or renamed. Record it again with AGENT_CORE_MODE=record."
+            )
         self._served[key] += 1
         return _as_replayed(recording)
 
@@ -57,14 +66,14 @@ class ReplayProvider:
                 key=prompt_key.key,
                 path=str(path),
             )
-        assert recording.prompt is not None  # noqa: S101 - prompt_path only holds prompted ones
+        if recording.prompt is None or recording.replay_hash != prompt_key.key:
+            raise CassetteFormatError(
+                f"{path} does not hold the recording of key {prompt_key.key}; it was copied "
+                "or renamed. Record it again with AGENT_CORE_MODE=record."
+            )
         stale = prompt_key.stale_parts(recording.prompt)
         if stale:
-            raise StaleRecordingError(
-                f"The recording at {path} was made with a different {' and '.join(stale)} "
-                f"for prompt {prompt_key.prompt_id} v{prompt_key.version}. Bump the prompt "
-                "version, or record it again with AGENT_CORE_MODE=record."
-            )
+            raise StaleRecordingError(_stale_message(prompt_key, path, stale))
         return _as_replayed(recording)
 
     def _prompted_miss_message(self, prompt_key: PromptKey, path: Path) -> str:
@@ -72,11 +81,14 @@ class ReplayProvider:
             f"No recording for prompt {prompt_key.prompt_id} v{prompt_key.version} "
             f"(attempt {prompt_key.attempt}) with key {prompt_key.key} at {path}."
         )
-        other_tiers = sorted(
-            recording.prompt.tier.value
-            for recording in self._store.prompt_recordings(prompt_key.prompt_id, prompt_key.version)
-            if recording.prompt is not None and prompt_key.differs_only_in_tier(recording.prompt)
-        )
+        # Only the files this call would have used on another tier are looked for,
+        # so the cost stays constant and no other recording is read.
+        other_tiers = [
+            tier.value
+            for tier in Tier
+            if tier is not prompt_key.tier
+            and self._store.prompt_path(prompt_key.model_copy(update={"tier": tier})).exists()
+        ]
         if other_tiers:
             message += (
                 f" This call routed to the {prompt_key.tier.value} tier, but it was recorded on "
@@ -84,6 +96,21 @@ class ReplayProvider:
                 "example after a price-table change."
             )
         return message + " Record it with AGENT_CORE_MODE=record."
+
+
+def _stale_message(prompt_key: PromptKey, path: Path, stale: list[str]) -> str:
+    message = (
+        f"The recording at {path} was made with a different {' and '.join(stale)} "
+        f"for prompt {prompt_key.prompt_id} v{prompt_key.version}."
+    )
+    if stale == ["output schema"]:
+        return message + (
+            " Either the output model changed, which needs a new prompt version, or the "
+            "JSON schema the SDK generates from it did, for example after upgrading "
+            "anthropic or pydantic, which needs the recording made again with "
+            "AGENT_CORE_MODE=record."
+        )
+    return message + " Bump the prompt version, or record it again with AGENT_CORE_MODE=record."
 
 
 def _as_replayed(recording: Recording) -> ProviderResponse:

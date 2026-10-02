@@ -140,12 +140,6 @@ class PromptKey(FrozenModel):
             attempt=self.attempt,
         )
 
-    def differs_only_in_tier(self, other: "PromptKey") -> bool:
-        """True when `other` is this call on another tier, e.g. before a budget drop."""
-        return self.tier != other.tier and self.model_copy(update={"tier": other.tier}).key == (
-            other.key
-        )
-
     def stale_parts(self, recorded: "PromptKey") -> list[str]:
         """Which of template, system prompt and output schema changed since `recorded`."""
         changes = {
