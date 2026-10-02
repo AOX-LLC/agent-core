@@ -232,7 +232,7 @@ class SQLApprovalQueue:
                     return False
                 after = page[-1]
                 if session.dialect is Dialect.SQLITE:
-                    return True
+                    return len(eligible) < limit
             return False
 
         # Postgres reads never block writers, so all pages share one transaction.

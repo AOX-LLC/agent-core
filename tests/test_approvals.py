@@ -512,3 +512,23 @@ def test_socket_paths_keep_their_case_and_pgport_sets_the_default_port(
     assert not without_port.same_database(
         open_database("postgresql://agent_core_app@db.example:5432/audit")
     )
+
+
+async def test_a_full_listing_reads_no_extra_page(
+    control_database: ControlDatabase, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    queue = queue_for(control_database)
+    for _ in range(2):
+        await submitted(queue)
+    transactions = 0
+    run = control_database.database.run
+
+    async def counting_run(*args: Any, **kwargs: Any) -> Any:
+        nonlocal transactions
+        transactions += 1
+        return await run(*args, **kwargs)
+
+    monkeypatch.setattr(control_database.database, "run", counting_run)
+
+    assert len(await queue.list_pending(APPROVER, limit=2)) == 2
+    assert transactions == 1
