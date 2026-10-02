@@ -21,6 +21,7 @@ from aox_agent_core.evals.types import (
 )
 from aox_agent_core.models.client import AgentClient
 
+# The system under test: takes one case and returns its output and cost.
 EvalTarget = Callable[[EvalCase], Awaitable[TargetOutput]]
 
 MAX_ERROR_LENGTH = 200
@@ -40,7 +41,8 @@ class EvalRunner:
 
     Latency is measured around each target call. A target that raises is
     recorded as a failed case with its error type and message; the run
-    continues. In CI the target runs in replay mode, so a run costs nothing.
+    continues. A scorer that raises is not caught and fails the whole run. A target
+    built on an AgentClient in replay mode (the client's default) costs nothing.
     """
 
     def __init__(self, scorers: Sequence[Scorer], *, concurrency: int = 4) -> None:
@@ -96,7 +98,8 @@ def model_call_target(
     """A target that sends each case's input (a string) as the prompt.
 
     Structured output is returned as its JSON form, so FieldMatch can compare it,
-    and the call's cost is carried into the scorecard.
+    and the call's cost is carried into the scorecard. A non-string input raises
+    TypeError, which the runner records as that case's failure.
     """
 
     async def call(case: EvalCase) -> TargetOutput:
@@ -116,6 +119,7 @@ def model_call_target(
 def _scorecard(
     suite: str, started_at: datetime, finished_at: datetime, results: tuple[CaseResult, ...]
 ) -> Scorecard:
+    # The suite has at least one case, so the divisions and percentiles below are safe.
     passed = [
         result
         for result in results

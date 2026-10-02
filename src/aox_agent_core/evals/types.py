@@ -53,8 +53,9 @@ class EvalSuite(FrozenModel):
     def from_jsonl(cls, path: Path, *, name: str | None = None) -> Self:
         """Load one EvalCase per line. The suite is named after the file unless given a name.
 
-        Blank lines are skipped. Raises EvalError naming the line of the first
-        problem.
+        Blank lines are skipped. Raises EvalError if the file cannot be read, naming
+        the file and line of the first invalid case, or the file if the cases
+        together are not a valid suite (none, or duplicate ids).
         """
         try:
             lines = path.read_text(encoding="utf-8").splitlines()
@@ -83,7 +84,7 @@ class TargetOutput(FrozenModel):
 
 
 class Score(FrozenModel):
-    """One scorer's judgment of one case."""
+    """One scorer's judgment of one case. value is 0 to 1; passed is the verdict."""
 
     scorer: str
     value: UnitInterval
@@ -121,6 +122,7 @@ class Scorecard(FrozenModel):
     cost_per_case_usd: NonNegativeUsd
 
     def failures(self) -> Sequence[CaseResult]:
+        """Results that errored, have no scores, or have a failed score."""
         return [
             result
             for result in self.results

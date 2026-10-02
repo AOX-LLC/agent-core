@@ -40,6 +40,7 @@ def render_scorecard_markdown(scorecard: Scorecard) -> str:
 
 
 def _why_failed(result: CaseResult) -> str:
+    """The error if the target raised, else each failed score's detail."""
     if result.error is not None:
         return _cell(result.error)
     if not result.scores:

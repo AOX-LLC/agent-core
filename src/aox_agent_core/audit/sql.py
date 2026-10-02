@@ -106,11 +106,15 @@ class SQLAuditLog:
         self._protections_checked = False
 
     async def append(self, event: AuditEvent) -> AuditRecord:
+        """Validate and scrub the event, then add it to the chain in its own transaction."""
         checked = self.checked_event(event)
         return await self.database.run(lambda session: self.append_in(session, checked), write=True)
 
     def checked_event(self, event: AuditEvent) -> AuditEvent:
-        """Re-validate an event and scan its payload strings for secrets."""
+        """Re-validate an event and scan its payload strings for secrets.
+
+        Raises AuditPayloadRejectedError if it is no longer valid or holds a secret.
+        """
         try:
             revalidated = AuditEvent.model_validate(event.model_dump())
         except ValidationError as error:
@@ -151,6 +155,7 @@ class SQLAuditLog:
         return record
 
     async def iter_records(self, *, after_seq: int = 0) -> AsyncIterator[AuditRecord]:
+        """Yield records with seq greater than after_seq, in order, read in batches."""
         last_seq = after_seq
         while True:
             batch = partial(_rows_after, after_seq=last_seq, limit=READ_BATCH_SIZE)
@@ -163,6 +168,7 @@ class SQLAuditLog:
                 return
 
     async def head(self) -> AuditHead:
+        """The latest record's seq and hash; seq 0 and the genesis hash if the log is empty."""
         return await self.database.run(_head_in)
 
     async def verify(self, *, expected_head: AuditHead | None = None) -> AuditHead:
@@ -199,6 +205,7 @@ class SQLAuditLog:
         return head
 
     def _ensure_protected(self, session: Session) -> None:
+        # Checked once per log object; a role or trigger change later is not noticed.
         if self._protections_checked:
             return
         if session.dialect is Dialect.SQLITE:
@@ -212,6 +219,7 @@ class SQLAuditLog:
 
 
 def _check_anchor(head: AuditHead, expected: AuditHead, anchored_hash: str | None) -> None:
+    """Fail unless the walked log still contains the expected head at its seq."""
     if expected.seq > head.seq:
         raise AuditIntegrityError(
             f"The log ends at record {head.seq}, but the anchor was taken at record "
@@ -299,6 +307,7 @@ def _table_is_readable(session: Session) -> bool:
 
 
 def _head_in(session: Session) -> AuditHead:
+    # A missing table means nothing was ever written, which is an empty log, not an error.
     if not _table_is_readable(session):
         return AuditHead(seq=0, record_hash=GENESIS_HASH)
     rows = session.execute(f"SELECT seq, record_hash FROM {AUDIT_TABLE} ORDER BY seq DESC LIMIT 1")
@@ -309,6 +318,7 @@ def _head_in(session: Session) -> AuditHead:
 
 
 def _rows_after(session: Session, after_seq: int, limit: int | None) -> list[tuple[Any, ...]]:
+    # limit is formatted in, not bound, and int() keeps that safe.
     if not _table_is_readable(session):
         return []
     limit_clause = f" LIMIT {int(limit)}" if limit is not None else ""
@@ -334,6 +344,7 @@ def _row_values(record: AuditRecord) -> tuple[Any, ...]:
 
 
 def record_from_row(row: tuple[Any, ...]) -> AuditRecord:
+    """Rebuild a record from a COLUMNS-ordered row; AuditIntegrityError if it is malformed."""
     seq, schema_version, event_id, occurred_at, action, actor_id, subject_id = row[:7]
     payload, prev_hash, record_hash = row[7:]
     try:

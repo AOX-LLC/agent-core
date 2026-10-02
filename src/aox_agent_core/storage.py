@@ -31,6 +31,8 @@ POSTGRES_ROLE_NAME = re.compile(r"[a-z_][a-z0-9_]{0,62}")
 
 
 class Dialect(StrEnum):
+    """The SQL dialects the library supports."""
+
     SQLITE = "sqlite"
     POSTGRES = "postgres"
 
@@ -55,6 +57,7 @@ class Session:
         return int(self._cursor.rowcount)
 
     def _native(self, sql: str) -> str:
+        # Plain replace: the library's SQL never has a literal '?' inside a string.
         return sql.replace("?", "%s") if self.dialect is Dialect.POSTGRES else sql
 
 
@@ -66,12 +69,15 @@ class Database(ABC):
     async def run(self, work: Callable[[Session], ResultT], *, write: bool = False) -> ResultT:
         """Run `work` in one transaction on a worker thread and return its result.
 
-        A write transaction takes the database's write lock up front (BEGIN
-        IMMEDIATE on SQLite), so concurrent writers queue instead of failing later.
+        On SQLite a write transaction takes the database's write lock up front (BEGIN
+        IMMEDIATE), so concurrent writers queue instead of failing later. Postgres
+        has no equivalent here; writers that must be serialized take their own lock
+        (the audit log uses an advisory lock).
         """
         return await asyncio.to_thread(self.run_sync, work, write=write)
 
     def run_sync(self, work: Callable[[Session], ResultT], *, write: bool = False) -> ResultT:
+        """Blocking form of run(). Commits if `work` returns, rolls back if it raises."""
         with self._transaction(write=write) as session:
             return work(session)
 

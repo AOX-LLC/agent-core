@@ -166,13 +166,14 @@ class SQLApprovalQueue:
         return await self._write(insert)
 
     async def get(self, request_id: UUID) -> ApprovalRequest:
+        """Return the request; raises ApprovalNotFoundError if there is none."""
         request = await self.database.run(lambda session: _load(session, request_id))
         if request is None:
             raise ApprovalNotFoundError(f"No approval request {request_id}.")
         return request
 
     async def list_pending(self, principal: Principal) -> Sequence[ApprovalRequest]:
-        """Pending, unexpired requests that this principal may resolve."""
+        """Pending, unexpired requests that this principal may resolve, oldest first."""
         now = self._clock()
         pending = await self.database.run(_load_pending)
         return [
@@ -392,11 +393,13 @@ def _missing_event(action: str, actor_id: str | None, request_id: UUID) -> Audit
 
 
 def _ensure_table(session: Session) -> None:
+    # On Postgres the owner role installs the table; the app role cannot create it.
     if session.dialect is Dialect.SQLITE:
         session.execute(_TABLE_DDL.replace("CREATE TABLE", "CREATE TABLE IF NOT EXISTS", 1))
 
 
 def _table_exists(session: Session) -> bool:
+    # Reads before the first submit see "no table", which means "no requests".
     if session.dialect is Dialect.SQLITE:
         return bool(
             session.execute(
@@ -449,6 +452,7 @@ def _row_values(request: ApprovalRequest) -> tuple[Any, ...]:
 
 
 def _request_from_row(row: tuple[Any, ...]) -> ApprovalRequest:
+    # NULL columns are dropped so the model's defaults apply.
     names = [name.strip() for name in _COLUMNS.split(",")]
     return ApprovalRequest.model_validate(
         {name: value for name, value in zip(names, row, strict=True) if value is not None}
