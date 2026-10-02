@@ -1,8 +1,9 @@
 """The cassette file format: recorded requests and their responses.
 
 Consuming projects commit cassettes to their own repositories, so this format and
-the request key are stable public API. format_version changes only with a
-migration path.
+the request hash are stable public API. The field is called request_hash, not
+request_key, because secret scanners such as gitleaks flag any high-entropy value
+whose name contains "key". format_version changes only with a migration path.
 """
 
 from typing import Annotated, Final, Literal
@@ -23,7 +24,7 @@ class CassetteEntry(FrozenModel):
     run replays its two responses in order.
     """
 
-    request_key: Sha256Hex
+    request_hash: Sha256Hex
     sequence: Annotated[int, Field(ge=0)]
     request: ProviderRequest
     response: ProviderResponse
@@ -37,7 +38,7 @@ class Cassette(FrozenModel):
     entries: tuple[CassetteEntry, ...] = ()
 
 
-def request_key(request: ProviderRequest) -> str:
+def request_hash(request: ProviderRequest) -> str:
     """Return the SHA-256 hex digest that identifies a request in a cassette.
 
     The digest covers the request as canonical JSON: keys sorted, no insignificant

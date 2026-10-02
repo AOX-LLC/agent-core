@@ -13,7 +13,7 @@ from aox_agent_core.replay import (
     PatternScrubber,
     RecordingProvider,
     ReplayProvider,
-    request_key,
+    request_hash,
 )
 from support import ScriptedProvider, response
 
@@ -37,10 +37,10 @@ def store(tmp_path: Path, on_secret: SecretAction = SecretAction.REFUSE) -> Dire
 
 
 def test_request_key_is_stable_and_ignores_unset_fields() -> None:
-    assert request_key(request()) == request_key(request())
-    assert request_key(request()) == request_key(request(system=None))
-    assert request_key(request()) != request_key(request("hello!"))
-    assert request_key(request()) != request_key(request(system="be brief"))
+    assert request_hash(request()) == request_hash(request())
+    assert request_hash(request()) == request_hash(request(system=None))
+    assert request_hash(request()) != request_hash(request("hello!"))
+    assert request_hash(request()) != request_hash(request(system="be brief"))
 
 
 def test_request_key_is_sha256_of_canonical_json() -> None:
@@ -53,7 +53,7 @@ def test_request_key_is_sha256_of_canonical_json() -> None:
         ensure_ascii=False,
     )
 
-    assert request_key(request()) == hashlib.sha256(canonical.encode()).hexdigest()
+    assert request_hash(request()) == hashlib.sha256(canonical.encode()).hexdigest()
 
 
 async def test_record_then_replay_round_trip(tmp_path: Path) -> None:

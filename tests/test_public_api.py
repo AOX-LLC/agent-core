@@ -56,7 +56,7 @@ EXPECTED_EXPORTS = {
         "ReplayProvider",
         "Scrubber",
         "SecretFinding",
-        "request_key",
+        "request_hash",
     ],
     "aox_agent_core.tracing": ["INSTRUMENTATION_NAME", "attributes", "get_tracer"],
     "aox_agent_core.approvals": [

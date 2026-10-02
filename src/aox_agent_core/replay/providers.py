@@ -5,7 +5,7 @@ from collections import Counter, defaultdict
 from aox_agent_core.errors import ReplayMissError
 from aox_agent_core.models.provider import ModelProvider
 from aox_agent_core.models.types import ProviderRequest, ProviderResponse
-from aox_agent_core.replay.cassette import Cassette, CassetteEntry, request_key
+from aox_agent_core.replay.cassette import Cassette, CassetteEntry, request_hash
 from aox_agent_core.replay.store import CassetteStore
 
 
@@ -23,7 +23,7 @@ class ReplayProvider:
         self._served: Counter[str] = Counter()
 
     async def complete(self, request: ProviderRequest) -> ProviderResponse:
-        key = request_key(request)
+        key = request_hash(request)
         recordings = self._load().get(key, [])
         call_number = self._served[key]
         if call_number >= len(recordings):
@@ -38,7 +38,7 @@ class ReplayProvider:
         if self._recordings is None:
             grouped: dict[str, list[CassetteEntry]] = defaultdict(list)
             for entry in self._store.load(self._cassette_name).entries:
-                grouped[entry.request_key].append(entry)
+                grouped[entry.request_hash].append(entry)
             self._recordings = {
                 key: sorted(entries, key=lambda entry: entry.sequence)
                 for key, entries in grouped.items()
@@ -64,9 +64,9 @@ class RecordingProvider:
 
     async def complete(self, request: ProviderRequest) -> ProviderResponse:
         response = await self._live.complete(request)
-        key = request_key(request)
+        key = request_hash(request)
         entry = CassetteEntry(
-            request_key=key, sequence=self._recorded[key], request=request, response=response
+            request_hash=key, sequence=self._recorded[key], request=request, response=response
         )
         self._store.save(Cassette(name=self._cassette_name, entries=(*self._entries, entry)))
         self._entries.append(entry)
