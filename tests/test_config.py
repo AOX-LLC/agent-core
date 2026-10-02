@@ -175,12 +175,31 @@ def test_invalid_secret_pattern_is_rejected() -> None:
         ReplayConfig(extra_secret_patterns={"broken": "("})
 
 
-def test_audit_database_url_is_hidden_in_repr(tmp_path: Path) -> None:
+def test_audit_url_with_a_password_is_refused_in_a_file(tmp_path: Path) -> None:
     override = write_override(
-        tmp_path, 'audit_database_url = "postgresql://app:hunter2@localhost:4202/audit"\n'
+        tmp_path, '[audit]\ndatabase_url = "postgresql://app:hunter2@localhost:4202/audit"\n'
     )
+
+    with pytest.raises(ConfigError, match="AGENT_CORE_AUDIT_DATABASE_URL") as caught:
+        load_config(override, environ=NO_ENVIRONMENT)
+
+    assert "hunter2" not in str(caught.value)
+
+
+def test_audit_url_without_a_password_is_allowed_in_a_file(tmp_path: Path) -> None:
+    override = write_override(tmp_path, '[audit]\ndatabase_url = "sqlite:///audit.sqlite3"\n')
 
     config = load_config(override, environ=NO_ENVIRONMENT)
 
+    assert config.audit.database_url is not None
+    assert config.audit.database_url.get_secret_value() == "sqlite:///audit.sqlite3"
+
+
+def test_audit_url_comes_from_the_environment_and_stays_hidden() -> None:
+    database_url = "postgresql://app:hunter2@localhost:4202/audit"
+
+    config = load_config(environ={"AGENT_CORE_AUDIT_DATABASE_URL": database_url})
+
+    assert config.audit.database_url is not None
+    assert config.audit.database_url.get_secret_value() == database_url
     assert "hunter2" not in repr(config)
-    assert config.audit_database_url is not None

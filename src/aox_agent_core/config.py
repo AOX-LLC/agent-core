@@ -15,6 +15,7 @@ from enum import StrEnum
 from importlib import resources
 from pathlib import Path
 from typing import Annotated, Any, Self
+from urllib.parse import urlsplit
 
 from pydantic import Field, SecretStr, StringConstraints, ValidationError, model_validator
 
@@ -23,6 +24,7 @@ from aox_agent_core.errors import ConfigError
 
 CONFIG_PATH_ENV = "AGENT_CORE_CONFIG"
 MODE_ENV = "AGENT_CORE_MODE"
+AUDIT_DATABASE_URL_ENV = "AGENT_CORE_AUDIT_DATABASE_URL"
 
 TaskName = Annotated[str, StringConstraints(pattern=r"^[a-z][a-z0-9_]{0,63}$")]
 RuleName = Annotated[str, StringConstraints(pattern=r"^[a-z][a-z0-9_]{0,63}$")]
@@ -178,6 +180,16 @@ class TracingConfig(FrozenModel):
     capture_content: bool = False
 
 
+class AuditConfig(FrozenModel):
+    """Where the audit log is stored: a sqlite:/// or postgresql:// URL.
+
+    A URL carrying a password belongs in AGENT_CORE_AUDIT_DATABASE_URL, never in
+    a config file a project commits; load_config refuses one found in a file.
+    """
+
+    database_url: SecretStr | None = None
+
+
 class AgentCoreConfig(FrozenModel):
     """The library's whole configuration."""
 
@@ -186,7 +198,7 @@ class AgentCoreConfig(FrozenModel):
     pricing: Mapping[Provider, ProviderPricing]
     replay: ReplayConfig = ReplayConfig()
     tracing: TracingConfig = TracingConfig()
-    audit_database_url: SecretStr | None = None
+    audit: AuditConfig = AuditConfig()
 
     @model_validator(mode="after")
     def _every_tier_is_priced(self) -> Self:
@@ -216,24 +228,39 @@ def load_config(
 
     The override file is `path` if given, else the file named by AGENT_CORE_CONFIG.
     It is merged over the defaults table by table, so a project can replace a
-    single tier without restating the rest. AGENT_CORE_MODE, when set, overrides
-    the mode last.
+    single tier without restating the rest. AGENT_CORE_MODE and
+    AGENT_CORE_AUDIT_DATABASE_URL, when set, override the file last.
     """
     env = os.environ if environ is None else environ
     document = _read_default_document()
 
     override_path = path if path is not None else _override_path_from(env)
     if override_path is not None:
-        document = _merge_tables(document, _read_toml(override_path))
+        override = _read_toml(override_path)
+        _reject_password_in_audit_url(override, override_path)
+        document = _merge_tables(document, override)
 
     mode_override = env.get(MODE_ENV, "").strip()
     if mode_override:
         document["mode"] = mode_override
 
+    audit_url_override = env.get(AUDIT_DATABASE_URL_ENV, "").strip()
+    if audit_url_override:
+        document["audit"] = {**document.get("audit", {}), "database_url": audit_url_override}
+
     try:
         return AgentCoreConfig.model_validate(document)
     except ValidationError as error:
         raise ConfigError(f"Invalid agent-core configuration:\n{error}") from error
+
+
+def _reject_password_in_audit_url(override: dict[str, Any], path: Path) -> None:
+    audit_table = override.get("audit")
+    database_url = audit_table.get("database_url") if isinstance(audit_table, dict) else None
+    if isinstance(database_url, str) and urlsplit(database_url).password is not None:
+        raise ConfigError(
+            f"{path} puts a password in audit.database_url; set {AUDIT_DATABASE_URL_ENV} instead."
+        )
 
 
 def _override_path_from(env: Mapping[str, str]) -> Path | None:

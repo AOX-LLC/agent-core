@@ -41,6 +41,8 @@ Set `AGENT_CORE_CONFIG` to the path of a TOML file. It is merged over the packag
 
 The API key comes only from an explicit `api_key` argument or `AGENT_CORE_ANTHROPIC_API_KEY`. The library never reads `ANTHROPIC_API_KEY`.
 
+Set the audit log's database with `AGENT_CORE_AUDIT_DATABASE_URL`. A URL with a password is refused in a config file, so it never gets committed.
+
 This example moves the large tier to Sonnet and maps a task to a tier:
 
 ```toml
