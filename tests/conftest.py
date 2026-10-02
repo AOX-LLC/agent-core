@@ -3,6 +3,10 @@
 import socket
 
 import pytest
+from opentelemetry import trace
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 
 AMBIENT_VARIABLES = (
     "AGENT_CORE_ANTHROPIC_API_KEY",
@@ -37,3 +41,19 @@ def _no_network(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(socket.socket, "connect", refuse_connection)
     monkeypatch.setattr(socket.socket, "connect_ex", refuse_connection)
     monkeypatch.setattr(socket, "getaddrinfo", refuse_lookup)
+
+
+@pytest.fixture(scope="session")
+def _session_span_exporter() -> InMemorySpanExporter:
+    exporter = InMemorySpanExporter()
+    tracer_provider = TracerProvider()
+    tracer_provider.add_span_processor(SimpleSpanProcessor(exporter))
+    trace.set_tracer_provider(tracer_provider)
+    return exporter
+
+
+@pytest.fixture
+def spans(_session_span_exporter: InMemorySpanExporter) -> InMemorySpanExporter:
+    """Finished spans from this test only."""
+    _session_span_exporter.clear()
+    return _session_span_exporter

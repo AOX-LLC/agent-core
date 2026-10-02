@@ -43,9 +43,12 @@ Changelog = "https://github.com/AOX-LLC/agent-core/blob/main/CHANGELOG.md"
 
 [dependency-groups]
 dev = [
+    "httpx2>=2.0",
     "mypy>=2.4",
+    "opentelemetry-sdk>=1.30,<2",
     "packaging>=24",
     "pytest>=9.1",
+    "pytest-asyncio>=1.0",
     "ruff>=0.16.10",
 ]
 
@@ -86,7 +89,7 @@ select = [
 ]
 
 [tool.ruff.lint.per-file-ignores]
-"tests/**" = ["S101", "S603"]
+"tests/**" = ["ASYNC240", "S101", "S603"]
 
 [tool.ruff.lint.flake8-tidy-imports]
 ban-relative-imports = "all"
@@ -107,3 +110,5 @@ testpaths = ["tests"]
 addopts = ["--strict-markers", "--strict-config", "-ra"]
 xfail_strict = true
 filterwarnings = ["error"]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
