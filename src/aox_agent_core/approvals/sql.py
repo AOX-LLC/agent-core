@@ -30,7 +30,7 @@ from aox_agent_core.audit.chain import canonical_timestamp
 from aox_agent_core.audit.log import AuditLog
 from aox_agent_core.audit.sql import SQLAuditLog
 from aox_agent_core.audit.types import AuditEvent
-from aox_agent_core.context import RunContext
+from aox_agent_core.context import STORED_CONTEXT, RunContext
 from aox_agent_core.errors import (
     ApprovalAlreadyResolvedError,
     ApprovalError,
@@ -625,7 +625,7 @@ def _request_from_row(row: tuple[Any, ...]) -> ApprovalRequest:
     fields = {name: value for name, value in zip(names, row, strict=True) if value is not None}
     if RUN_CONTEXT_COLUMN in fields:
         fields[RUN_CONTEXT_COLUMN] = json.loads(fields[RUN_CONTEXT_COLUMN])
-    return ApprovalRequest.model_validate(fields)
+    return ApprovalRequest.model_validate(fields, context={STORED_CONTEXT: True})
 
 
 def _utc_now() -> datetime:

@@ -21,7 +21,7 @@ from functools import partial
 from typing import Any, Final
 from uuid import UUID, uuid4
 
-from pydantic import ValidationError
+from pydantic import JsonValue, ValidationError
 
 from aox_agent_core._canonical import canonical_json
 from aox_agent_core.audit.chain import canonical_timestamp, compute_record_hash
@@ -32,6 +32,7 @@ from aox_agent_core.audit.types import (
     AuditRecord,
     UnsealedAuditRecord,
 )
+from aox_agent_core.context import STORED_CONTEXT
 from aox_agent_core.errors import AuditIntegrityError, AuditPayloadRejectedError, ConfigError
 from aox_agent_core.replay.scrub import PatternScrubber, Scrubber
 from aox_agent_core.storage import Database, Dialect, Session, require_current_table
@@ -152,10 +153,13 @@ class SQLAuditLog:
             raise AuditPayloadRejectedError(
                 "The event was changed after it was built and is no longer valid."
             ) from error
-        findings = self._scrubber.find_secrets(revalidated.payload)
+        scanned: dict[str, JsonValue] = {"payload": revalidated.payload}
+        if revalidated.context is not None:
+            scanned["context"] = revalidated.context.as_json()
+        findings = self._scrubber.find_secrets(scanned)
         if findings:
             located = ", ".join(f"{finding.rule} at {finding.path}" for finding in findings)
-            raise AuditPayloadRejectedError(f"The audit payload contains {located}.")
+            raise AuditPayloadRejectedError(f"The audit event contains {located}.")
         return revalidated
 
     def append_in(self, session: Session, event: AuditEvent) -> AuditRecord:
@@ -421,18 +425,21 @@ def record_from_row(row: tuple[Any, ...]) -> AuditRecord:
     seq, schema_version, event_id, occurred_at, action, actor_id, subject_id = row[:7]
     payload, run_context, prev_hash, record_hash = row[7:]
     try:
-        return AuditRecord(
-            seq=seq,
-            schema_version=schema_version,
-            event_id=UUID(event_id),
-            occurred_at=datetime.fromisoformat(occurred_at),
-            action=action,
-            actor_id=actor_id,
-            subject_id=subject_id,
-            payload=json.loads(payload),
-            run_context=json.loads(run_context) if run_context is not None else None,
-            prev_hash=prev_hash,
-            record_hash=record_hash,
+        return AuditRecord.model_validate(
+            {
+                "seq": seq,
+                "schema_version": schema_version,
+                "event_id": UUID(event_id),
+                "occurred_at": datetime.fromisoformat(occurred_at),
+                "action": action,
+                "actor_id": actor_id,
+                "subject_id": subject_id,
+                "payload": json.loads(payload),
+                "run_context": json.loads(run_context) if run_context is not None else None,
+                "prev_hash": prev_hash,
+                "record_hash": record_hash,
+            },
+            context={STORED_CONTEXT: True},
         )
     except (ValueError, TypeError, ValidationError) as error:
         raise AuditIntegrityError(f"Record {seq} is malformed and cannot be checked.") from error

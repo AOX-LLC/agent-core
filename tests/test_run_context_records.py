@@ -19,7 +19,13 @@ from aox_agent_core.audit import (
 )
 from aox_agent_core.audit import sql as audit_sql
 from aox_agent_core.audit.sql import SQLAuditLog
-from aox_agent_core.errors import ApprovalNotGrantedError, AuditIntegrityError, ConfigError
+from aox_agent_core.errors import (
+    ApprovalNotGrantedError,
+    AuditIntegrityError,
+    AuditPayloadRejectedError,
+    ConfigError,
+)
+from aox_agent_core.replay import PatternScrubber, SecretFinding
 from databases import ControlDatabase
 
 RUN = RunContext(run_id="run-0001", external_ids={"workflow_id": "wf-7"})
@@ -110,6 +116,62 @@ def test_an_audit_event_refuses_a_secret_shaped_context() -> None:
                 "context": {"run_id": "r1", "external_ids": {"api_token": "abc"}},
             }
         )
+
+
+ACME_PATTERNS = {"acme_token": r"acme_[a-f0-9]{16}"}
+ACME_RUN = RunContext(run_id="acme_abcdefabcdef1234")
+
+
+async def test_the_logs_own_patterns_apply_to_the_context(
+    control_database: ControlDatabase,
+) -> None:
+    log = SQLAuditLog(
+        control_database.database, scrubber=PatternScrubber(extra_patterns=ACME_PATTERNS)
+    )
+
+    with pytest.raises(AuditPayloadRejectedError, match=r"acme_token at \$\.context\.run_id"):
+        await log.append(event(context=ACME_RUN))
+
+    assert [record async for record in log.iter_records()] == []
+
+
+async def test_an_approval_with_such_a_context_is_not_stored(
+    control_database: ControlDatabase,
+) -> None:
+    database = control_database.database
+    log = SQLAuditLog(database, scrubber=PatternScrubber(extra_patterns=ACME_PATTERNS))
+    queue = SQLApprovalQueue(database, audit_log=log)
+
+    with pytest.raises(AuditPayloadRejectedError):
+        await submit(queue, context=ACME_RUN)
+
+    assert await queue.list_pending(APPROVER) == []
+
+
+async def test_stored_contexts_are_not_scanned_again_on_read(
+    control_database: ControlDatabase, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    log = SQLAuditLog(control_database.database)
+    await log.append(event())
+    queue = queue_for(control_database)
+    request = await submit(queue)
+
+    # A later release adds a pattern that this stored context happens to match.
+    def finds_everything(self: PatternScrubber, value: object) -> list[SecretFinding]:
+        return [SecretFinding(rule="new_rule", path="$")]
+
+    monkeypatch.setattr(PatternScrubber, "find_secrets", finds_everything)
+
+    assert (await log.verify()).seq == 2
+    assert (await queue.get(request.id)).run_context == RUN
+
+
+def test_a_run_context_is_read_only_and_hashable() -> None:
+    with pytest.raises(TypeError):
+        RUN.external_ids["workflow_id"] = "wf-8"  # type: ignore[index]
+
+    assert hash(RUN) == hash(RunContext(run_id="run-0001", external_ids={"workflow_id": "wf-7"}))
+    assert RUN.model_dump() == {"run_id": "run-0001", "external_ids": {"workflow_id": "wf-7"}}
 
 
 # Approvals

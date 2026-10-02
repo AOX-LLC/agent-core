@@ -332,6 +332,16 @@ async def test_run_context_reaches_span_attributes_but_not_the_key(
     assert "the scan" not in str(first.to_json())
 
 
+async def test_a_context_matching_the_projects_secret_patterns_is_refused() -> None:
+    provider = ScriptedProvider()
+    patterned = client(provider, replay={"extra_secret_patterns": {"acme": r"acme_[a-f0-9]{16}"}})
+
+    with pytest.raises(ValueError, match="secret patterns: acme"):
+        await call_receipt(patterned, context=RunContext(run_id="acme_abcdefabcdef1234"))
+
+    assert provider.requests == []
+
+
 # The Anthropic provider
 
 

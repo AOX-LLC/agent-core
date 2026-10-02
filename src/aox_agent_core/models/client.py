@@ -199,6 +199,8 @@ class AgentClient:
         """
         if max_attempts < 1:
             raise ValueError(f"max_attempts must be at least 1, got {max_attempts}")
+        if context is not None:
+            self._refuse_secret_context(context)
         prompt_ref = prompt if isinstance(prompt, PromptRef) else None
         messages, system = _prepare_prompt(prompt, inputs, attachments, system)
         route_request = RouteRequest(
@@ -387,6 +389,18 @@ class AgentClient:
         return DirectoryRecordingStore(
             replay.cassette_dir, scrubber=scrubber, on_secret=replay.on_secret
         )
+
+    def _refuse_secret_context(self, context: RunContext) -> None:
+        """Raise ValueError if the context matches this project's secret patterns.
+
+        RunContext checks the default patterns itself; spans carry the context, so
+        it must also pass the patterns configured in replay.extra_secret_patterns.
+        """
+        scrubber = PatternScrubber(extra_patterns=self._config.replay.extra_secret_patterns)
+        findings = scrubber.find_secrets(context.as_json())
+        if findings:
+            rules = ", ".join(sorted({finding.rule for finding in findings}))
+            raise ValueError(f"The run context matches the secret patterns: {rules}.")
 
     def _capture_content(
         self, span: Span, messages: tuple[Message, ...], response: ProviderResponse
