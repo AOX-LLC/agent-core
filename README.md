@@ -55,6 +55,8 @@ Set `AGENT_CORE_CONFIG` to the path of a TOML file. It is merged over the packag
 
 The API key comes only from an explicit `api_key` argument or `AGENT_CORE_ANTHROPIC_API_KEY`. The library never reads `ANTHROPIC_API_KEY`.
 
+The library passes the key and base URL to the Anthropic SDK explicitly, so the SDK's own `ANTHROPIC_*` variables are never used; live and record modes refuse to start while `ANTHROPIC_CUSTOM_HEADERS` is set. The SDK's `ANTHROPIC_LOG=debug` logs whole requests, prompts included, so leave it unset outside local debugging.
+
 Set the audit log's database with `AGENT_CORE_AUDIT_DATABASE_URL`. A URL with a password is refused in a config file, so it never gets committed.
 
 This example moves the large tier to Sonnet and maps a task to a tier:
@@ -70,6 +72,8 @@ extraction = "small"
 ## Record and replay
 
 In `replay` mode every call is served from a cassette, a JSON file under `replay.cassette_dir`, so a project runs and tests with no API key. To record, set `AGENT_CORE_MODE=record` and `AGENT_CORE_ANTHROPIC_API_KEY`, then run the code once; commit the cassettes it writes. Recording refuses to write a cassette that contains anything that looks like a key, and the live key itself is always caught.
+
+A request's hash covers the JSON schema the Anthropic SDK generates for an output model, so upgrading `anthropic` or `pydantic` can change it. Replay then reports a miss, and the cassette has to be recorded again.
 
 Check cassettes in CI with:
 
