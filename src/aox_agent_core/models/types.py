@@ -94,3 +94,6 @@ class CallResult(FrozenModel, Generic[OutputT]):
     stop_reason: str
     trace_id: str | None = None
     attempts: Annotated[int, Field(ge=1)] = 1
+    # The prompt key of the last attempt for a PromptRef call, else its request hash.
+    replay_key: str = ""
+    prompt_id: str | None = None

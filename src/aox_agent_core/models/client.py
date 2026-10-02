@@ -3,24 +3,33 @@
 import asyncio
 import time
 import weakref
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from decimal import Decimal
-from typing import Any, TypeVar, overload
+from typing import Any, Protocol, TypeVar, overload
 
 import anthropic
 from opentelemetry.trace import Span, Status, StatusCode
-from pydantic import BaseModel, SecretStr, ValidationError
+from pydantic import BaseModel, JsonValue, SecretStr, ValidationError
 
 from aox_agent_core.config import AgentCoreConfig, Mode, ModelPrice, Provider, Tier, load_config
+from aox_agent_core.context import RunContext
 from aox_agent_core.credentials import resolve_api_key
 from aox_agent_core.errors import (
+    AttachmentError,
     BudgetExceededError,
     EventLoopRunningError,
     ModelRefusalError,
     StructuredOutputError,
 )
+from aox_agent_core.models.attachments import Attachment
 from aox_agent_core.models.live import LiveProviders
-from aox_agent_core.models.pricing import cost_of, estimate_input_tokens, worst_case_cost
+from aox_agent_core.models.pricing import (
+    cost_of,
+    estimate_attachment_tokens,
+    estimate_input_tokens,
+    worst_case_cost,
+)
+from aox_agent_core.models.prompts import PromptRef
 from aox_agent_core.models.provider import ModelProvider, close_provider
 from aox_agent_core.models.router import ConfigRouter, RouteDecision, Router, RouteRequest
 from aox_agent_core.models.types import (
@@ -31,6 +40,7 @@ from aox_agent_core.models.types import (
     Role,
     Usage,
 )
+from aox_agent_core.replay.keys import PromptKey, request_hash
 from aox_agent_core.replay.providers import RecordingProvider, ReplayProvider
 from aox_agent_core.replay.scrub import PatternScrubber
 from aox_agent_core.replay.store import DirectoryRecordingStore
@@ -43,6 +53,46 @@ Prompt = str | Sequence[Message]
 REFUSAL_STOP_REASON = "refusal"
 MAX_TOKENS_STOP_REASON = "max_tokens"
 GEN_AI_PROVIDER_NAMES = {Provider.ANTHROPIC: "anthropic", Provider.BEDROCK: "aws.bedrock"}
+
+
+class ModelClient(Protocol):
+    """What a host depends on to make model calls: AgentClient, or a test double.
+
+    Type a dependency as ModelClient rather than AgentClient, and a fake with
+    the same `call` can stand in for it.
+    """
+
+    @overload
+    async def call(
+        self,
+        prompt: Prompt | PromptRef,
+        *,
+        inputs: Mapping[str, JsonValue] | None = None,
+        attachments: Sequence[Attachment] = (),
+        output: None = None,
+        tier: Tier | None = None,
+        task: str | None = None,
+        system: str | None = None,
+        max_tokens: int | None = None,
+        max_attempts: int = 2,
+        context: RunContext | None = None,
+    ) -> CallResult[str]: ...
+
+    @overload
+    async def call(
+        self,
+        prompt: Prompt | PromptRef,
+        *,
+        inputs: Mapping[str, JsonValue] | None = None,
+        attachments: Sequence[Attachment] = (),
+        output: type[OutputModelT],
+        tier: Tier | None = None,
+        task: str | None = None,
+        system: str | None = None,
+        max_tokens: int | None = None,
+        max_attempts: int = 2,
+        context: RunContext | None = None,
+    ) -> CallResult[OutputModelT]: ...
 
 
 class AgentClient:
@@ -89,41 +139,57 @@ class AgentClient:
     @overload
     async def call(
         self,
-        prompt: Prompt,
+        prompt: Prompt | PromptRef,
         *,
+        inputs: Mapping[str, JsonValue] | None = None,
+        attachments: Sequence[Attachment] = (),
         output: None = None,
         tier: Tier | None = None,
         task: str | None = None,
         system: str | None = None,
         max_tokens: int | None = None,
         max_attempts: int = 2,
+        context: RunContext | None = None,
     ) -> CallResult[str]: ...
 
     @overload
     async def call(
         self,
-        prompt: Prompt,
+        prompt: Prompt | PromptRef,
         *,
+        inputs: Mapping[str, JsonValue] | None = None,
+        attachments: Sequence[Attachment] = (),
         output: type[OutputModelT],
         tier: Tier | None = None,
         task: str | None = None,
         system: str | None = None,
         max_tokens: int | None = None,
         max_attempts: int = 2,
+        context: RunContext | None = None,
     ) -> CallResult[OutputModelT]: ...
 
     async def call(
         self,
-        prompt: Prompt,
+        prompt: Prompt | PromptRef,
         *,
+        inputs: Mapping[str, JsonValue] | None = None,
+        attachments: Sequence[Attachment] = (),
         output: type[BaseModel] | None = None,
         tier: Tier | None = None,
         task: str | None = None,
         system: str | None = None,
         max_tokens: int | None = None,
         max_attempts: int = 2,
+        context: RunContext | None = None,
     ) -> CallResult[Any]:
         """Make one routed model call. Name a tier or a task, not both.
+
+        `prompt` is text, a list of messages, or a PromptRef. A PromptRef is
+        rendered from `inputs` (required with it, refused without), carries its
+        own system prompt (so `system` must be None), and keys replay by content:
+        prompt id and version, routed tier, schema name, inputs, attachment
+        hashes and attempt. `attachments` go on the last user message. `context`
+        reaches span attributes, never the replay key.
 
         Raises ValueError for `max_attempts` below 1, an empty message list, or
         both a tier and a task. Also raises BudgetExceededError, ModelRefusalError
@@ -132,13 +198,15 @@ class AgentClient:
         """
         if max_attempts < 1:
             raise ValueError(f"max_attempts must be at least 1, got {max_attempts}")
-        messages = _as_messages(prompt)
+        prompt_ref = prompt if isinstance(prompt, PromptRef) else None
+        messages, system = _prepare_prompt(prompt, inputs, attachments, system)
         route_request = RouteRequest(
             tier=tier,
             task=task,
             estimated_input_tokens=estimate_input_tokens(
                 system, *(message.content for message in messages)
-            ),
+            )
+            + estimate_attachment_tokens(_attachments_in(messages)),
             max_output_tokens=max_tokens,
         )
         decision = self._router.select(route_request)
@@ -151,6 +219,10 @@ class AgentClient:
             output=output,
             max_attempts=max_attempts,
             task=task,
+            prompt_ref=prompt_ref,
+            inputs=inputs or {},
+            attachments=tuple(attachments),
+            context=context,
         )
 
         # The span records failures itself, by class name only: an error message
@@ -182,44 +254,55 @@ class AgentClient:
                 stop_reason=response.stop_reason,
                 trace_id=_trace_id(span),
                 attempts=call.attempts,
+                replay_key=call.replay_key,
+                prompt_id=prompt_ref.id if prompt_ref is not None else None,
             )
 
     @overload
     def call_sync(
         self,
-        prompt: Prompt,
+        prompt: Prompt | PromptRef,
         *,
+        inputs: Mapping[str, JsonValue] | None = None,
+        attachments: Sequence[Attachment] = (),
         output: None = None,
         tier: Tier | None = None,
         task: str | None = None,
         system: str | None = None,
         max_tokens: int | None = None,
         max_attempts: int = 2,
+        context: RunContext | None = None,
     ) -> CallResult[str]: ...
 
     @overload
     def call_sync(
         self,
-        prompt: Prompt,
+        prompt: Prompt | PromptRef,
         *,
+        inputs: Mapping[str, JsonValue] | None = None,
+        attachments: Sequence[Attachment] = (),
         output: type[OutputModelT],
         tier: Tier | None = None,
         task: str | None = None,
         system: str | None = None,
         max_tokens: int | None = None,
         max_attempts: int = 2,
+        context: RunContext | None = None,
     ) -> CallResult[OutputModelT]: ...
 
     def call_sync(
         self,
-        prompt: Prompt,
+        prompt: Prompt | PromptRef,
         *,
+        inputs: Mapping[str, JsonValue] | None = None,
+        attachments: Sequence[Attachment] = (),
         output: type[BaseModel] | None = None,
         tier: Tier | None = None,
         task: str | None = None,
         system: str | None = None,
         max_tokens: int | None = None,
         max_attempts: int = 2,
+        context: RunContext | None = None,
     ) -> CallResult[Any]:
         """Blocking version of call() for scripts.
 
@@ -237,12 +320,15 @@ class AgentClient:
         return self._runner.run(
             self.call(
                 prompt,
+                inputs=inputs,
+                attachments=attachments,
                 output=output,
                 tier=tier,
                 task=task,
                 system=system,
                 max_tokens=max_tokens,
                 max_attempts=max_attempts,
+                context=context,
             )
         )
 
@@ -337,6 +423,10 @@ class _CallInProgress:
         output: type[BaseModel] | None,
         max_attempts: int,
         task: str | None,
+        prompt_ref: PromptRef | None = None,
+        inputs: Mapping[str, JsonValue] | None = None,
+        attachments: tuple[Attachment, ...] = (),
+        context: RunContext | None = None,
     ) -> None:
         self._config = config
         self._provider = provider
@@ -347,10 +437,15 @@ class _CallInProgress:
         self._output = output
         self._max_attempts = max_attempts
         self._output_schema = anthropic.transform_schema(output) if output is not None else None
+        self._prompt_ref = prompt_ref
+        self._inputs = dict(inputs or {})
+        self._attachments = attachments
+        self._context = context
         self.usage = Usage(input_tokens=0, output_tokens=0)
         self.cost_usd = Decimal(0)
         self.attempts = 0
         self.current_decision: RouteDecision | None = None
+        self.replay_key = ""
 
     async def run(
         self, decision: RouteDecision, route_request: RouteRequest
@@ -373,8 +468,8 @@ class _CallInProgress:
         self.current_decision = decision
         conversation = list(self._messages)
         failures: list[str] = []
-        for _ in range(self._max_attempts):
-            response = await self._send(decision, conversation)
+        for attempt in range(1, self._max_attempts + 1):
+            response = await self._send(decision, conversation, attempt)
             if self._output is None:
                 return response.text, response
             if response.stop_reason == MAX_TOKENS_STOP_REASON:
@@ -400,10 +495,12 @@ class _CallInProgress:
                 ]
         raise _AttemptsExhaustedError(failures)
 
-    async def _send(self, decision: RouteDecision, conversation: list[Message]) -> ProviderResponse:
+    async def _send(
+        self, decision: RouteDecision, conversation: list[Message], attempt: int
+    ) -> ProviderResponse:
         config = self._config
         # Priced before sending, so a misconfigured route fails before it costs anything.
-        price = config.price_for(decision.provider, decision.model)
+        route_price = config.price_for(decision.provider, decision.model)
         request = ProviderRequest(
             provider=decision.provider,
             model=decision.model,
@@ -413,17 +510,46 @@ class _CallInProgress:
             effort=config.routing.tiers[decision.tier].effort,
             output_schema=self._output_schema,
         )
-        self._refuse_over_budget(request, price)
-        response = await self._provider.complete(request)
+        self._refuse_over_budget(request, route_price)
+        prompt_key = self._prompt_key(decision, attempt)
+        self.replay_key = prompt_key.key if prompt_key is not None else request_hash(request)
+        response = await self._provider.complete(request, prompt_key=prompt_key)
 
         self.attempts += 1
         self.usage = _add_usage(self.usage, response.usage)
-        self.cost_usd += cost_of(response.usage, price)
+        self.cost_usd += cost_of(response.usage, self._response_price(decision, response))
         if response.stop_reason == REFUSAL_STOP_REASON:
             raise ModelRefusalError(
                 f"The model declined the request on tier {decision.tier.value} ({decision.model})."
             )
         return response
+
+    def _prompt_key(self, decision: RouteDecision, attempt: int) -> PromptKey | None:
+        if self._prompt_ref is None:
+            return None
+        return PromptKey.for_call(
+            self._prompt_ref,
+            tier=decision.tier,
+            output_schema=self._output.__name__ if self._output is not None else None,
+            output_json_schema=self._output_schema,
+            inputs=self._inputs,
+            attachments=self._attachments,
+            attempt=attempt,
+        )
+
+    def _response_price(self, decision: RouteDecision, response: ProviderResponse) -> ModelPrice:
+        """The price of the model that answered.
+
+        A replayed response may come from a model other than today's route, for
+        example after a tier's model changes; it is priced at its own rate, and
+        replaying one whose model has no price raises ConfigError. A live
+        provider may name the model differently from the route (an alias, a
+        Bedrock ID); then the route's price applies.
+        """
+        config = self._config
+        if config.mode is Mode.REPLAY or config.has_price(decision.provider, response.model):
+            return config.price_for(decision.provider, response.model)
+        return config.price_for(decision.provider, decision.model)
 
     def _refuse_over_budget(self, request: ProviderRequest, price: ModelPrice) -> None:
         """Raise BudgetExceededError if this attempt could take the call over its budget.
@@ -435,7 +561,7 @@ class _CallInProgress:
             return
         input_tokens = estimate_input_tokens(
             request.system, *(message.content for message in request.messages)
-        )
+        ) + estimate_attachment_tokens(_attachments_in(request.messages))
         worst_case = worst_case_cost(input_tokens, request.max_tokens, price)
         if self.cost_usd + worst_case > budget:
             raise BudgetExceededError(
@@ -500,9 +626,63 @@ class _CallInProgress:
         )
         if self._task is not None:
             span.set_attribute(attributes.AGENT_CORE_TASK, self._task)
+        if self.replay_key:
+            span.set_attribute(attributes.AGENT_CORE_REPLAY_KEY, self.replay_key)
+        if self._prompt_ref is not None:
+            span.set_attribute(attributes.AGENT_CORE_PROMPT_ID, self._prompt_ref.id)
+            span.set_attribute(attributes.AGENT_CORE_PROMPT_VERSION, self._prompt_ref.version)
+        if self._attachments:
+            span.set_attribute(attributes.AGENT_CORE_ATTACHMENT_COUNT, len(self._attachments))
+        if self._context is not None:
+            span.set_attributes(context_attributes(self._context))
         if response is not None:
             span.set_attribute(attributes.GEN_AI_RESPONSE_MODEL, response.model)
             span.set_attribute(attributes.GEN_AI_RESPONSE_FINISH_REASONS, [response.stop_reason])
+
+
+def context_attributes(context: RunContext) -> dict[str, str]:
+    """Span attributes for a run context: its run ID and each external ID."""
+    values = {attributes.AGENT_CORE_RUN_ID: context.run_id}
+    for name, value in context.external_ids.items():
+        values[attributes.AGENT_CORE_EXTERNAL_ID_PREFIX + name] = value
+    return values
+
+
+def _prepare_prompt(
+    prompt: Prompt | PromptRef,
+    inputs: Mapping[str, JsonValue] | None,
+    attachments: Sequence[Attachment],
+    system: str | None,
+) -> tuple[tuple[Message, ...], str | None]:
+    """The call's messages and system prompt, with attachments on the last user turn."""
+    if isinstance(prompt, PromptRef):
+        if inputs is None:
+            raise ValueError("A PromptRef call needs inputs; pass inputs={} if it has none.")
+        if system is not None:
+            raise ValueError("A PromptRef carries its own system prompt; do not pass system.")
+        messages: tuple[Message, ...] = (Message(role=Role.USER, content=prompt.render(inputs)),)
+        system = prompt.system
+    else:
+        if inputs is not None:
+            raise ValueError("inputs only apply to a PromptRef prompt.")
+        messages = _as_messages(prompt)
+    if not attachments:
+        return messages, system
+    for attachment in attachments:
+        if attachment.data is None:
+            raise AttachmentError(
+                f"Attachment {attachment.sha256} has no bytes; build it with "
+                "Attachment.from_bytes() or Attachment.from_path()."
+            )
+    last = messages[-1]
+    if last.role is not Role.USER:
+        raise ValueError("Attachments go on the last message, which must be a user turn.")
+    with_attachments = last.model_copy(update={"attachments": (*last.attachments, *attachments)})
+    return (*messages[:-1], with_attachments), system
+
+
+def _attachments_in(messages: Sequence[Message]) -> list[Attachment]:
+    return [attachment for message in messages for attachment in message.attachments]
 
 
 def _as_messages(prompt: Prompt) -> tuple[Message, ...]:

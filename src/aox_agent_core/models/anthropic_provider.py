@@ -1,24 +1,32 @@
 """The Anthropic Messages API provider."""
 
 import asyncio
+import base64
 import os
 import weakref
 from collections.abc import Mapping
 from typing import TYPE_CHECKING
 
 import anthropic
-from anthropic.types import JSONOutputFormatParam, MessageParam, OutputConfigParam
+from anthropic.types import (
+    ContentBlockParam,
+    JSONOutputFormatParam,
+    MessageParam,
+    OutputConfigParam,
+)
 from anthropic.types import Message as SdkMessage
 from pydantic import SecretStr
 
 from aox_agent_core.config import AnthropicConfig
 from aox_agent_core.errors import (
+    AttachmentError,
     ConfigError,
     ProviderRequestError,
     ProviderUnavailableError,
     RateLimitedError,
 )
-from aox_agent_core.models.types import ProviderRequest, ProviderResponse, Usage
+from aox_agent_core.models.attachments import Attachment
+from aox_agent_core.models.types import Message, ProviderRequest, ProviderResponse, Usage
 
 if TYPE_CHECKING:
     from aox_agent_core.replay.keys import PromptKey
@@ -113,8 +121,36 @@ class AnthropicProvider:
 
 def _messages_param(request: ProviderRequest) -> list[MessageParam]:
     return [
-        {"role": message.role.value, "content": message.content} for message in request.messages
+        {"role": message.role.value, "content": _content_param(message)}
+        for message in request.messages
     ]
+
+
+def _content_param(message: Message) -> str | list[ContentBlockParam]:
+    """Plain text, or attachment blocks followed by the text, as the API recommends."""
+    if not message.attachments:
+        return message.content
+    blocks: list[ContentBlockParam] = [_attachment_block(item) for item in message.attachments]
+    blocks.append({"type": "text", "text": message.content})
+    return blocks
+
+
+def _attachment_block(attachment: Attachment) -> ContentBlockParam:
+    if attachment.data is None:
+        raise AttachmentError(
+            f"Attachment {attachment.sha256} has no bytes to send; a recorded "
+            "attachment can only be replayed."
+        )
+    data = base64.b64encode(attachment.data).decode("ascii")
+    if attachment.media_type == "application/pdf":
+        return {
+            "type": "document",
+            "source": {"type": "base64", "media_type": "application/pdf", "data": data},
+        }
+    return {
+        "type": "image",
+        "source": {"type": "base64", "media_type": attachment.media_type, "data": data},
+    }
 
 
 def _output_config(request: ProviderRequest) -> OutputConfigParam:
