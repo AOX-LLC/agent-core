@@ -303,3 +303,55 @@ async def test_verify_walks_in_batches_off_the_event_loop(
     with pytest.raises(AuditIntegrityError, match="Record 5 was altered"):
         await log.verify()
     assert threading.main_thread().name not in threads
+
+
+@pytest.mark.parametrize(
+    "statement",
+    [
+        f"INSERT OR REPLACE INTO {audit_sql.AUDIT_TABLE} ({audit_sql.COLUMNS}) "
+        "SELECT seq, schema_version, event_id, occurred_at, 'model.forged', actor_id, "
+        f"subject_id, payload, prev_hash, record_hash FROM {audit_sql.AUDIT_TABLE} WHERE seq = 2",
+        f"INSERT INTO {audit_sql.AUDIT_TABLE} ({audit_sql.COLUMNS}) "
+        "SELECT 10, schema_version, 'forged-event', occurred_at, action, actor_id, "
+        f"subject_id, payload, prev_hash, record_hash FROM {audit_sql.AUDIT_TABLE} WHERE seq = 3",
+    ],
+    ids=["insert-or-replace", "insert-out-of-order"],
+)
+async def test_inserts_land_only_at_the_end(
+    control_database: ControlDatabase, statement: str
+) -> None:
+    if control_database.backend == "postgres" and "OR REPLACE" in statement:
+        pytest.skip("INSERT OR REPLACE is SQLite syntax")
+    log = await filled_log(control_database)
+
+    with pytest.raises(REFUSED, match="append-only"):
+        control_database.raw(statement)
+
+    assert (await log.verify()).seq == 3
+
+
+@pytest.mark.parametrize(
+    ("payload", "problem"),
+    [
+        ({"count": 2**53}, "within"),
+        ({"items": [-(2**53)]}, "within"),
+        ({"note": "\ud800"}, "not valid Unicode"),
+    ],
+)
+def test_payloads_that_could_not_be_verified_everywhere_are_rejected(
+    payload: dict[str, Any], problem: str
+) -> None:
+    with pytest.raises(ValueError, match=problem):
+        AuditEvent(action="model.call", actor_id="svc-1", payload=payload)
+
+
+def test_largest_safe_integer_and_booleans_are_fine() -> None:
+    event = AuditEvent(action="model.call", actor_id="svc-1", payload={"n": 2**53 - 1, "ok": True})
+
+    assert event.payload["n"] == 2**53 - 1
+
+
+@pytest.mark.parametrize("url", ["sqlite:///:memory:", "sqlite:///file::memory:?cache=shared"])
+def test_in_memory_sqlite_is_refused(url: str) -> None:
+    with pytest.raises(ConfigError, match="in-memory"):
+        open_database(url)

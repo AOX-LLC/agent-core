@@ -41,6 +41,9 @@ UPDATE_TRIGGER: Final = "agent_core_audit_no_update"
 DELETE_TRIGGER: Final = "agent_core_audit_no_delete"
 UPDATE_DELETE_TRIGGER: Final = "agent_core_audit_no_update_delete"
 TRUNCATE_TRIGGER: Final = "agent_core_audit_no_truncate"
+APPEND_TRIGGER: Final = "agent_core_audit_append_at_end"
+SQLITE_TRIGGERS: Final = frozenset({UPDATE_TRIGGER, DELETE_TRIGGER, APPEND_TRIGGER})
+POSTGRES_TRIGGERS: Final = frozenset({UPDATE_DELETE_TRIGGER, TRUNCATE_TRIGGER, APPEND_TRIGGER})
 
 # pg_advisory_xact_lock key that serializes appends: ASCII "agentcor" as an int64.
 APPEND_LOCK_KEY: Final = 0x6167656E74636F72
@@ -72,6 +75,12 @@ SQLITE_SCHEMA: Final = (
     BEGIN SELECT RAISE(ABORT, '{AUDIT_TABLE} is append-only'); END""",
     f"""CREATE TRIGGER {DELETE_TRIGGER} BEFORE DELETE ON {AUDIT_TABLE}
     BEGIN SELECT RAISE(ABORT, '{AUDIT_TABLE} is append-only'); END""",
+    # Inserts land only right after the last record. Besides keeping the sequence
+    # gapless, this stops INSERT OR REPLACE, which deletes the row it replaces
+    # without firing the delete trigger.
+    f"""CREATE TRIGGER {APPEND_TRIGGER} BEFORE INSERT ON {AUDIT_TABLE}
+    WHEN NEW.seq <> (SELECT COALESCE(MAX(seq), 0) FROM {AUDIT_TABLE}) + 1
+    BEGIN SELECT RAISE(ABORT, '{AUDIT_TABLE} is append-only'); END""",
 )
 
 POSTGRES_SCHEMA: Final = (
@@ -82,6 +91,15 @@ POSTGRES_SCHEMA: Final = (
     FOR EACH ROW EXECUTE FUNCTION {AUDIT_TABLE}_refuse_change()""",
     f"""CREATE TRIGGER {TRUNCATE_TRIGGER} BEFORE TRUNCATE ON {AUDIT_TABLE}
     FOR EACH STATEMENT EXECUTE FUNCTION {AUDIT_TABLE}_refuse_change()""",
+    f"""CREATE FUNCTION {AUDIT_TABLE}_append_at_end() RETURNS trigger LANGUAGE plpgsql AS $$
+    BEGIN
+        IF NEW.seq <> (SELECT COALESCE(MAX(seq), 0) FROM {AUDIT_TABLE}) + 1 THEN
+            RAISE EXCEPTION '{AUDIT_TABLE} is append-only';
+        END IF;
+        RETURN NEW;
+    END $$""",
+    f"""CREATE TRIGGER {APPEND_TRIGGER} BEFORE INSERT ON {AUDIT_TABLE}
+    FOR EACH ROW EXECUTE FUNCTION {AUDIT_TABLE}_append_at_end()""",
     f"REVOKE ALL ON {AUDIT_TABLE} FROM PUBLIC",
 )
 
@@ -214,9 +232,7 @@ class SQLAuditLog:
             _ensure_sqlite_schema(session)
         else:
             _check_postgres_role(session)
-            _require_triggers(
-                session, _postgres_triggers(session), {UPDATE_DELETE_TRIGGER, TRUNCATE_TRIGGER}
-            )
+            _require_triggers(session, _postgres_triggers(session), POSTGRES_TRIGGERS)
         self._protections_checked = True
 
 
@@ -258,10 +274,10 @@ def _ensure_sqlite_schema(session: Session) -> None:
             (AUDIT_TABLE,),
         )
     }
-    _require_triggers(session, triggers, {UPDATE_TRIGGER, DELETE_TRIGGER})
+    _require_triggers(session, triggers, SQLITE_TRIGGERS)
 
 
-def _require_triggers(session: Session, present: set[str], required: set[str]) -> None:
+def _require_triggers(session: Session, present: set[str], required: frozenset[str]) -> None:
     missing = sorted(required - present)
     if missing:
         raise AuditIntegrityError(

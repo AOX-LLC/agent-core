@@ -7,11 +7,13 @@ from uuid import UUID
 
 from pydantic import AwareDatetime, Field, JsonValue, field_validator
 
+from aox_agent_core._canonical import canonical_json
 from aox_agent_core._model import ActionName, FrozenModel, PrincipalId, Sha256Hex, SubjectId
 
 AUDIT_SCHEMA_VERSION: Final = 1
 GENESIS_HASH: Final = "0" * 64
 MAX_PAYLOAD_BYTES = 8_192
+MAX_SAFE_INTEGER: Final = 2**53 - 1
 
 # A payload key is rejected when, lowercased with everything but letters and digits
 # removed, it ends with one of these. Suffix matching blocks "client_secret" and
@@ -61,6 +63,15 @@ class AuditEvent(FrozenModel):
 
         if _contains_float(payload):
             raise ValueError("payload numbers must be integers; write decimals as strings")
+        if _contains_unsafe_integer(payload):
+            raise ValueError(
+                f"payload integers must be within +/-{MAX_SAFE_INTEGER}, so that any JSON "
+                "reader can verify the hash exactly"
+            )
+        try:
+            canonical_json(payload)
+        except UnicodeEncodeError as error:
+            raise ValueError("payload text is not valid Unicode") from error
 
         size = len(json.dumps(payload, separators=(",", ":")).encode())
         if size > MAX_PAYLOAD_BYTES:
@@ -125,4 +136,16 @@ def _contains_float(value: JsonValue) -> bool:
         return any(_contains_float(item) for item in value)
     if isinstance(value, dict):
         return any(_contains_float(item) for item in value.values())
+    return False
+
+
+def _contains_unsafe_integer(value: JsonValue) -> bool:
+    if isinstance(value, bool):
+        return False
+    if isinstance(value, int):
+        return abs(value) > MAX_SAFE_INTEGER
+    if isinstance(value, list):
+        return any(_contains_unsafe_integer(item) for item in value)
+    if isinstance(value, dict):
+        return any(_contains_unsafe_integer(item) for item in value.values())
     return False

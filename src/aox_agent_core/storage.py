@@ -47,19 +47,25 @@ class Session:
 
     def execute(self, sql: str, parameters: Sequence[Any] = ()) -> list[tuple[Any, ...]]:
         """Run one statement and return its rows (empty for statements without rows)."""
-        self._cursor.execute(self._native(sql), tuple(parameters))
+        self._run(sql, parameters)
         if self._cursor.description is None:
             return []
         return [tuple(row) for row in self._cursor.fetchall()]
 
     def execute_count(self, sql: str, parameters: Sequence[Any] = ()) -> int:
         """Run one statement and return how many rows it changed."""
-        self._cursor.execute(self._native(sql), tuple(parameters))
+        self._run(sql, parameters)
         return int(self._cursor.rowcount)
 
-    def _native(self, sql: str) -> str:
-        # Plain replace: the library's SQL never has a literal '?' inside a string.
-        return sql.replace("?", "%s") if self.dialect is Dialect.POSTGRES else sql
+    def _run(self, sql: str, parameters: Sequence[Any]) -> None:
+        if self.dialect is Dialect.SQLITE:
+            self._cursor.execute(sql, tuple(parameters))
+        elif parameters:
+            # psycopg uses %s placeholders, so a literal % must be doubled.
+            self._cursor.execute(sql.replace("%", "%%").replace("?", "%s"), tuple(parameters))
+        else:
+            # Without parameters psycopg sends the text as it is.
+            self._cursor.execute(sql)
 
 
 class Database(ABC):
@@ -161,6 +167,10 @@ def open_database(url: str | SecretStr) -> Database:
         path = text.removeprefix("sqlite:///")
         if not path or path == text:
             raise ConfigError("A SQLite URL looks like sqlite:///audit.sqlite3.")
+        if path == ":memory:" or path.startswith("file::memory"):
+            # Each operation opens its own connection, so an in-memory database
+            # would vanish between them.
+            raise ConfigError("An in-memory SQLite database cannot hold the audit log.")
         return SQLiteDatabase(Path(path))
     if scheme in {"postgresql", "postgres"}:
         return PostgresDatabase(secret_url)
