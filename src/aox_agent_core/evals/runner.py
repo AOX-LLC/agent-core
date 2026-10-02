@@ -111,11 +111,15 @@ def model_call_target(
 
     Without `prompt`, each case's input must be a string and is sent as the
     prompt. With a PromptRef, each case's input must be an object and becomes
-    the prompt's inputs, so every case replays by its own content-addressed key.
+    the prompt's inputs, so every case replays by its own content-addressed key;
+    `system` is then refused (ValueError), since the PromptRef carries its own.
     Structured output is returned as its JSON form, so FieldMatch can compare it,
     and the call's cost is carried into the scorecard. An input of the wrong
     shape raises TypeError, which the runner records as that case's failure.
     """
+
+    if prompt is not None and system is not None:
+        raise ValueError("A PromptRef carries its own system prompt; do not pass system.")
 
     async def call(case: EvalCase) -> TargetOutput:
         if prompt is not None:

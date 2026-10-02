@@ -89,7 +89,7 @@ class PromptRef:
 
 - A superset of the draft. `system` is new and optional.
 - The template uses `string.Template` placeholders: `${name}`.
-- agent-core renders the template. Strings go in as they are. Other values go in as compact JSON.
+- agent-core renders the template. Strings go in as they are. Other values go in as compact JSON with sorted keys. Inputs that are not plain JSON (a `Decimal`, a `datetime`, `NaN`) raise `PromptError`.
 - A placeholder with no input raises `PromptError`.
 
 ### Attachment

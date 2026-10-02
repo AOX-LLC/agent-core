@@ -155,6 +155,14 @@ async def test_a_prompted_target_refuses_a_string_input() -> None:
         await target(EvalCase(id="a", input="charged twice"))
 
 
+def test_a_prompted_target_refuses_a_system_prompt() -> None:
+    client = AgentClient(make_config(), provider=ScriptedProvider())
+    prompt = PromptRef(id="tickets.triage", version=1, template="Triage: ${ticket}")
+
+    with pytest.raises(ValueError, match="own system prompt"):
+        model_call_target(client, prompt=prompt, system="be brief")
+
+
 async def test_scorecard_writers(tmp_path: Path) -> None:
     suite = EvalSuite(
         name="sample",

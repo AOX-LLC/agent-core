@@ -2,17 +2,21 @@
 
 import hashlib
 import zlib
+from datetime import datetime
+from decimal import Decimal
 from pathlib import Path
 from uuid import UUID
 
 import pytest
 from pydantic import ValidationError
 
+from aox_agent_core import Tier
 from aox_agent_core.context import MAX_EXTERNAL_IDS, RunContext
 from aox_agent_core.errors import AttachmentError, PromptError
 from aox_agent_core.models import Message, Role
 from aox_agent_core.models.attachments import MAX_IMAGE_BYTES, Attachment
 from aox_agent_core.models.prompts import PromptRef
+from aox_agent_core.replay import replay_key
 
 PNG = b"\x89PNG\r\n\x1a\n" + b"\x00" * 32
 JPEG = b"\xff\xd8\xff\xe0" + b"\x00" * 32
@@ -146,8 +150,27 @@ def test_prompt_renders_strings_as_given_and_other_values_as_json() -> None:
     prompt = PromptRef(id="receipts.extract", version=2, template="Ticket ${ticket} with ${tags}")
 
     assert prompt.render({"ticket": "INV {1042}", "tags": ["a", 1]}) == (
-        'Ticket INV {1042} with ["a", 1]'
+        'Ticket INV {1042} with ["a",1]'
     )
+
+
+def test_inputs_differing_only_in_key_order_render_the_same_text() -> None:
+    prompt = PromptRef(id="receipts.extract", version=2, template="Data: ${data}")
+
+    first = prompt.render({"data": {"b": 1, "a": [1, 2]}})
+    second = prompt.render({"data": {"a": [1, 2], "b": 1}})
+
+    assert first == second == 'Data: {"a":[1,2],"b":1}'
+
+
+@pytest.mark.parametrize("value", [Decimal("1.5"), datetime(2026, 10, 2), float("nan")])
+def test_inputs_that_are_not_plain_json_are_a_prompt_error(value: object) -> None:
+    prompt = PromptRef(id="receipts.extract", version=2, template="Data: ${data}")
+
+    with pytest.raises(PromptError, match="plain JSON"):
+        prompt.render({"data": value})  # type: ignore[dict-item]
+    with pytest.raises(PromptError, match="plain JSON"):
+        replay_key(prompt, tier=Tier.SMALL, output_schema=None, inputs={"data": value})  # type: ignore[dict-item]
 
 
 def test_prompt_errors_name_the_problem() -> None:

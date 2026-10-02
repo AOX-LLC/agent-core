@@ -28,13 +28,15 @@ class PromptRef(FrozenModel):
     system: str | None = None
 
     def render(self, inputs: Mapping[str, JsonValue]) -> str:
-        """Fill the template. Strings go in as they are, other values as compact JSON.
+        """Fill the template. Strings go in as they are, other values as compact JSON
+        with sorted keys, so inputs that share a replay key render the same text.
 
-        Raises PromptError naming a placeholder that has no input.
+        Raises PromptError naming a placeholder that has no input, or if an input
+        is not plain JSON.
         """
         values = {
-            name: value if isinstance(value, str) else json.dumps(value, ensure_ascii=False)
-            for name, value in inputs.items()
+            name: value if isinstance(value, str) else _compact_json(value)
+            for name, value in checked_inputs(inputs).items()
         }
         try:
             return Template(self.template).substitute(values)
@@ -46,3 +48,22 @@ class PromptRef(FrozenModel):
             raise PromptError(
                 f"Prompt {self.id} v{self.version} has a bad placeholder: {error}"
             ) from error
+
+
+def checked_inputs(inputs: Mapping[str, JsonValue]) -> dict[str, JsonValue]:
+    """The inputs as plain JSON values: tuples become lists, and so on.
+
+    Raises PromptError if a value is not JSON (a Decimal, a datetime) or is a
+    float that JSON cannot hold (NaN, infinity).
+    """
+    try:
+        loaded: dict[str, JsonValue] = json.loads(_compact_json(dict(inputs)))
+    except (TypeError, ValueError) as error:
+        raise PromptError(f"Prompt inputs must be plain JSON values: {error}") from None
+    return loaded
+
+
+def _compact_json(value: JsonValue) -> str:
+    return json.dumps(
+        value, ensure_ascii=False, allow_nan=False, sort_keys=True, separators=(",", ":")
+    )

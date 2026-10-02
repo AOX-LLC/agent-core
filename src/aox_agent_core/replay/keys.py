@@ -24,7 +24,7 @@ from aox_agent_core._canonical import sha256_of
 from aox_agent_core._model import FrozenModel, Sha256Hex
 from aox_agent_core.config import Tier
 from aox_agent_core.models.attachments import Attachment
-from aox_agent_core.models.prompts import PromptId, PromptRef
+from aox_agent_core.models.prompts import PromptId, PromptRef, checked_inputs
 from aox_agent_core.models.types import ProviderRequest
 
 PROMPT_KEY_VERSION: Final = 2
@@ -66,8 +66,11 @@ def request_hash(request: ProviderRequest) -> str:
 
 
 def normalize_inputs(inputs: Mapping[str, JsonValue]) -> dict[str, JsonValue]:
-    """Inputs as the key sees them: every string, keys included, in Unicode NFC form."""
-    return {_nfc(name): _normalized(value) for name, value in inputs.items()}
+    """Inputs as the key sees them: plain JSON, every string, keys included, in NFC form.
+
+    Raises PromptError if an input is not plain JSON.
+    """
+    return {_nfc(name): _normalized(value) for name, value in checked_inputs(inputs).items()}
 
 
 def _normalized(value: JsonValue) -> JsonValue:
@@ -76,7 +79,7 @@ def _normalized(value: JsonValue) -> JsonValue:
     if isinstance(value, list):
         return [_normalized(item) for item in value]
     if isinstance(value, dict):
-        return normalize_inputs(value)
+        return {_nfc(name): _normalized(item) for name, item in value.items()}
     return value
 
 
