@@ -10,12 +10,12 @@ import os
 import re
 import stat
 import zlib
-from pathlib import Path
 from typing import Annotated, Final, Literal, Self
 
 from pydantic import Field, PrivateAttr, ValidationInfo, model_validator
 
 from aox_agent_core._model import FrozenModel, Sha256Hex
+from aox_agent_core._validation import HASHED_ATTACHMENT
 from aox_agent_core.errors import AttachmentError
 
 AttachmentMediaType = Literal["image/png", "image/jpeg", "application/pdf"]
@@ -25,13 +25,13 @@ AttachmentMediaType = Literal["image/png", "image/jpeg", "application/pdf"]
 MAX_IMAGE_BYTES: Final = 5_000_000
 MAX_PDF_BYTES: Final = 24_000_000
 
-# Inflating a PDF's object streams to count its pages stops past this many bytes.
+# Counting a PDF's pages gives up past this many inflated bytes or object streams.
 MAX_INFLATED_BYTES: Final = 64_000_000
-
-# Tells the validator that from_bytes() has just hashed these bytes itself.
-_HASHED_CONTEXT: Final = "aox_agent_core.attachment_hashed"
+MAX_OBJECT_STREAMS: Final = 10_000
 
 _PDF_PAGE_OBJECT = re.compile(rb"/Type\s*/Page(?![a-zA-Z])")
+_PDF_PAGE_COUNT = re.compile(rb"/Count\s+(\d{1,9})")
+_PDF_ESCAPED_TYPE = re.compile(rb"/Type\s*/[^\s/<>\[\]()]*#")
 _PDF_OBJECT_STREAM = re.compile(rb"/Type\s*/ObjStm(?![a-zA-Z])")
 _PDF_STREAM_START = re.compile(rb"stream\r?\n")
 
@@ -50,6 +50,11 @@ class Attachment(FrozenModel):
     match the bytes, or AttachmentError is raised. `data` is excluded from every
     dump, so it never reaches a recording, a hash or a log; an attachment read
     back from a recording has no data.
+
+    model_copy(update=...) skips those checks, as it does for every pydantic
+    model: never use it to change `data`. Equality also compares the page count
+    read from the bytes, so compare `sha256` to tell whether two attachments
+    hold the same file.
     """
 
     media_type: AttachmentMediaType
@@ -74,7 +79,7 @@ class Attachment(FrozenModel):
             raise AttachmentError(
                 f"The {sniffed} attachment is {len(self.data)} bytes; the cap is {cap}."
             )
-        already_hashed = bool(info.context and info.context.get(_HASHED_CONTEXT))
+        already_hashed = bool(info.context and info.context.get(HASHED_ATTACHMENT))
         if not already_hashed and hashlib.sha256(self.data).hexdigest() != self.sha256:
             raise AttachmentError("sha256 does not match the attachment's bytes.")
         if sniffed == "application/pdf":
@@ -117,7 +122,7 @@ class Attachment(FrozenModel):
                 "size_bytes": len(data),
                 "data": data,
             },
-            context={_HASHED_CONTEXT: True},
+            context={HASHED_ATTACHMENT: True},
         )
 
     @classmethod
@@ -135,7 +140,9 @@ class Attachment(FrozenModel):
         """
         limit = MAX_PDF_BYTES if max_bytes is None else min(max_bytes, MAX_PDF_BYTES)
         try:
-            with Path(path).open("rb") as file:
+            # O_NONBLOCK, so opening a FIFO returns at once and is then refused.
+            descriptor = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+            with os.fdopen(descriptor, "rb") as file:
                 if not stat.S_ISREG(os.fstat(file.fileno()).st_mode):
                     raise AttachmentError(f"Attachment {path} is not a regular file.")
                 data = file.read(limit + 1)
@@ -164,26 +171,42 @@ def _cap_for(media_type: AttachmentMediaType) -> int:
 
 
 def _pdf_page_count(data: bytes) -> int | None:
-    """Count the page objects in a PDF, including those inside object streams.
+    """Count a PDF's pages: the larger of its page objects and its largest /Count.
 
-    Returns None when the pages cannot be counted: an object stream that is not
-    Flate-encoded, inflates past MAX_INFLATED_BYTES, or no page objects at all.
+    Page objects inside Flate-encoded object streams are counted too. Each byte
+    is scanned once. Returns None, so the caller assumes the most pages, when the
+    count cannot be trusted: an object stream that is not Flate, more than
+    MAX_OBJECT_STREAMS of them, inflating past MAX_INFLATED_BYTES in all, a
+    /Type name written with # escapes, or no pages found.
     """
-    pages = len(_PDF_PAGE_OBJECT.findall(data))
     view = memoryview(data)
+    chunks = [data]
     inflated_budget = MAX_INFLATED_BYTES
-    for object_stream in _PDF_OBJECT_STREAM.finditer(data):
+    position = 0
+    while (object_stream := _PDF_OBJECT_STREAM.search(data, position)) is not None:
+        if len(chunks) > MAX_OBJECT_STREAMS:
+            return None
         start = _PDF_STREAM_START.search(data, object_stream.end())
         end = data.find(b"endstream", start.end()) if start is not None else -1
         if start is None or end < 0:
             return None
         inflater = zlib.decompressobj()
         try:
+            # inflated_budget is always positive here; a max_length of 0 means no limit.
             inflated = inflater.decompress(view[start.end() : end], inflated_budget)
         except zlib.error:
             return None
-        if inflater.unconsumed_tail:
-            return None
         inflated_budget -= len(inflated)
-        pages += len(_PDF_PAGE_OBJECT.findall(inflated))
-    return pages or None
+        if inflater.unconsumed_tail or inflated_budget <= 0:
+            return None
+        chunks.append(inflated)
+        position = end + len(b"endstream")
+
+    page_objects = 0
+    declared = 0
+    for chunk in chunks:
+        if _PDF_ESCAPED_TYPE.search(chunk):
+            return None
+        page_objects += len(_PDF_PAGE_OBJECT.findall(chunk))
+        declared = max([declared, *(int(count) for count in _PDF_PAGE_COUNT.findall(chunk))])
+    return max(page_objects, declared) or None

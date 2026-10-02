@@ -1,6 +1,8 @@
 """Attachments, prompt references and run contexts: the new call inputs."""
 
 import hashlib
+import os
+import time
 import zlib
 from datetime import datetime
 from decimal import Decimal
@@ -13,7 +15,7 @@ from pydantic import ValidationError
 from aox_agent_core import Tier
 from aox_agent_core.context import MAX_EXTERNAL_IDS, RunContext
 from aox_agent_core.errors import AttachmentError, PromptError
-from aox_agent_core.models import Message, Role
+from aox_agent_core.models import Message, Role, attachments
 from aox_agent_core.models.attachments import MAX_IMAGE_BYTES, Attachment
 from aox_agent_core.models.prompts import PromptRef
 from aox_agent_core.replay import replay_key
@@ -126,6 +128,58 @@ def test_pdf_pages_are_counted_inside_object_streams() -> None:
     assert Attachment.from_bytes(PDF).pdf_pages is None
     assert Attachment.from_bytes(object_stream_pdf(3, filter_ok=False)).pdf_pages is None
     assert Attachment.from_bytes(PNG).pdf_pages is None
+
+
+def test_inflating_stops_at_the_budget_instead_of_running_unbounded(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(attachments, "MAX_INFLATED_BYTES", 1_000)
+    exactly_at_budget = zlib.compress(b"\x00" * 1_000)
+    bomb = zlib.compress(b"\x00" * 20_000_000)
+    data = b"%PDF-1.7\n" + b"".join(
+        b"1 0 obj << /Type /ObjStm >>\nstream\n" + body + b"\nendstream\nendobj\n"
+        for body in (exactly_at_budget, bomb)
+    )
+
+    assert attachments._pdf_page_count(data) is None
+
+
+def test_many_object_stream_markers_are_scanned_once() -> None:
+    markers = b"<< /Type /ObjStm >> " * 20_000
+    data = (
+        b"%PDF-1.7\n"
+        + markers
+        + b"\nstream\n"
+        + zlib.compress(b"<< /Type /Page >>")
+        + b"\nendstream\n"
+    )
+    started = time.perf_counter()
+
+    assert attachments._pdf_page_count(data) == 1
+    assert time.perf_counter() - started < 1
+
+
+def test_escaped_type_names_and_declared_counts_are_not_under_counted() -> None:
+    escaped = PDF + b"<< /Type /Page >> " + b"<< /Type /P#61ge >> " * 99
+    declared = PDF + b"<< /Type /Pages /Count 100 >> << /Type /Page >>"
+
+    assert Attachment.from_bytes(escaped).pdf_pages is None
+    assert Attachment.from_bytes(declared).pdf_pages == 100
+
+
+def test_from_path_refuses_a_fifo_without_blocking(tmp_path: Path) -> None:
+    fifo = tmp_path / "pipe"
+    os.mkfifo(fifo)
+
+    with pytest.raises(AttachmentError, match="not a regular file"):
+        Attachment.from_path(fifo)
+
+
+def test_a_string_validation_flag_does_not_skip_the_hash_check() -> None:
+    fields = {**Attachment.from_bytes(PNG).model_dump(), "data": PNG, "sha256": "0" * 64}
+
+    with pytest.raises(AttachmentError, match="sha256 does not match"):
+        Attachment.model_validate(fields, context={"aox_agent_core.attachment_hashed": True})
 
 
 def test_bytes_never_appear_in_dumps_or_repr() -> None:
