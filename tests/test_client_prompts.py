@@ -217,11 +217,55 @@ async def test_a_replayed_response_is_priced_at_its_recorded_model() -> None:
     )
 
 
-async def test_replaying_an_unpriced_model_is_a_config_error() -> None:
-    provider = ScriptedProvider(response(RECEIPT_JSON, model="claude-retired-1"))
+async def record_receipt(tmp_path: Path, reply: Any, **config: Any) -> None:
+    store = DirectoryRecordingStore(tmp_path, scrubber=PatternScrubber())
+    recorder = RecordingProvider(ScriptedProvider(reply), store, "default")
+    await call_receipt(AgentClient(make_config(tmp_path, **config), provider=recorder))
+
+
+async def test_a_replayed_alias_is_priced_at_the_recorded_request_model(tmp_path: Path) -> None:
+    await record_receipt(tmp_path, response(RECEIPT_JSON, model="claude-haiku-latest"))
+    config = make_config(tmp_path)
+
+    result = await call_receipt(AgentClient(config))
+
+    assert result.model == "claude-haiku-latest"
+    assert result.cost_usd == cost_of(
+        result.usage, config.price_for(Provider.ANTHROPIC, SMALL_MODEL)
+    )
+
+
+async def test_a_replay_is_priced_on_the_provider_it_was_recorded_with(tmp_path: Path) -> None:
+    mid = "claude-sonnet-5-5"
+    store = DirectoryRecordingStore(tmp_path, scrubber=PatternScrubber())
+    recorder = RecordingProvider(ScriptedProvider(response(RECEIPT_JSON, model=mid)), store, "x")
+    recording_client = AgentClient(make_config(tmp_path), provider=recorder)
+    await recording_client.call(PROMPT, inputs={"source": "s"}, output=Receipt, tier=Tier.MID)
+    # The mid tier has since moved to Bedrock, whose price table names it differently.
+    moved = make_config(
+        tmp_path,
+        routing={"tiers": {"mid": {"provider": "bedrock", "model": "anthropic.claude-sonnet-5-5"}}},
+    )
+
+    result = await AgentClient(moved).call(
+        PROMPT, inputs={"source": "s"}, output=Receipt, tier=Tier.MID
+    )
+
+    assert result.cost_usd == cost_of(result.usage, moved.price_for(Provider.ANTHROPIC, mid))
+
+
+async def test_replaying_a_model_that_lost_its_price_is_a_config_error(tmp_path: Path) -> None:
+    retired = "claude-retired-1"
+    haiku_price = make_config().pricing[Provider.ANTHROPIC].models[SMALL_MODEL].model_dump()
+    await record_receipt(
+        tmp_path,
+        response(RECEIPT_JSON, model=retired),
+        routing={"tiers": {"small": {"model": retired}}},
+        pricing={"anthropic": {"models": {retired: haiku_price}}},
+    )
 
     with pytest.raises(ConfigError, match="claude-retired-1"):
-        await call_receipt(client(provider))
+        await call_receipt(AgentClient(make_config(tmp_path)))
 
 
 async def test_a_live_alias_without_a_price_falls_back_to_the_route() -> None:

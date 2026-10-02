@@ -46,7 +46,7 @@ class ReplayProvider:
                 path=str(path),
             )
         self._served[key] += 1
-        return recording.response
+        return _as_replayed(recording)
 
     def _replay_prompted(self, prompt_key: PromptKey) -> ProviderResponse:
         path = self._store.prompt_path(prompt_key)
@@ -65,7 +65,7 @@ class ReplayProvider:
                 f"for prompt {prompt_key.prompt_id} v{prompt_key.version}. Bump the prompt "
                 "version, or record it again with AGENT_CORE_MODE=record."
             )
-        return recording.response
+        return _as_replayed(recording)
 
     def _prompted_miss_message(self, prompt_key: PromptKey, path: Path) -> str:
         message = (
@@ -84,6 +84,16 @@ class ReplayProvider:
                 "example after a price-table change."
             )
         return message + " Record it with AGENT_CORE_MODE=record."
+
+
+def _as_replayed(recording: Recording) -> ProviderResponse:
+    """The recorded response, noting the route it was recorded on, for pricing."""
+    return recording.response.model_copy(
+        update={
+            "recorded_provider": recording.request.provider,
+            "recorded_model": recording.request.model,
+        }
+    )
 
 
 class RecordingProvider:

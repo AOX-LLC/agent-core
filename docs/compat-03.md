@@ -387,7 +387,7 @@ def replay_key(
 - Editing a template, system prompt or output schema without bumping the version raises `StaleRecordingError`.
 - The tier in the key is the tier after routing. A price-table change that flips a budget drop to a lower tier changes the key.
 - A structured retry is attempt 2, with its own key.
-- Replaying a recording made on another model returns that recording's model and prices it at that model's rate. A model with no price raises `ConfigError`.
+- Replaying a recording made on another model returns that recording's model and prices it at that model's rate, on the provider it was recorded with. If the API answered with an unpriced name such as an alias, the recorded request's model's rate applies. `ConfigError` if neither is priced.
 
 ## Host-supplied backends
 

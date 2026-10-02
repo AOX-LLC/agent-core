@@ -77,6 +77,10 @@ class ProviderResponse(FrozenModel):
     text: str
     stop_reason: str
     usage: Usage
+    # Set only by replay: the provider and model the recorded request named, which
+    # had a price when it was recorded. Never written to a recording.
+    recorded_provider: Provider | None = Field(default=None, exclude=True, repr=False)
+    recorded_model: str | None = Field(default=None, exclude=True, repr=False)
 
 
 class CallResult(FrozenModel, Generic[OutputT]):

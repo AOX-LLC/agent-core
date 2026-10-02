@@ -19,7 +19,7 @@ What a consuming project needs to key replay by prompt, send images and PDFs, an
 - The audit log is schema 2: every record has a `run_context`, included in its hash. `UnsealedAuditRecord` requires it (pass `None` for none). Audit and approval tables created by 0.1.0a1 are refused with a `ConfigError`; the library never alters an existing table.
 - `ModelProvider.complete` takes a keyword-only `prompt_key` (a `PromptKey` or `None`). Custom providers must accept it.
 - `Message` has an `attachments` field, allowed on user messages only. Request hashes leave out fields at their defaults, so hashes of 0.1.0a1 requests are unchanged.
-- A replayed response is priced at the rate of the model it was recorded on, not the model the route now names. A recorded model with no configured price is a `ConfigError`.
+- A replayed response is priced as recorded, not at the model the route now names: at its own model's rate on the provider it was recorded with, else at the rate of the model the recorded request named. If neither has a price, it is a `ConfigError`. `ProviderResponse` gains `recorded_provider` and `recorded_model`, set only by replay and never stored.
 - The repository's triage eval cases take an object of prompt inputs (`{"ticket": ...}`) instead of a string.
 
 ### Added

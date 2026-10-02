@@ -17,6 +17,7 @@ from aox_agent_core.credentials import resolve_api_key
 from aox_agent_core.errors import (
     AttachmentError,
     BudgetExceededError,
+    ConfigError,
     EventLoopRunningError,
     ModelRefusalError,
     StructuredOutputError,
@@ -538,18 +539,26 @@ class _CallInProgress:
         )
 
     def _response_price(self, decision: RouteDecision, response: ProviderResponse) -> ModelPrice:
-        """The price of the model that answered.
+        """The price of the model that answered, falling back to the model that was asked.
 
         A replayed response may come from a model other than today's route, for
-        example after a tier's model changes; it is priced at its own rate, and
-        replaying one whose model has no price raises ConfigError. A live
-        provider may name the model differently from the route (an alias, a
-        Bedrock ID); then the route's price applies.
+        example after a tier's model changes, so it is priced as recorded: at
+        its own model's rate on the provider it was recorded with, or, when the
+        API answered with a name the price table lacks (an alias, a dated ID),
+        at the rate of the model the recorded request named. ConfigError if
+        neither has a price any more. A live response is priced the same way
+        against today's route.
         """
         config = self._config
-        if config.mode is Mode.REPLAY or config.has_price(decision.provider, response.model):
-            return config.price_for(decision.provider, response.model)
-        return config.price_for(decision.provider, decision.model)
+        provider = response.recorded_provider or decision.provider
+        requested = response.recorded_model or decision.model
+        for model in (response.model, requested):
+            if config.has_price(provider, model):
+                return config.price_for(provider, model)
+        raise ConfigError(
+            f"Cannot price the response: neither {response.model!r} nor {requested!r} has a "
+            f"{provider.value} price configured."
+        )
 
     def _refuse_over_budget(self, request: ProviderRequest, price: ModelPrice) -> None:
         """Raise BudgetExceededError if this attempt could take the call over its budget.
