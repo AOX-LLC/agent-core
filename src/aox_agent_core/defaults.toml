@@ -59,19 +59,13 @@ cache_read_usd_per_mtok = "0.20"
 
 # Bedrock bills separately through AWS Marketplace. These are the on-demand
 # "Standard" regional rates for us-east-1, which are 1.1x the global-endpoint
-# rates. Keys are the model IDs the Bedrock Mantle endpoint accepts.
+# rates. Keys are the model IDs the Bedrock Mantle endpoint accepts. Only the
+# models in [bedrock.tier_models] are priced.
 
 [pricing.bedrock]
 as_of = 2026-10-02
 source = "https://pricing.us-east-1.amazonaws.com/offers/v1.0/aws/AmazonBedrockFoundationModels/current/us-east-1/index.json"
 region = "us-east-1"
-
-[pricing.bedrock.models."anthropic.claude-haiku-4-5"]
-input_usd_per_mtok = "1.10"
-output_usd_per_mtok = "5.50"
-cache_write_5m_usd_per_mtok = "1.375"
-cache_write_1h_usd_per_mtok = "2.20"
-cache_read_usd_per_mtok = "0.11"
 
 [pricing.bedrock.models."anthropic.claude-sonnet-5-5"]
 input_usd_per_mtok = "2.20"
@@ -86,6 +80,22 @@ output_usd_per_mtok = "22.00"
 cache_write_5m_usd_per_mtok = "5.50"
 cache_write_1h_usd_per_mtok = "8.80"
 cache_read_usd_per_mtok = "0.22"
+
+[anthropic]
+base_url = "https://api.anthropic.com"
+timeout_seconds = 600
+max_retries = 2
+
+# Bedrock model per tier. The small tier has no Bedrock default: Claude Haiku 4.5
+# reaches end of life on Bedrock no sooner than 2026-10-16, and as of 2026-10-02
+# no other small model was available there to replace it. A project that routes
+# the small tier to Bedrock must name the model, and price it, itself.
+[bedrock]
+region = "us-east-1"
+
+[bedrock.tier_models]
+mid = "anthropic.claude-sonnet-5-5"
+large = "anthropic.claude-opus-5-5"
 
 [replay]
 cassette_dir = "replays"
