@@ -532,3 +532,21 @@ async def test_a_full_listing_reads_no_extra_page(
 
     assert len(await queue.list_pending(APPROVER, limit=2)) == 2
     assert transactions == 1
+
+
+async def test_list_pending_pages_with_an_after_cursor(control_database: ControlDatabase) -> None:
+    clock = Clock()
+    queue = queue_for(control_database, clock)
+    created = []
+    for minute in range(5):
+        clock.now = NOW + timedelta(minutes=minute)
+        created.append((await submitted(queue)).id)
+
+    first = await queue.list_pending(APPROVER, limit=2)
+    second = await queue.list_pending(APPROVER, limit=2, after=first[-1].id)
+    third = await queue.list_pending(APPROVER, limit=2, after=second[-1].id)
+
+    pages = [[request.id for request in page] for page in (first, second, third)]
+    assert pages == [created[0:2], created[2:4], created[4:5]]
+    with pytest.raises(ApprovalNotFoundError):
+        await queue.list_pending(APPROVER, after=uuid4())

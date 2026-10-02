@@ -35,9 +35,12 @@ class ApprovalQueue(Protocol):
     async def get(self, request_id: UUID) -> ApprovalRequest: ...
 
     async def list_pending(
-        self, principal: Principal, *, limit: int = 100
+        self, principal: Principal, *, limit: int = 100, after: UUID | None = None
     ) -> Sequence[ApprovalRequest]:
-        """Up to `limit` pending, unexpired requests this principal may resolve, oldest first."""
+        """Up to `limit` pending, unexpired requests this principal may resolve, oldest first.
+
+        Pass the last request's id as `after` to read the next page.
+        """
         ...
 
     async def resolve(

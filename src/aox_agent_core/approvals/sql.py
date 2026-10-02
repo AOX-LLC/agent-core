@@ -193,9 +193,17 @@ class SQLApprovalQueue:
         return request
 
     async def list_pending(
-        self, principal: Principal, *, limit: int = DEFAULT_PENDING_LIMIT
+        self,
+        principal: Principal,
+        *,
+        limit: int = DEFAULT_PENDING_LIMIT,
+        after: UUID | None = None,
     ) -> Sequence[ApprovalRequest]:
         """Up to `limit` pending, unexpired requests this principal may resolve, oldest first.
+
+        Requests are ordered by creation (created_at, then id). To read the next
+        page, pass the last request's id as `after`; listing resumes right after
+        it. An unknown `after` raises ApprovalNotFoundError.
 
         The policy decides each request. With the default RoleApproverPolicy the
         database also narrows by role and requester, which keeps a large queue
@@ -214,14 +222,14 @@ class SQLApprovalQueue:
         page_size = limit if uses_default_policy else max(limit, PENDING_PAGE_SIZE)
 
         eligible: list[ApprovalRequest] = []
-        after: ApprovalRequest | None = None
+        resume_after = await self.get(after) if after is not None else None
 
         def read_pages(session: Session) -> bool:
             """Read pages until `limit` requests pass; return whether more pages remain."""
-            nonlocal after
+            nonlocal resume_after
             while len(eligible) < limit:
                 page = _load_pending_page(
-                    session, now=now, after=after, narrowed_to=narrowed_to, limit=page_size
+                    session, now=now, after=resume_after, narrowed_to=narrowed_to, limit=page_size
                 )
                 eligible.extend(
                     request
@@ -230,7 +238,7 @@ class SQLApprovalQueue:
                 )
                 if len(page) < page_size:
                     return False
-                after = page[-1]
+                resume_after = page[-1]
                 if session.dialect is Dialect.SQLITE:
                     return len(eligible) < limit
             return False
