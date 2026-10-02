@@ -7,10 +7,13 @@ memory for the one request that sends them.
 
 import hashlib
 import os
+import re
+import stat
+import zlib
 from pathlib import Path
 from typing import Annotated, Final, Literal, Self
 
-from pydantic import Field
+from pydantic import Field, PrivateAttr, ValidationInfo, model_validator
 
 from aox_agent_core._model import FrozenModel, Sha256Hex
 from aox_agent_core.errors import AttachmentError
@@ -22,6 +25,16 @@ AttachmentMediaType = Literal["image/png", "image/jpeg", "application/pdf"]
 MAX_IMAGE_BYTES: Final = 5_000_000
 MAX_PDF_BYTES: Final = 24_000_000
 
+# Inflating a PDF's object streams to count its pages stops past this many bytes.
+MAX_INFLATED_BYTES: Final = 64_000_000
+
+# Tells the validator that from_bytes() has just hashed these bytes itself.
+_HASHED_CONTEXT: Final = "aox_agent_core.attachment_hashed"
+
+_PDF_PAGE_OBJECT = re.compile(rb"/Type\s*/Page(?![a-zA-Z])")
+_PDF_OBJECT_STREAM = re.compile(rb"/Type\s*/ObjStm(?![a-zA-Z])")
+_PDF_STREAM_START = re.compile(rb"stream\r?\n")
+
 _SIGNATURES: Final[tuple[tuple[bytes, AttachmentMediaType], ...]] = (
     (b"\x89PNG\r\n\x1a\n", "image/png"),
     (b"\xff\xd8\xff", "image/jpeg"),
@@ -32,15 +45,47 @@ _SIGNATURES: Final[tuple[tuple[bytes, AttachmentMediaType], ...]] = (
 class Attachment(FrozenModel):
     """A PNG, JPEG or PDF to send with a call.
 
-    Build one with from_bytes() or from_path(), which check the type and size.
-    `data` is excluded from every dump, so it never reaches a recording, a hash
-    or a log; an attachment read back from a recording has no data.
+    Build one with from_bytes() or from_path(). An attachment built directly
+    with its bytes is checked the same way: its type, size and SHA-256 must
+    match the bytes, or AttachmentError is raised. `data` is excluded from every
+    dump, so it never reaches a recording, a hash or a log; an attachment read
+    back from a recording has no data.
     """
 
     media_type: AttachmentMediaType
     sha256: Sha256Hex
     size_bytes: Annotated[int, Field(gt=0)]
     data: bytes | None = Field(default=None, exclude=True, repr=False)
+    _pdf_pages: int | None = PrivateAttr(default=None)
+
+    @model_validator(mode="after")
+    def _fields_match_the_bytes(self, info: ValidationInfo) -> Self:
+        if self.data is None:
+            return self
+        sniffed = _sniff(self.data)
+        if sniffed != self.media_type:
+            raise AttachmentError(f"Declared {self.media_type} but the bytes are {sniffed}.")
+        if len(self.data) != self.size_bytes:
+            raise AttachmentError(
+                f"size_bytes is {self.size_bytes} but the attachment is {len(self.data)} bytes."
+            )
+        cap = _cap_for(sniffed)
+        if len(self.data) > cap:
+            raise AttachmentError(
+                f"The {sniffed} attachment is {len(self.data)} bytes; the cap is {cap}."
+            )
+        already_hashed = bool(info.context and info.context.get(_HASHED_CONTEXT))
+        if not already_hashed and hashlib.sha256(self.data).hexdigest() != self.sha256:
+            raise AttachmentError("sha256 does not match the attachment's bytes.")
+        if sniffed == "application/pdf":
+            self._pdf_pages = _pdf_page_count(self.data)
+        return self
+
+    @property
+    def pdf_pages(self) -> int | None:
+        """A PDF's page count, read once from its bytes; None for an image, a PDF
+        whose pages could not be counted, or an attachment built without bytes."""
+        return self._pdf_pages
 
     @classmethod
     def from_bytes(
@@ -65,11 +110,14 @@ class Attachment(FrozenModel):
             raise AttachmentError(
                 f"The {sniffed} attachment is {len(data)} bytes; the cap is {cap}."
             )
-        return cls(
-            media_type=sniffed,
-            sha256=hashlib.sha256(data).hexdigest(),
-            size_bytes=len(data),
-            data=data,
+        return cls.model_validate(
+            {
+                "media_type": sniffed,
+                "sha256": hashlib.sha256(data).hexdigest(),
+                "size_bytes": len(data),
+                "data": data,
+            },
+            context={_HASHED_CONTEXT: True},
         )
 
     @classmethod
@@ -80,11 +128,21 @@ class Attachment(FrozenModel):
         media_type: AttachmentMediaType | None = None,
         max_bytes: int | None = None,
     ) -> Self:
-        """Read a file and build an attachment from its bytes, as from_bytes() does."""
+        """Read a file and build an attachment from its bytes, as from_bytes() does.
+
+        Only a regular file is read, and never more than one byte past the
+        largest cap, so a huge or endless file fails fast.
+        """
+        limit = MAX_PDF_BYTES if max_bytes is None else min(max_bytes, MAX_PDF_BYTES)
         try:
-            data = Path(path).read_bytes()
+            with Path(path).open("rb") as file:
+                if not stat.S_ISREG(os.fstat(file.fileno()).st_mode):
+                    raise AttachmentError(f"Attachment {path} is not a regular file.")
+                data = file.read(limit + 1)
         except OSError as error:
             raise AttachmentError(f"Cannot read attachment {path}: {error.strerror}") from error
+        if len(data) > limit:
+            raise AttachmentError(f"Attachment {path} is over the {limit}-byte cap.")
         return cls.from_bytes(data, media_type=media_type, max_bytes=max_bytes)
 
     def reference(self) -> "Attachment":
@@ -103,3 +161,29 @@ def _sniff(data: bytes) -> AttachmentMediaType:
 
 def _cap_for(media_type: AttachmentMediaType) -> int:
     return MAX_PDF_BYTES if media_type == "application/pdf" else MAX_IMAGE_BYTES
+
+
+def _pdf_page_count(data: bytes) -> int | None:
+    """Count the page objects in a PDF, including those inside object streams.
+
+    Returns None when the pages cannot be counted: an object stream that is not
+    Flate-encoded, inflates past MAX_INFLATED_BYTES, or no page objects at all.
+    """
+    pages = len(_PDF_PAGE_OBJECT.findall(data))
+    view = memoryview(data)
+    inflated_budget = MAX_INFLATED_BYTES
+    for object_stream in _PDF_OBJECT_STREAM.finditer(data):
+        start = _PDF_STREAM_START.search(data, object_stream.end())
+        end = data.find(b"endstream", start.end()) if start is not None else -1
+        if start is None or end < 0:
+            return None
+        inflater = zlib.decompressobj()
+        try:
+            inflated = inflater.decompress(view[start.end() : end], inflated_budget)
+        except zlib.error:
+            return None
+        if inflater.unconsumed_tail:
+            return None
+        inflated_budget -= len(inflated)
+        pages += len(_PDF_PAGE_OBJECT.findall(inflated))
+    return pages or None

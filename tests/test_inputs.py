@@ -1,5 +1,7 @@
 """Attachments, prompt references and run contexts: the new call inputs."""
 
+import hashlib
+import zlib
 from pathlib import Path
 from uuid import UUID
 
@@ -55,6 +57,71 @@ def test_a_misnamed_file_is_typed_by_its_contents(tmp_path: Path) -> None:
     assert Attachment.from_path(path).media_type == "application/pdf"
     with pytest.raises(AttachmentError, match="Cannot read"):
         Attachment.from_path(tmp_path / "absent.png")
+
+
+@pytest.mark.parametrize(
+    ("fields", "message"),
+    [
+        ({"media_type": "image/png", "data": JPEG}, "bytes are image/jpeg"),
+        ({"size_bytes": 1}, "size_bytes is 1"),
+        ({"sha256": "0" * 64}, "sha256 does not match"),
+    ],
+    ids=["type", "size", "hash"],
+)
+def test_a_directly_built_attachment_must_match_its_bytes(
+    fields: dict[str, object], message: str
+) -> None:
+    valid = Attachment.from_bytes(PNG)
+    built = {**valid.model_dump(), "data": PNG, **fields}
+    if "data" in fields:
+        built["size_bytes"] = len(JPEG)
+
+    with pytest.raises(AttachmentError, match=message):
+        Attachment.model_validate(built)
+
+
+def test_a_directly_built_oversized_attachment_is_refused() -> None:
+    data = PNG + b"\x00" * MAX_IMAGE_BYTES
+    fields = {
+        "media_type": "image/png",
+        "sha256": hashlib.sha256(data).hexdigest(),
+        "size_bytes": len(data),
+        "data": data,
+    }
+
+    with pytest.raises(AttachmentError, match="the cap is"):
+        Attachment.model_validate(fields)
+
+
+def test_from_path_reads_only_regular_files_and_stops_past_the_cap(tmp_path: Path) -> None:
+    big = tmp_path / "big.png"
+    big.write_bytes(PNG + b"\x00" * 2_000)
+
+    with pytest.raises(AttachmentError, match="not a regular file"):
+        Attachment.from_path("/dev/zero")
+    with pytest.raises(AttachmentError, match="over the 1000-byte cap"):
+        Attachment.from_path(big, max_bytes=1_000)
+
+
+def object_stream_pdf(pages: int, *, filter_ok: bool = True) -> bytes:
+    """A PDF 1.5-style file whose page objects live in a compressed object stream."""
+    objects = b" ".join(b"<< /Type /Page /Parent 2 0 R >>" for _ in range(pages))
+    body = zlib.compress(objects) if filter_ok else b"not flate data"
+    header = b"5 0 obj << /Type /ObjStm /N %d /First 0 /Filter /FlateDecode /Length %d >>"
+    return (
+        b"%PDF-1.7\n"
+        + header % (pages, len(body))
+        + b"\nstream\n"
+        + body
+        + b"\nendstream\nendobj\n%EOF\n"
+    )
+
+
+def test_pdf_pages_are_counted_inside_object_streams() -> None:
+    assert Attachment.from_bytes(object_stream_pdf(7)).pdf_pages == 7
+    assert Attachment.from_bytes(PDF).pdf_pages is None
+    assert Attachment.from_bytes(object_stream_pdf(3, filter_ok=False)).pdf_pages is None
+    assert Attachment.from_bytes(PNG).pdf_pages is None
 
 
 def test_bytes_never_appear_in_dumps_or_repr() -> None:

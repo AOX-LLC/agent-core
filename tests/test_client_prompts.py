@@ -31,6 +31,7 @@ from aox_agent_core.models import AnthropicProvider, ProviderRequest
 from aox_agent_core.models.pricing import (
     IMAGE_TOKENS_ESTIMATE,
     PDF_PAGE_TOKENS_ESTIMATE,
+    PDF_PAGES_CEILING,
     cost_of,
     estimate_attachment_tokens,
     worst_case_cost,
@@ -282,7 +283,9 @@ async def test_a_live_alias_without_a_price_falls_back_to_the_route() -> None:
 def test_attachment_estimates_count_images_and_pdf_pages() -> None:
     assert estimate_attachment_tokens([PNG]) == IMAGE_TOKENS_ESTIMATE
     assert estimate_attachment_tokens([PDF]) == 2 * PDF_PAGE_TOKENS_ESTIMATE
-    assert estimate_attachment_tokens([PDF.reference()]) == PDF_PAGE_TOKENS_ESTIMATE
+    assert estimate_attachment_tokens([PDF.reference()]) == 2 * PDF_PAGE_TOKENS_ESTIMATE
+    recorded = Attachment.model_validate(PDF.reference().model_dump())
+    assert estimate_attachment_tokens([recorded]) == PDF_PAGES_CEILING * PDF_PAGE_TOKENS_ESTIMATE
 
 
 async def test_the_budget_counts_attachments() -> None:

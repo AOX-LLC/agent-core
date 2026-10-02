@@ -1,7 +1,6 @@
 """Turning token counts into dollars with the configured, dated price table."""
 
 import math
-import re
 from collections.abc import Iterable
 from decimal import Decimal
 
@@ -20,8 +19,9 @@ CHARACTERS_PER_TOKEN_ESTIMATE = 3
 # image of the page.
 IMAGE_TOKENS_ESTIMATE = 5_000
 PDF_PAGE_TOKENS_ESTIMATE = 8_000
-
-_PDF_PAGE_OBJECT = re.compile(rb"/Type\s*/Page(?![a-zA-Z])")
+# Pages assumed for a PDF whose pages cannot be counted: the API's per-request
+# PDF page limit, so the estimate stays an upper bound.
+PDF_PAGES_CEILING = 100
 
 
 def cost_of(usage: Usage, price: ModelPrice) -> Decimal:
@@ -56,14 +56,14 @@ def estimate_input_tokens(*texts: str | None) -> int:
 def estimate_attachment_tokens(attachments: Iterable[Attachment]) -> int:
     """Over-estimate the tokens attachments add, for budget checks before a call.
 
-    A PDF's pages are counted from its page objects. An attachment without its
-    bytes counts as one image or one page.
+    A PDF's pages are counted once, when the attachment is built; a PDF whose
+    pages could not be counted is assumed to have PDF_PAGES_CEILING of them.
     """
     tokens = 0
     for attachment in attachments:
         if attachment.media_type != "application/pdf":
             tokens += IMAGE_TOKENS_ESTIMATE
             continue
-        pages = len(_PDF_PAGE_OBJECT.findall(attachment.data)) if attachment.data else 0
-        tokens += max(pages, 1) * PDF_PAGE_TOKENS_ESTIMATE
+        pages = attachment.pdf_pages or PDF_PAGES_CEILING
+        tokens += pages * PDF_PAGE_TOKENS_ESTIMATE
     return tokens
