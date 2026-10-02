@@ -209,7 +209,10 @@ class AgentClient:
             estimated_input_tokens=estimate_input_tokens(
                 system, *(message.content for message in messages)
             )
-            + estimate_attachment_tokens(_attachments_in(messages)),
+            + estimate_attachment_tokens(
+                _attachments_in(messages),
+                count_pdf_pages=self._config.routing.count_pdf_pages,
+            ),
             max_output_tokens=max_tokens,
         )
         decision = self._router.select(route_request)
@@ -584,7 +587,10 @@ class _CallInProgress:
             return
         input_tokens = estimate_input_tokens(
             request.system, *(message.content for message in request.messages)
-        ) + estimate_attachment_tokens(_attachments_in(request.messages))
+        ) + estimate_attachment_tokens(
+            _attachments_in(request.messages),
+            count_pdf_pages=self._config.routing.count_pdf_pages,
+        )
         worst_case = worst_case_cost(input_tokens, request.max_tokens, price)
         if self.cost_usd + worst_case > budget:
             raise BudgetExceededError(

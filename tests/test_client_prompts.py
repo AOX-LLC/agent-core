@@ -304,6 +304,31 @@ async def test_the_budget_counts_attachments() -> None:
     assert len(provider.requests) == 1
 
 
+async def test_strict_mode_budgets_every_pdf_at_the_page_ceiling() -> None:
+    config = make_config()
+    small = config.routing.tiers[Tier.SMALL]
+    price = config.price_for(Provider.ANTHROPIC, SMALL_MODEL)
+    # Room for the two counted pages, but not for 100.
+    budget = worst_case_cost(20_000, small.max_tokens, price)
+    counted = ScriptedProvider(response(RECEIPT_JSON))
+    strict = ScriptedProvider()
+
+    await call_receipt(
+        client(counted, routing={"budget_usd_per_call": str(budget)}), attachments=[PDF]
+    )
+    with pytest.raises(BudgetExceededError):
+        await call_receipt(
+            client(strict, routing={"budget_usd_per_call": str(budget), "count_pdf_pages": False}),
+            attachments=[PDF],
+        )
+
+    assert len(counted.requests) == 1
+    assert strict.requests == []
+    assert estimate_attachment_tokens([PDF], count_pdf_pages=False) == (
+        PDF_PAGES_CEILING * PDF_PAGE_TOKENS_ESTIMATE
+    )
+
+
 # Run context
 
 

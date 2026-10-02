@@ -26,7 +26,7 @@ MAX_IMAGE_BYTES: Final = 5_000_000
 MAX_PDF_BYTES: Final = 24_000_000
 
 # Counting a PDF's pages gives up past this many inflated bytes or object streams.
-MAX_INFLATED_BYTES: Final = 64_000_000
+MAX_INFLATED_BYTES: Final = 16_000_000
 MAX_OBJECT_STREAMS: Final = 10_000
 
 _PDF_PAGE_OBJECT = re.compile(rb"/Type\s*/Page(?![a-zA-Z])")
@@ -101,6 +101,10 @@ class Attachment(FrozenModel):
         max_bytes: int | None = None,
     ) -> Self:
         """Check the bytes' type by their signature and their size against the cap.
+
+        Counting a PDF's pages can take up to about a second of CPU on a file
+        built to be slow; in async code, build attachments from untrusted bytes
+        with asyncio.to_thread.
 
         A declared media_type must agree with the signature. max_bytes can only
         lower the per-type cap. Raises AttachmentError.

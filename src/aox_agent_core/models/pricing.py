@@ -53,17 +53,21 @@ def estimate_input_tokens(*texts: str | None) -> int:
     return math.ceil(characters / CHARACTERS_PER_TOKEN_ESTIMATE)
 
 
-def estimate_attachment_tokens(attachments: Iterable[Attachment]) -> int:
+def estimate_attachment_tokens(
+    attachments: Iterable[Attachment], *, count_pdf_pages: bool = True
+) -> int:
     """Over-estimate the tokens attachments add, for budget checks before a call.
 
     A PDF's pages are counted once, when the attachment is built; a PDF whose
-    pages could not be counted is assumed to have PDF_PAGES_CEILING of them.
+    pages could not be counted is assumed to have PDF_PAGES_CEILING of them. The
+    count is best effort against a PDF built to hide its pages; with
+    count_pdf_pages=False every PDF is assumed to have PDF_PAGES_CEILING.
     """
     tokens = 0
     for attachment in attachments:
         if attachment.media_type != "application/pdf":
             tokens += IMAGE_TOKENS_ESTIMATE
             continue
-        pages = attachment.pdf_pages or PDF_PAGES_CEILING
+        pages = (attachment.pdf_pages if count_pdf_pages else None) or PDF_PAGES_CEILING
         tokens += pages * PDF_PAGE_TOKENS_ESTIMATE
     return tokens

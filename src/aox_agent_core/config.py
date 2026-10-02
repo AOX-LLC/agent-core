@@ -115,6 +115,11 @@ class RoutingConfig(FrozenModel):
     DROP_ONE_TIER retries the estimate one tier lower and raises only if that is
     still over budget or there is no lower tier. A retry or escalation that could
     take the total over budget raises BudgetExceededError instead of being sent.
+
+    A PDF's pages are counted from its bytes, which is best effort: a PDF built
+    to hide its pages can be under-counted. Set count_pdf_pages to false when
+    PDFs come from untrusted users, and every PDF is budgeted at the API's
+    100-page limit.
     """
 
     tiers: Mapping[Tier, TierConfig]
@@ -123,6 +128,7 @@ class RoutingConfig(FrozenModel):
     budget_usd_per_call: Annotated[Decimal, Field(gt=0)] | None = None
     on_budget_exceeded: BudgetAction = BudgetAction.RAISE
     escalate_on_structured_failure: bool = False
+    count_pdf_pages: bool = True
 
     @model_validator(mode="after")
     def _every_tier_is_defined(self) -> Self:
