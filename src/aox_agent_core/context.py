@@ -1,7 +1,6 @@
 """RunContext: which run a call, an approval or an audit record belongs to."""
 
-from collections.abc import Mapping
-from types import MappingProxyType
+from collections.abc import Iterator, Mapping
 from typing import Annotated, Any, Final, Self
 
 from pydantic import (
@@ -15,19 +14,43 @@ from pydantic import (
 
 from aox_agent_core._canonical import canonical_json
 from aox_agent_core._model import FrozenModel
+from aox_agent_core._validation import STORED_RECORD
 
 MAX_EXTERNAL_IDS: Final = 16
 MAX_CONTEXT_BYTES: Final = 2_048
-
-# Validation context for a run context read back from storage: it was scanned for
-# secrets when written, and is not scanned again, so a secret pattern added later
-# cannot make an existing audit chain unreadable.
-STORED_CONTEXT: Final = "aox_agent_core.stored_run_context"
 
 
 # Opaque identifiers only: no '@', so an email address cannot pass as an id.
 OpaqueId = Annotated[str, StringConstraints(pattern=r"^[A-Za-z0-9][A-Za-z0-9._:/-]{0,199}$")]
 ExternalIdName = Annotated[str, StringConstraints(pattern=r"^[a-z][a-z0-9_]{0,63}$")]
+
+
+class ReadOnlyIds(Mapping[str, str]):
+    """A sorted mapping that cannot be changed after it is built, but can be
+    copied and pickled, unlike MappingProxyType."""
+
+    __slots__ = ("_ids",)
+
+    def __init__(self, ids: Mapping[str, str] | None = None) -> None:
+        self._ids = dict(sorted((ids or {}).items()))
+
+    def __getitem__(self, name: str) -> str:
+        return self._ids[name]
+
+    def __iter__(self) -> Iterator[str]:
+        return iter(self._ids)
+
+    def __len__(self) -> int:
+        return len(self._ids)
+
+    def __hash__(self) -> int:
+        return hash(tuple(self._ids.items()))
+
+    def __repr__(self) -> str:
+        return f"ReadOnlyIds({self._ids!r})"
+
+    def __reduce__(self) -> tuple[type["ReadOnlyIds"], tuple[dict[str, str]]]:
+        return (ReadOnlyIds, (dict(self._ids),))
 
 
 class RunContext(FrozenModel):
@@ -43,14 +66,12 @@ class RunContext(FrozenModel):
     """
 
     run_id: OpaqueId
-    external_ids: Mapping[ExternalIdName, OpaqueId] = Field(
-        default_factory=lambda: MappingProxyType({})
-    )
+    external_ids: Mapping[ExternalIdName, OpaqueId] = Field(default_factory=ReadOnlyIds)
 
     @field_validator("external_ids", mode="after")
     @classmethod
     def _read_only(cls, external_ids: Mapping[str, str]) -> Mapping[str, str]:
-        return MappingProxyType(dict(sorted(external_ids.items())))
+        return ReadOnlyIds(external_ids)
 
     @field_serializer("external_ids")
     def _as_dict(self, external_ids: Mapping[str, str]) -> dict[str, str]:
@@ -65,6 +86,10 @@ class RunContext(FrozenModel):
         from aox_agent_core.audit.types import is_secret_shaped_key
         from aox_agent_core.replay.scrub import PatternScrubber
 
+        # A stored context passed these checks when it was written; only its
+        # structure (the id patterns above) is checked when it is read back.
+        if info.context and info.context.get(STORED_RECORD):
+            return self
         if len(self.external_ids) > MAX_EXTERNAL_IDS:
             raise ValueError(f"at most {MAX_EXTERNAL_IDS} external ids")
         size = len(canonical_json(self.as_json()))
@@ -73,8 +98,6 @@ class RunContext(FrozenModel):
         secret_names = sorted(name for name in self.external_ids if is_secret_shaped_key(name))
         if secret_names:
             raise ValueError(f"external id names look like secrets: {', '.join(secret_names)}")
-        if info.context and info.context.get(STORED_CONTEXT):
-            return self
         if PatternScrubber().find_secrets(self.as_json()):
             raise ValueError("a run context value looks like a secret")
         return self

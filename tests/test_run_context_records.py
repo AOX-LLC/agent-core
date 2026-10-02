@@ -1,5 +1,7 @@
 """Run contexts in audit records and approvals, and refusal of 0.1.0a1 tables."""
 
+import copy
+import pickle
 from pathlib import Path
 from typing import Any
 
@@ -7,6 +9,7 @@ import pytest
 from pydantic import ValidationError
 
 from aox_agent_core import RunContext
+from aox_agent_core._validation import STORED_RECORD
 from aox_agent_core.approvals import Principal, PrincipalKind
 from aox_agent_core.approvals import sql as approvals_sql
 from aox_agent_core.approvals.sql import SQLApprovalQueue
@@ -272,3 +275,21 @@ def test_table_columns_refuses_a_name_that_is_not_an_identifier(tmp_path: Path) 
 
     with pytest.raises(ValueError, match="not a plain table name"):
         database.run_sync(lambda session: table_columns(session, "x); DROP TABLE y; --"))
+
+
+def test_contexts_and_what_holds_them_copy_and_pickle() -> None:
+    held = event()
+
+    assert pickle.loads(pickle.dumps(RUN)) == RUN  # noqa: S301 - bytes pickled just above
+    assert copy.deepcopy(held) == held
+    assert RUN.model_copy(deep=True) == RUN
+
+
+def test_a_stored_context_is_checked_for_structure_only() -> None:
+    stored = {"run_id": "r1", "external_ids": {"api_token": "abc"}}
+
+    assert RunContext.model_validate(stored, context={STORED_RECORD: True}).run_id == "r1"
+    with pytest.raises(ValidationError):
+        RunContext.model_validate(stored)
+    with pytest.raises(ValidationError):
+        RunContext.model_validate({"run_id": "not an id!"}, context={STORED_RECORD: True})

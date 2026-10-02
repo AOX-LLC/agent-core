@@ -24,6 +24,7 @@ from uuid import UUID, uuid4
 from pydantic import JsonValue, ValidationError
 
 from aox_agent_core._canonical import canonical_json
+from aox_agent_core._validation import STORED_RECORD
 from aox_agent_core.audit.chain import canonical_timestamp, compute_record_hash
 from aox_agent_core.audit.types import (
     GENESIS_HASH,
@@ -32,7 +33,6 @@ from aox_agent_core.audit.types import (
     AuditRecord,
     UnsealedAuditRecord,
 )
-from aox_agent_core.context import STORED_CONTEXT
 from aox_agent_core.errors import AuditIntegrityError, AuditPayloadRejectedError, ConfigError
 from aox_agent_core.replay.scrub import PatternScrubber, Scrubber
 from aox_agent_core.storage import Database, Dialect, Session, require_current_table
@@ -439,7 +439,7 @@ def record_from_row(row: tuple[Any, ...]) -> AuditRecord:
                 "prev_hash": prev_hash,
                 "record_hash": record_hash,
             },
-            context={STORED_CONTEXT: True},
+            context={STORED_RECORD: True},
         )
     except (ValueError, TypeError, ValidationError) as error:
         raise AuditIntegrityError(f"Record {seq} is malformed and cannot be checked.") from error
