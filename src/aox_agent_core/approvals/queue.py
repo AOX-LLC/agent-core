@@ -34,8 +34,10 @@ class ApprovalQueue(Protocol):
 
     async def get(self, request_id: UUID) -> ApprovalRequest: ...
 
-    async def list_pending(self, principal: Principal) -> Sequence[ApprovalRequest]:
-        """Pending requests that this principal may resolve."""
+    async def list_pending(
+        self, principal: Principal, *, limit: int = 100
+    ) -> Sequence[ApprovalRequest]:
+        """Up to `limit` pending, unexpired requests this principal may resolve, oldest first."""
         ...
 
     async def resolve(
@@ -55,9 +57,16 @@ class ApprovalQueue(Protocol):
         ...
 
     async def consume(
-        self, request_id: UUID, *, action: str, payload: Mapping[str, JsonValue]
+        self,
+        request_id: UUID,
+        *,
+        action: str,
+        payload: Mapping[str, JsonValue],
+        principal: Principal,
     ) -> ApprovalRequest:
-        """Call right before acting. Atomically moves an approved request to CONSUMED.
+        """Call right before acting, as `principal`, the one about to act.
+
+        Atomically moves an approved request to CONSUMED.
 
         One approval authorizes one run. Raises ApprovalPayloadMismatchError if the
         action or payload differ from what was approved, ApprovalNotGrantedError if

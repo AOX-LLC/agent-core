@@ -9,6 +9,7 @@ a Database, in the same transaction as the change.
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
+from functools import partial
 from typing import Any, Final, TypeVar
 from uuid import UUID, uuid4
 
@@ -23,6 +24,7 @@ from aox_agent_core.approvals.types import (
     Decision,
     DenialReason,
     Principal,
+    PrincipalKind,
 )
 from aox_agent_core.audit.chain import canonical_timestamp
 from aox_agent_core.audit.log import AuditLog
@@ -61,7 +63,17 @@ CREATE TABLE {APPROVALS_TABLE} (
     reason TEXT
 )"""
 
-SCHEMA: Final = (_TABLE_DDL, f"REVOKE ALL ON {APPROVALS_TABLE} FROM PUBLIC")
+_PENDING_INDEX_DDL = (
+    f"CREATE INDEX agent_core_approvals_pending ON {APPROVALS_TABLE} (status, created_at)"
+)
+
+SCHEMA: Final = (
+    _TABLE_DDL,
+    _PENDING_INDEX_DDL,
+    f"REVOKE ALL ON {APPROVALS_TABLE} FROM PUBLIC",
+)
+
+DEFAULT_PENDING_LIMIT = 100
 
 _COLUMNS = (
     "id, action, summary, payload_sha256, requested_by, required_role, created_at, "
@@ -103,7 +115,7 @@ class SQLApprovalQueue:
     caller cannot skip it. A denied attempt is audited and committed before its
     error is raised. consume() is called right before acting: it moves an approved
     request to CONSUMED, so one approval authorizes exactly one run, and its audit
-    event is attributed to the principal who requested the action.
+    event names the principal about to act.
     """
 
     def __init__(
@@ -118,6 +130,12 @@ class SQLApprovalQueue:
         self._audit_log = audit_log
         self._policy = policy if policy is not None else RoleApproverPolicy()
         self._clock = clock if clock is not None else _utc_now
+
+    def _now(self) -> datetime:
+        now = self._clock()
+        if now.tzinfo is None or now.utcoffset() is None:
+            raise ValueError("the approval queue's clock must return timezone-aware datetimes")
+        return now
 
     async def submit(
         self,
@@ -135,7 +153,7 @@ class SQLApprovalQueue:
         """
         if not 0 < ttl_seconds <= TTL_SECONDS_MAX:
             raise ValueError(f"ttl_seconds must be 1 to {TTL_SECONDS_MAX}, got {ttl_seconds}")
-        now = self._clock()
+        now = self._now()
         request = ApprovalRequest(
             id=uuid4(),
             action=action,
@@ -172,10 +190,22 @@ class SQLApprovalQueue:
             raise ApprovalNotFoundError(f"No approval request {request_id}.")
         return request
 
-    async def list_pending(self, principal: Principal) -> Sequence[ApprovalRequest]:
-        """Pending, unexpired requests that this principal may resolve, oldest first."""
-        now = self._clock()
-        pending = await self.database.run(_load_pending)
+    async def list_pending(
+        self, principal: Principal, *, limit: int = DEFAULT_PENDING_LIMIT
+    ) -> Sequence[ApprovalRequest]:
+        """Up to `limit` pending, unexpired requests this principal may resolve, oldest first.
+
+        The database narrows by status, expiry, role and requester; the policy then
+        has the final say on each request.
+        """
+        if limit < 1:
+            raise ValueError(f"limit must be at least 1, got {limit}")
+        if principal.kind is not PrincipalKind.HUMAN or not principal.roles:
+            return []
+        now = self._now()
+        pending = await self.database.run(
+            partial(_load_pending, principal=principal, now=now, limit=limit)
+        )
         return [
             request
             for request in pending
@@ -205,18 +235,24 @@ class SQLApprovalQueue:
                     ApprovalNotFoundError(f"No approval request {request_id}."),
                     _missing_event("approval.resolve_denied", principal.id, request_id),
                 )
-            now = self._clock()
+            now = self._now()
             verdict = self._policy.evaluate(principal, request, now=now)
-            if not verdict.allowed and verdict.reason is not None:
-                error_type = _DENIAL_ERRORS[verdict.reason]
+            if not verdict.allowed:
+                # A custom policy that denies without a reason is still a denial.
+                denial = verdict.reason.value if verdict.reason is not None else "denied"
+                error_type = (
+                    _DENIAL_ERRORS[verdict.reason]
+                    if verdict.reason is not None
+                    else NotAuthorizedToResolveError
+                )
                 return _denied(
-                    error_type(f"Request {request_id} cannot be resolved: {verdict.reason.value}."),
+                    error_type(f"Request {request_id} cannot be resolved: {denial}."),
                     _event(
                         "approval.resolve_denied",
                         principal.id,
                         request,
                         decision=decision.value,
-                        reason=verdict.reason.value,
+                        reason=denial,
                     ),
                 )
 
@@ -263,11 +299,17 @@ class SQLApprovalQueue:
         return await self._write(decide)
 
     async def consume(
-        self, request_id: UUID, *, action: str, payload: Mapping[str, JsonValue]
+        self,
+        request_id: UUID,
+        *,
+        action: str,
+        payload: Mapping[str, JsonValue],
+        principal: Principal,
     ) -> ApprovalRequest:
         """Call right before acting. Atomically moves an approved request to CONSUMED.
 
-        One approval authorizes one run. Raises ApprovalPayloadMismatchError if the
+        `principal` is whoever is about to act; the audit event names them. One
+        approval authorizes one run. Raises ApprovalPayloadMismatchError if the
         action or payload differ from what was approved, ApprovalNotGrantedError if
         the request is pending or was rejected, ApprovalAlreadyResolvedError if it
         was already consumed or cancelled, and ApprovalExpiredError if it expired.
@@ -279,15 +321,14 @@ class SQLApprovalQueue:
             if request is None:
                 return _denied(
                     ApprovalNotFoundError(f"No approval request {request_id}."),
-                    _missing_event("approval.consume_denied", None, request_id),
+                    _missing_event("approval.consume_denied", principal.id, request_id),
                 )
-            now = self._clock()
+            now = self._now()
             refusal = _consume_refusal(request, presented_hash, now)
             if refusal is not None:
                 error, reason = refusal
                 return _denied(
-                    error,
-                    _event("approval.consume_denied", request.requested_by, request, reason=reason),
+                    error, _event("approval.consume_denied", principal.id, request, reason=reason)
                 )
 
             consumed = ApprovalRequest.model_validate(
@@ -306,11 +347,9 @@ class SQLApprovalQueue:
             if changed != 1:
                 return _denied(
                     ApprovalAlreadyResolvedError(f"Request {request_id} was used meanwhile."),
-                    _event(
-                        "approval.consume_denied", request.requested_by, request, reason="not_open"
-                    ),
+                    _event("approval.consume_denied", principal.id, request, reason="not_open"),
                 )
-            event = _event("approval.consumed", request.requested_by, consumed)
+            event = _event("approval.consumed", principal.id, consumed)
             return _Outcome(request=consumed, events=[event])
 
         return await self._write(use)
@@ -318,18 +357,28 @@ class SQLApprovalQueue:
     async def _write(self, work: Callable[[Session], _Outcome]) -> ApprovalRequest:
         """Run `work` in a write transaction, audit its events, then return or raise.
 
-        When the audit log shares this queue's database the events are written in
-        the same transaction; otherwise right after it commits.
+        When the audit log is on the same database the events are written in the
+        same transaction, so the change and its record commit together or not at
+        all. An audit log elsewhere is written right after the commit; that is best
+        effort, since a failure then cannot undo the change.
         """
         audit_log = self._audit_log
-        shares_database = isinstance(audit_log, SQLAuditLog) and audit_log.database is self.database
         checked_log = audit_log if isinstance(audit_log, SQLAuditLog) else None
+        shares_database = checked_log is not None and checked_log.database.same_database(
+            self.database
+        )
 
         def in_transaction(session: Session) -> _Outcome:
             outcome = work(session)
+            # Checked before the commit, so an event the log would refuse stops the change.
+            checked_events = (
+                [checked_log.checked_event(event) for event in outcome.events]
+                if checked_log is not None
+                else outcome.events
+            )
             if shares_database and checked_log is not None:
-                for event in outcome.events:
-                    checked_log.append_in(session, checked_log.checked_event(event))
+                for event in checked_events:
+                    checked_log.append_in(session, event)
             return outcome
 
         outcome = await self.database.run(in_transaction, write=True)
@@ -396,6 +445,7 @@ def _ensure_table(session: Session) -> None:
     # On Postgres the owner role installs the table; the app role cannot create it.
     if session.dialect is Dialect.SQLITE:
         session.execute(_TABLE_DDL.replace("CREATE TABLE", "CREATE TABLE IF NOT EXISTS", 1))
+        session.execute(_PENDING_INDEX_DDL.replace("CREATE INDEX", "CREATE INDEX IF NOT EXISTS", 1))
 
 
 def _table_exists(session: Session) -> bool:
@@ -419,12 +469,25 @@ def _load(session: Session, request_id: UUID) -> ApprovalRequest | None:
     return _request_from_row(rows[0]) if rows else None
 
 
-def _load_pending(session: Session) -> list[ApprovalRequest]:
+def _load_pending(
+    session: Session, *, principal: Principal, now: datetime, limit: int
+) -> list[ApprovalRequest]:
     if not _table_exists(session):
         return []
+    roles = sorted(principal.roles)
+    role_placeholders = ", ".join("?" for _ in roles)
+    # Canonical timestamps are fixed-width UTC strings, so they compare as text.
     rows = session.execute(
-        f"SELECT {_COLUMNS} FROM {APPROVALS_TABLE} WHERE status = ? ORDER BY created_at",
-        (ApprovalStatus.PENDING.value,),
+        f"SELECT {_COLUMNS} FROM {APPROVALS_TABLE} "
+        f"WHERE status = ? AND expires_at > ? AND required_role IN ({role_placeholders}) "
+        "AND requested_by <> ? ORDER BY created_at LIMIT ?",
+        (
+            ApprovalStatus.PENDING.value,
+            canonical_timestamp(now),
+            *roles,
+            principal.id,
+            limit,
+        ),
     )
     return [_request_from_row(row) for row in rows]
 

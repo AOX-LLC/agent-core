@@ -46,7 +46,9 @@ async def seed(log: SQLAuditLog, queue: SQLApprovalQueue) -> None:
         ttl_seconds=3_600,
     )
     await queue.resolve(request.id, decision=Decision.APPROVE, principal=APPROVER)
-    await queue.consume(request.id, action="crm.update_contact", payload=PAYLOAD)
+    await queue.consume(
+        request.id, action="crm.update_contact", payload=PAYLOAD, principal=INTAKE_AGENT
+    )
 
 
 async def self_approve(queue: SQLApprovalQueue) -> None:

@@ -27,6 +27,7 @@ from aox_agent_core.errors import ConfigError
 ResultT = TypeVar("ResultT")
 
 SQLITE_BUSY_TIMEOUT_SECONDS = 30.0
+POSTGRES_DEFAULT_PORT = 5432
 POSTGRES_ROLE_NAME = re.compile(r"[a-z_][a-z0-9_]{0,62}")
 
 
@@ -76,6 +77,13 @@ class Database(ABC):
         """
         return await asyncio.to_thread(self.run_sync, work, write=write)
 
+    def same_database(self, other: "Database") -> bool:
+        """True when both point at the same database, even as separate objects."""
+        return self._identity() == other._identity()
+
+    @abstractmethod
+    def _identity(self) -> tuple[str, ...]: ...
+
     def run_sync(self, work: Callable[[Session], ResultT], *, write: bool = False) -> ResultT:
         """Blocking form of run(). Commits if `work` returns, rolls back if it raises."""
         with self._transaction(write=write) as session:
@@ -93,6 +101,9 @@ class SQLiteDatabase(Database):
 
     def __init__(self, path: Path) -> None:
         self.path = path
+
+    def _identity(self) -> tuple[str, ...]:
+        return (self.dialect.value, str(self.path.resolve()))
 
     @contextmanager
     def _transaction(self, *, write: bool) -> Iterator[Session]:
@@ -120,6 +131,12 @@ class PostgresDatabase(Database):
     def __init__(self, url: SecretStr) -> None:
         self._url = url
         self._psycopg = _import_psycopg()
+
+    def _identity(self) -> tuple[str, ...]:
+        parts = urlsplit(self._url.get_secret_value())
+        host = (parts.hostname or "localhost").lower()
+        port = str(parts.port or POSTGRES_DEFAULT_PORT)
+        return (self.dialect.value, host, port, parts.path.lstrip("/"))
 
     @contextmanager
     def _transaction(self, *, write: bool) -> Iterator[Session]:

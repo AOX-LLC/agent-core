@@ -7,7 +7,12 @@ from aox_agent_core.audit.types import UnsealedAuditRecord
 
 
 def canonical_timestamp(moment: datetime) -> str:
-    """UTC ISO 8601 with exactly six fractional digits, as hashed and stored."""
+    """UTC ISO 8601 with exactly six fractional digits, as hashed and stored.
+
+    A naive datetime is refused: converting it would silently assume local time.
+    """
+    if moment.tzinfo is None or moment.utcoffset() is None:
+        raise ValueError(f"timestamp {moment!r} has no time zone")
     return moment.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
 
 
