@@ -1,14 +1,27 @@
 {
   "format_version": 2,
-  "prompt": null,
-  "replay_hash": "d16e531d8726fb5e838436a112c6240b263bba52946c625cc9af6bbdb2abdee3",
+  "prompt": {
+    "attachments": [],
+    "attempt": 1,
+    "inputs": {
+      "ticket": "Subject: Duplicate charge on invoice INV-2001\n\nWe were billed twice for INV-2001 this month. Please refund the duplicate today, our payment run closes this afternoon."
+    },
+    "output_schema": "TicketTriage",
+    "prompt_id": "tickets.triage",
+    "schema_sha256": "517a6165b8bf8c17c7feb180ac2b3e8dc391d4cf0d06d8e9511ec8072653c751",
+    "system_sha256": "033aa057582250a044377f1425343ae80edc9c578697357903cb59138caeac31",
+    "template_sha256": "40eb4cd7a1c84d0987401d0d04ada5d937d80c40b0690f311ec835ee3619368b",
+    "tier": "small",
+    "version": 1
+  },
+  "replay_hash": "a214d794371b59f9ecdd454b3a615574dacfadd679343457e5305a845e9ddf30",
   "request": {
     "effort": null,
     "max_tokens": 16000,
     "messages": [
       {
         "attachments": [],
-        "content": "Subject: API rate limit questions\n\nWhat is the request limit for the reports endpoint? We are planning an integration for next quarter.",
+        "content": "Triage this support ticket.\n\nSubject: Duplicate charge on invoice INV-2001\n\nWe were billed twice for INV-2001 this month. Please refund the duplicate today, our payment run closes this afternoon.",
         "role": "user"
       }
     ],
@@ -48,11 +61,11 @@
   "response": {
     "model": "claude-haiku-4-5-20251001",
     "stop_reason": "end_turn",
-    "text": "{\"queue\": \"technical\", \"urgent\": false, \"summary\": \"Customer inquiring about API rate limits for the reports endpoint in preparation for planned integration next quarter\"}",
+    "text": "{\"queue\": \"billing\", \"urgent\": true, \"summary\": \"Customer charged twice for INV-2001, requesting immediate refund before payment run deadline\"}",
     "usage": {
       "cache_creation_input_tokens": 0,
       "cache_read_input_tokens": 0,
-      "input_tokens": 291,
+      "input_tokens": 315,
       "output_tokens": 37
     }
   },

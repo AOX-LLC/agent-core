@@ -1,9 +1,10 @@
 """A small support-ticket triage eval suite, scored with FieldMatch.
 
 It sends the 10 synthetic tickets in evals/triage/cases.jsonl through the
-"extraction" task and checks the queue and urgency against the expected labels.
-By default it replays evals/replays/triage-eval.json, so it needs no API key
-and costs nothing.
+prompt "tickets.triage" v1 on the "extraction" task and checks the queue and
+urgency against the expected labels. Each case's input is the prompt's inputs,
+so each replays from its own file under evals/replays/prompts/tickets.triage/v1/.
+By default it replays, so it needs no API key and costs nothing.
 
 Run it from the repository root:
 
@@ -20,7 +21,7 @@ from typing import Literal
 
 from pydantic import BaseModel
 
-from aox_agent_core import AgentClient, load_config
+from aox_agent_core import AgentClient, PromptRef, load_config
 from aox_agent_core.evals import (
     EvalRunner,
     EvalSuite,
@@ -35,7 +36,12 @@ EVALS_DIR = Path(__file__).resolve().parent
 CONFIG_PATH = EVALS_DIR / "agent-core.toml"
 CASES_PATH = EVALS_DIR / "triage" / "cases.jsonl"
 
-SYSTEM_PROMPT = "You triage support tickets for a fictional software company."
+TRIAGE_TICKET = PromptRef(
+    id="tickets.triage",
+    version=1,
+    system="You triage support tickets for a fictional software company.",
+    template="Triage this support ticket.\n\n${ticket}",
+)
 
 
 class TicketTriage(BaseModel):
@@ -47,7 +53,7 @@ class TicketTriage(BaseModel):
 async def run(client: AgentClient) -> Scorecard:
     """Run the triage suite through the client and return its scorecard."""
     suite = EvalSuite.from_jsonl(CASES_PATH, name="triage")
-    target = model_call_target(client, output=TicketTriage, task="extraction", system=SYSTEM_PROMPT)
+    target = model_call_target(client, prompt=TRIAGE_TICKET, output=TicketTriage, task="extraction")
     runner = EvalRunner([FieldMatch(["queue", "urgent"])], concurrency=4)
     return await runner.run(suite, target, mode=client.config.mode)
 

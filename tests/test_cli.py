@@ -43,13 +43,38 @@ def test_example_cassettes_pass(cassettes: Path, capsys: pytest.CaptureFixture[s
     assert "valid" in capsys.readouterr().out
 
 
-def test_tampered_request_is_reported(cassettes: Path, capsys: pytest.CaptureFixture[str]) -> None:
-    def change_prompt(document: dict[str, Any]) -> None:
-        document["request"]["max_tokens"] += 1
+def test_tampered_prompt_inputs_are_reported(
+    cassettes: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    def change_inputs(document: dict[str, Any]) -> None:
+        document["prompt"]["inputs"]["currency"] = "EUR"
 
-    edit(only_recording(cassettes), change_prompt)
+    edit(only_recording(cassettes), change_inputs)
 
     assert main(["cassettes", "check", str(cassettes)]) == 1
+    assert "key does not match its recorded call" in capsys.readouterr().out
+
+
+async def test_tampered_unprompted_request_is_reported(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    store = DirectoryRecordingStore(tmp_path, scrubber=PatternScrubber())
+    recorder = RecordingProvider(ScriptedProvider(response("ok")), store, "plain")
+    await recorder.complete(
+        ProviderRequest(
+            provider=Provider.ANTHROPIC,
+            model="claude-haiku-4-5-20251001",
+            messages=(Message(role=Role.USER, content="hello"),),
+            max_tokens=100,
+        )
+    )
+
+    def change_request(document: dict[str, Any]) -> None:
+        document["request"]["max_tokens"] += 1
+
+    edit(only_recording(tmp_path), change_request)
+
+    assert main(["cassettes", "check", str(tmp_path)]) == 1
     assert "key does not match its recorded call" in capsys.readouterr().out
 
 
