@@ -56,6 +56,12 @@ class Tier(StrEnum):
         position = order.index(self)
         return order[position - 1] if position > 0 else None
 
+    def one_higher(self) -> "Tier | None":
+        """Return the next more capable tier, or None for the most capable."""
+        order = list(Tier)
+        position = order.index(self)
+        return order[position + 1] if position + 1 < len(order) else None
+
 
 class Provider(StrEnum):
     """Where a model is served from."""
@@ -103,10 +109,12 @@ class RoutingConfig(FrozenModel):
     tasks maps a task name such as "extraction" to a tier, so callers can pass
     task="extraction" instead of naming a tier.
 
-    When a call's estimated cost is over budget_usd_per_call, on_budget_exceeded
-    decides what happens: RAISE raises BudgetExceededError; DROP_ONE_TIER retries
-    the estimate one tier lower and raises only if that is still over budget or
-    there is no lower tier.
+    budget_usd_per_call caps the worst-case spend of a whole call, retries and
+    escalation included. When the first attempt's estimate is over budget,
+    on_budget_exceeded decides what happens: RAISE raises BudgetExceededError;
+    DROP_ONE_TIER retries the estimate one tier lower and raises only if that is
+    still over budget or there is no lower tier. A retry or escalation that could
+    take the total over budget raises BudgetExceededError instead of being sent.
     """
 
     tiers: Mapping[Tier, TierConfig]
@@ -180,6 +188,47 @@ class TracingConfig(FrozenModel):
     capture_content: bool = False
 
 
+class AnthropicConfig(FrozenModel):
+    """How to reach the Anthropic API.
+
+    base_url is always passed to the SDK explicitly, so ANTHROPIC_BASE_URL in the
+    environment can never redirect the library's traffic. Plain http is accepted
+    only for a loopback address, for local test servers.
+    """
+
+    base_url: Annotated[
+        str,
+        StringConstraints(pattern=r"^(https://\S+|http://(127\.0\.0\.1|localhost)(:\d+)?(/\S*)?)$"),
+    ] = "https://api.anthropic.com"
+    timeout_seconds: Annotated[float, Field(gt=0)] = 600.0
+    max_retries: Annotated[int, Field(ge=0, le=10)] = 2
+
+
+class BedrockConfig(FrozenModel):
+    """Amazon Bedrock region and the Bedrock model ID for each tier.
+
+    When a project's config sets a tier's provider to "bedrock" without naming a
+    model, load_config fills in that tier's model from tier_models. A tier
+    missing from tier_models has no Bedrock default, and moving it to Bedrock
+    without a model is a ConfigError.
+    """
+
+    region: Annotated[str, StringConstraints(pattern=r"^[a-z]{2}(-[a-z]+)+-\d$")] = "us-east-1"
+    tier_models: Mapping[Tier, Annotated[str, StringConstraints(min_length=1)]] = Field(
+        default_factory=dict
+    )
+
+    def model_for(self, tier: Tier) -> str:
+        """Return the Bedrock model ID for a tier, or raise ConfigError if it has none."""
+        try:
+            return self.tier_models[tier]
+        except KeyError:
+            raise ConfigError(
+                f"The {tier.value} tier has no default Bedrock model; set "
+                f"bedrock.tier_models.{tier.value} and price it under pricing.bedrock."
+            ) from None
+
+
 class AuditConfig(FrozenModel):
     """Where the audit log is stored: a sqlite:/// or postgresql:// URL.
 
@@ -199,6 +248,8 @@ class AgentCoreConfig(FrozenModel):
     replay: ReplayConfig = ReplayConfig()
     tracing: TracingConfig = TracingConfig()
     audit: AuditConfig = AuditConfig()
+    anthropic: AnthropicConfig = AnthropicConfig()
+    bedrock: BedrockConfig = BedrockConfig()
 
     @model_validator(mode="after")
     def _every_tier_is_priced(self) -> Self:
@@ -207,6 +258,12 @@ class AgentCoreConfig(FrozenModel):
                 raise ValueError(
                     f"tier {tier.value!r} uses {tier_config.provider.value} model "
                     f"{tier_config.model!r}, which has no entry under pricing"
+                )
+        for tier, model in self.bedrock.tier_models.items():
+            if not self._has_price(Provider.BEDROCK, model):
+                raise ValueError(
+                    f"bedrock.tier_models.{tier.value} is {model!r}, which has no entry "
+                    "under pricing.bedrock"
                 )
         return self
 
@@ -238,7 +295,10 @@ def load_config(
     if override_path is not None:
         override = _read_toml(override_path)
         _reject_password_in_audit_url(override, override_path)
+        _anchor_cassette_dir(override, override_path)
+        bedrock_tiers_without_model = _bedrock_tiers_without_model(override)
         document = _merge_tables(document, override)
+        _fill_bedrock_models(document, bedrock_tiers_without_model)
 
     mode_override = env.get(MODE_ENV, "").strip()
     if mode_override:
@@ -252,6 +312,47 @@ def load_config(
         return AgentCoreConfig.model_validate(document)
     except ValidationError as error:
         raise ConfigError(f"Invalid agent-core configuration:\n{error}") from error
+
+
+def _bedrock_tiers_without_model(override: dict[str, Any]) -> list[str]:
+    """Tiers the override moves to Bedrock without naming a model."""
+    routing = override.get("routing")
+    tiers = routing.get("tiers") if isinstance(routing, dict) else None
+    if not isinstance(tiers, dict):
+        return []
+    return [
+        tier
+        for tier, table in tiers.items()
+        if isinstance(table, dict)
+        and table.get("provider") == Provider.BEDROCK.value
+        and "model" not in table
+    ]
+
+
+def _fill_bedrock_models(document: dict[str, Any], tiers: list[str]) -> None:
+    """Give each tier moved to Bedrock without a model its bedrock.tier_models default."""
+    defaults = document.get("bedrock", {}).get("tier_models", {})
+    for tier in tiers:
+        if tier not in defaults:
+            raise ConfigError(
+                f"routing.tiers.{tier} moves to Bedrock without a model, and the {tier} tier "
+                f"has no default Bedrock model; set routing.tiers.{tier}.model and price it "
+                "under pricing.bedrock."
+            )
+        document["routing"]["tiers"][tier]["model"] = defaults[tier]
+
+
+def _anchor_cassette_dir(override: dict[str, Any], path: Path) -> None:
+    """Resolve a relative replay.cassette_dir against the config file's folder.
+
+    Without this the directory would depend on where the process was started.
+    """
+    replay_table = override.get("replay")
+    if not isinstance(replay_table, dict):
+        return
+    cassette_dir = replay_table.get("cassette_dir")
+    if isinstance(cassette_dir, str) and not Path(cassette_dir).is_absolute():
+        replay_table["cassette_dir"] = str(path.resolve().parent / cassette_dir)
 
 
 def _reject_password_in_audit_url(override: dict[str, Any], path: Path) -> None:

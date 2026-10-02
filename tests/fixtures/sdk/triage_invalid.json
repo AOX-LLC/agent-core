@@ -1,0 +1,21 @@
+{
+  "id": "msg_fixture_0003",
+  "type": "message",
+  "role": "assistant",
+  "model": "claude-haiku-4-5-20251001",
+  "content": [
+    {
+      "type": "text",
+      "text": "{\"queue\": \"sales\", \"summary\": \"Customer was charged twice on invoice INV-1042 and needs the duplicate refunded before Friday.\"}"
+    }
+  ],
+  "stop_reason": "end_turn",
+  "stop_sequence": null,
+  "usage": {
+    "input_tokens": 180,
+    "output_tokens": 38,
+    "cache_creation_input_tokens": 0,
+    "cache_read_input_tokens": 0,
+    "service_tier": "standard"
+  }
+}

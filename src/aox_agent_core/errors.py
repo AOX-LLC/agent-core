@@ -55,7 +55,15 @@ class ModelRefusalError(AgentCoreError):
 
 
 class StructuredOutputError(AgentCoreError):
-    """The model's output did not validate against the requested schema after every attempt."""
+    """The model's output did not validate against the requested schema after every attempt.
+
+    attempts holds one short validation summary per failed attempt, oldest first.
+    The model's raw output is not included.
+    """
+
+    def __init__(self, message: str, *, attempts: tuple[str, ...] = ()) -> None:
+        super().__init__(message)
+        self.attempts = attempts
 
 
 class ReplayError(AgentCoreError):
@@ -68,6 +76,10 @@ class ReplayMissError(ReplayError):
 
 class CassetteFormatError(ReplayError):
     """A cassette file is unreadable, malformed or of an unsupported format version."""
+
+
+class CassetteConflictError(ReplayError):
+    """Another recorder wrote the same cassette during this run, so it was not overwritten."""
 
 
 class SecretInRecordingError(ReplayError):

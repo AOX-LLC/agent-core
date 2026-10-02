@@ -203,3 +203,83 @@ def test_audit_url_comes_from_the_environment_and_stays_hidden() -> None:
     assert config.audit.database_url is not None
     assert config.audit.database_url.get_secret_value() == database_url
     assert "hunter2" not in repr(config)
+
+
+def test_bedrock_small_tier_has_no_default_model() -> None:
+    bedrock = load_config(environ=NO_ENVIRONMENT).bedrock
+
+    assert Tier.SMALL not in bedrock.tier_models
+    with pytest.raises(ConfigError, match="small tier has no default Bedrock model"):
+        bedrock.model_for(Tier.SMALL)
+
+
+def test_bedrock_tier_models_are_priced() -> None:
+    config = load_config(environ=NO_ENVIRONMENT)
+
+    for tier in (Tier.MID, Tier.LARGE):
+        config.price_for(Provider.BEDROCK, config.bedrock.model_for(tier))
+
+
+def test_unpriced_bedrock_tier_model_is_rejected(tmp_path: Path) -> None:
+    override = write_override(tmp_path, '[bedrock.tier_models]\nsmall = "anthropic.unknown"\n')
+
+    with pytest.raises(ConfigError, match=r"pricing\.bedrock"):
+        load_config(override, environ=NO_ENVIRONMENT)
+
+
+def test_relative_cassette_dir_resolves_against_the_config_file(tmp_path: Path) -> None:
+    override = write_override(tmp_path, '[replay]\ncassette_dir = "recordings"\n')
+
+    config = load_config(override, environ=NO_ENVIRONMENT)
+
+    assert config.replay.cassette_dir == tmp_path.resolve() / "recordings"
+
+
+@pytest.mark.parametrize(
+    ("base_url", "allowed"),
+    [
+        ("https://api.anthropic.com", True),
+        ("http://127.0.0.1:8080", True),
+        ("http://localhost:4210/v1", True),
+        ("http://api.example.com", False),
+        ("ftp://api.anthropic.com", False),
+    ],
+)
+def test_anthropic_base_url_must_be_https_or_loopback(
+    tmp_path: Path, base_url: str, allowed: bool
+) -> None:
+    override = write_override(tmp_path, f'[anthropic]\nbase_url = "{base_url}"\n')
+
+    if allowed:
+        assert load_config(override, environ=NO_ENVIRONMENT).anthropic.base_url == base_url
+    else:
+        with pytest.raises(ConfigError, match="base_url"):
+            load_config(override, environ=NO_ENVIRONMENT)
+
+
+def test_tier_moved_to_bedrock_takes_the_bedrock_default_model(tmp_path: Path) -> None:
+    override = write_override(tmp_path, '[routing.tiers.mid]\nprovider = "bedrock"\n')
+
+    config = load_config(override, environ=NO_ENVIRONMENT)
+
+    mid = config.routing.tiers[Tier.MID]
+    assert (mid.provider, mid.model) == (Provider.BEDROCK, "anthropic.claude-sonnet-5-5")
+    assert config.price_for(mid.provider, mid.model).input_usd_per_mtok > 0
+
+
+def test_small_tier_cannot_move_to_bedrock_without_a_model(tmp_path: Path) -> None:
+    override = write_override(tmp_path, '[routing.tiers.small]\nprovider = "bedrock"\n')
+
+    with pytest.raises(ConfigError, match="small tier has no default Bedrock model"):
+        load_config(override, environ=NO_ENVIRONMENT)
+
+
+def test_explicit_bedrock_model_is_kept(tmp_path: Path) -> None:
+    override = write_override(
+        tmp_path,
+        '[routing.tiers.large]\nprovider = "bedrock"\nmodel = "anthropic.claude-sonnet-5-5"\n',
+    )
+
+    large = load_config(override, environ=NO_ENVIRONMENT).routing.tiers[Tier.LARGE]
+
+    assert large.model == "anthropic.claude-sonnet-5-5"

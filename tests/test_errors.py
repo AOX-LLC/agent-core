@@ -27,6 +27,7 @@ EXPECTED_PARENTS: dict[type[Exception], type[Exception]] = {
     errors.ReplayError: AgentCoreError,
     errors.ReplayMissError: ReplayError,
     errors.CassetteFormatError: ReplayError,
+    errors.CassetteConflictError: ReplayError,
     errors.SecretInRecordingError: ReplayError,
     errors.ApprovalError: AgentCoreError,
     errors.NotAuthorizedToResolveError: ApprovalError,

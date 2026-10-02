@@ -85,3 +85,4 @@ class CallResult(FrozenModel, Generic[OutputT]):
     latency_ms: Annotated[float, Field(ge=0)]
     stop_reason: str
     trace_id: str | None = None
+    attempts: Annotated[int, Field(ge=1)] = 1
