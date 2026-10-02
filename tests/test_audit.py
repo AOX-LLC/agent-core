@@ -234,3 +234,48 @@ def test_timestamps_keep_six_fractional_digits() -> None:
     assert canonical_timestamp(datetime(2026, 10, 2, 8, 0, tzinfo=UTC)) == (
         "2026-10-02T08:00:00.000000Z"
     )
+
+
+@pytest.mark.parametrize(
+    "grants",
+    [
+        ("GRANT agent_core_owner TO {role}",),
+        (
+            f"GRANT SELECT, INSERT ON {audit_sql.AUDIT_TABLE} TO {{role}}",
+            f"GRANT UPDATE (payload) ON {audit_sql.AUDIT_TABLE} TO {{role}}",
+        ),
+    ],
+    ids=["member-of-owner-without-inherit", "column-level-update"],
+)
+async def test_roles_that_could_change_the_table_are_refused(
+    control_database: ControlDatabase, grants: tuple[str, ...]
+) -> None:
+    if control_database.backend != "postgres":
+        pytest.skip("roles exist only on Postgres")
+    url = control_database.login_role(*grants)
+
+    with pytest.raises(ConfigError, match="may only INSERT and SELECT"):
+        await SQLAuditLog(open_database(url)).append(event(1))
+
+
+SET_REPEATABLE_READ_DEFAULT = """
+DO $$ BEGIN
+    EXECUTE format(
+        'ALTER DATABASE %I SET default_transaction_isolation = ''repeatable read''',
+        current_database()
+    );
+END $$
+"""
+
+
+async def test_appends_stay_safe_when_the_server_defaults_to_repeatable_read(
+    control_database: ControlDatabase,
+) -> None:
+    if control_database.backend != "postgres":
+        pytest.skip("isolation levels are a Postgres concern here")
+    control_database.superuser_raw(SET_REPEATABLE_READ_DEFAULT)
+    log = SQLAuditLog(control_database.database)
+
+    await asyncio.gather(*(log.append(event(number)) for number in range(10)))
+
+    assert (await log.verify()).seq == 10

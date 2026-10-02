@@ -9,7 +9,7 @@ import os
 import sqlite3
 from collections.abc import Callable, Iterator
 from contextlib import closing, contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit, urlunsplit
@@ -47,6 +47,20 @@ class ControlDatabase:
     superuser_raw: Callable[[str], list[tuple[Any, ...]]]
     owner_url: str | None = None
     superuser_url: str | None = None
+    roles: list[str] = field(default_factory=list)
+
+    def login_role(self, *statements: str) -> str:
+        """Create a NOINHERIT login role, run `statements` ({role} is its name), return its URL.
+
+        The fixture drops the role after the test database is gone.
+        """
+        assert self.superuser_url is not None, "roles exist only on Postgres"
+        role = f"agent_core_probe_{uuid4().hex[:8]}"
+        self.superuser_raw(f"CREATE ROLE {role} LOGIN NOINHERIT")
+        self.roles.append(role)
+        for statement in statements:
+            self.superuser_raw(statement.format(role=role))
+        return _with(self.superuser_url, user=role)
 
 
 def sqlite_database(tmp_path: Path) -> ControlDatabase:
@@ -85,19 +99,22 @@ def postgres_database() -> Iterator[ControlDatabase]:
 
         return raw
 
+    database = ControlDatabase(
+        "postgres",
+        open_database(app_url),
+        app_url,
+        runner(owner_url),
+        runner(superuser_url),
+        owner_url=owner_url,
+        superuser_url=superuser_url,
+    )
     try:
-        yield ControlDatabase(
-            "postgres",
-            open_database(app_url),
-            app_url,
-            runner(owner_url),
-            runner(superuser_url),
-            owner_url=owner_url,
-            superuser_url=superuser_url,
-        )
+        yield database
     finally:
         with psycopg.connect(admin_url, autocommit=True) as admin:
             admin.execute(f'DROP DATABASE "{name}" WITH (FORCE)')
+            for role in database.roles:
+                admin.execute(f'DROP ROLE IF EXISTS "{role}"')
 
 
 def _with(url: str, *, user: str | None = None, database: str | None = None) -> str:

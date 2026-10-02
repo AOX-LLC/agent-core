@@ -257,27 +257,43 @@ def _require_triggers(session: Session, present: set[str], required: set[str]) -
         )
 
 
-def _check_postgres_role(session: Session) -> None:
-    rows = session.execute(
-        "SELECT r.rolsuper, t.tableowner = current_user, "
-        "has_table_privilege(current_user, ?, 'UPDATE'), "
-        "has_table_privilege(current_user, ?, 'DELETE'), "
-        "has_table_privilege(current_user, ?, 'TRUNCATE') "
-        "FROM pg_roles r, pg_tables t "
-        "WHERE r.rolname = current_user AND t.tablename = ?",
-        (AUDIT_TABLE, AUDIT_TABLE, AUDIT_TABLE, AUDIT_TABLE),
+# The connecting role must not be able to change the audit table, directly or
+# through any role it can SET ROLE to, whether or not it inherits that role's
+# privileges. Every role the current user is a member of is checked for
+# superuser, ownership, and table- or column-level change rights.
+_ROLE_CHECK_SQL = """
+SELECT
+    c.oid IS NOT NULL,
+    EXISTS (
+        SELECT 1 FROM pg_roles m
+        WHERE pg_has_role(current_user, m.oid, 'MEMBER')
+          AND (
+              m.rolsuper
+              OR m.oid = c.relowner
+              OR has_table_privilege(m.oid, c.oid, 'UPDATE')
+              OR has_table_privilege(m.oid, c.oid, 'DELETE')
+              OR has_table_privilege(m.oid, c.oid, 'TRUNCATE')
+              OR has_any_column_privilege(m.oid, c.oid, 'UPDATE')
+          )
     )
-    if not rows:
+FROM (SELECT to_regclass(?) AS oid) AS target
+LEFT JOIN pg_class c ON c.oid = target.oid
+"""
+
+
+def _check_postgres_role(session: Session) -> None:
+    table_exists, can_change = session.execute(_ROLE_CHECK_SQL, (AUDIT_TABLE,))[0]
+    if not table_exists:
         raise ConfigError(
             f"Table {AUDIT_TABLE} does not exist; install it with "
             "storage.install_postgres_schema as the owner role."
         )
-    is_superuser, owns_table, *can_change = rows[0]
-    if is_superuser or owns_table or any(can_change):
+    if can_change:
         raise ConfigError(
             "The audit log's database role may only INSERT and SELECT on "
-            f"{AUDIT_TABLE}; this role is a superuser, owns the table, or can update, "
-            "delete or truncate it. Connect as the application role."
+            f"{AUDIT_TABLE}; this role, or a role it can switch to, is a superuser, owns "
+            "the table, or can update, delete or truncate it. Connect as the application "
+            "role."
         )
 
 

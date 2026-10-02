@@ -123,12 +123,12 @@ class PostgresDatabase(Database):
 
     @contextmanager
     def _transaction(self, *, write: bool) -> Iterator[Session]:
-        with (
-            self._psycopg.connect(self._url.get_secret_value(), autocommit=False) as connection,
-            connection.transaction(),
-            connection.cursor() as cursor,
-        ):
-            yield Session(cursor, self.dialect)
+        with self._psycopg.connect(self._url.get_secret_value(), autocommit=False) as connection:
+            # Appends read the head and insert after it under an advisory lock; that
+            # is only safe in READ COMMITTED, whatever the server's default is.
+            connection.isolation_level = self._psycopg.IsolationLevel.READ_COMMITTED
+            with connection.transaction(), connection.cursor() as cursor:
+                yield Session(cursor, self.dialect)
 
 
 def open_database(url: str | SecretStr) -> Database:
