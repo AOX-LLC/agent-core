@@ -1,0 +1,26 @@
+{
+  "id": "msg_fixture_0002",
+  "type": "message",
+  "role": "assistant",
+  "model": "claude-sonnet-5-5",
+  "content": [
+    {
+      "type": "thinking",
+      "thinking": "",
+      "signature": "sig_fixture_0001"
+    },
+    {
+      "type": "text",
+      "text": "The duplicate charge on INV-1042 should be refunded to the original card within five business days."
+    }
+  ],
+  "stop_reason": "end_turn",
+  "stop_sequence": null,
+  "usage": {
+    "input_tokens": 412,
+    "output_tokens": 31,
+    "cache_creation_input_tokens": 1024,
+    "cache_read_input_tokens": 2048,
+    "service_tier": "standard"
+  }
+}

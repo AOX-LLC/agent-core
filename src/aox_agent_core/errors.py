@@ -90,6 +90,10 @@ class ApprovalError(AgentCoreError):
     """Base class for approval-queue failures."""
 
 
+class ApprovalNotFoundError(ApprovalError):
+    """No approval request has that id."""
+
+
 class NotAuthorizedToResolveError(ApprovalError):
     """The principal is not allowed to resolve this approval request."""
 

@@ -6,7 +6,9 @@ Run it from the repository root; it needs no API key:
 
 The call asks for structured output on the "extraction" task, which
 examples/agent-core.toml maps to the small tier. Its response is replayed from
-examples/replays/routed-call.json. The ticket is synthetic.
+examples/replays/routed-call.json, which was recorded from the live API. To
+record it again, run with AGENT_CORE_MODE=record and AGENT_CORE_ANTHROPIC_API_KEY
+set. The ticket is synthetic.
 """
 
 from pathlib import Path
@@ -37,7 +39,7 @@ class TicketTriage(BaseModel):
 
 
 def triage(client: AgentClient) -> CallResult[TicketTriage]:
-    """The example's one call. The cassette builder replays exactly this request."""
+    """The example's one call; its request must match the recorded one to replay."""
     return client.call_sync(TICKET, output=TicketTriage, task="extraction", system=SYSTEM_PROMPT)
 
 

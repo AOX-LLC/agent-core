@@ -46,3 +46,6 @@ coverage.xml
 .worktrees/
 CLAUDE.local.md
 .claude/agent-memory/
+
+# Local SQLite databases (audit logs, demos)
+*.sqlite3

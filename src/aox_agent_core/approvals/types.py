@@ -37,7 +37,11 @@ class Principal(FrozenModel):
 
 
 class ApprovalStatus(StrEnum):
-    """Where a request is in its life. CONSUMED means its one permitted run has happened."""
+    """Where a request is in its life. CONSUMED means its one permitted run has happened.
+
+    EXPIRED and CANCELLED are reserved: this release never sets them. Expiry is
+    judged from expires_at whenever a request is resolved or used.
+    """
 
     PENDING = "pending"
     APPROVED = "approved"

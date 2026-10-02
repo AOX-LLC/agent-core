@@ -1,26 +1,29 @@
 {
-  "id": "msg_fixture_0002",
+  "model": "claude-haiku-4-5-20251001",
+  "id": "msg_011Cfe1J86dkhsjUvLSfWxaq",
   "type": "message",
   "role": "assistant",
-  "model": "claude-sonnet-5-5",
   "content": [
     {
-      "type": "thinking",
-      "thinking": "",
-      "signature": "sig_fixture_0001"
-    },
-    {
       "type": "text",
-      "text": "The duplicate charge on INV-1042 should be refunded to the original card within five business days."
+      "text": "A support-ticket triage queue prioritizes incoming customer issues by urgency, complexity, or category to ensure they're routed to the right team and handled in the most efficient order."
     }
   ],
+  "container": null,
   "stop_reason": "end_turn",
   "stop_sequence": null,
+  "stop_details": null,
   "usage": {
-    "input_tokens": 412,
-    "output_tokens": 31,
-    "cache_creation_input_tokens": 1024,
-    "cache_read_input_tokens": 2048,
-    "service_tier": "standard"
-  }
+    "input_tokens": 22,
+    "cache_creation_input_tokens": 0,
+    "cache_read_input_tokens": 0,
+    "cache_creation": {
+      "ephemeral_5m_input_tokens": 0,
+      "ephemeral_1h_input_tokens": 0
+    },
+    "output_tokens": 41,
+    "service_tier": "standard",
+    "inference_geo": "not_available"
+  },
+  "diagnostics": null
 }
