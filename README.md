@@ -50,7 +50,7 @@ result = await client.call(
 )
 ```
 
-An attachment's type is read from its first bytes, never from its name, and is capped at 5 MB per image and 24 MB per PDF. The per-call budget counts a PDF's pages from its bytes, which is best effort against a file built to hide them; when PDFs come from untrusted users, set `routing.count_pdf_pages = false` to budget every PDF at the API's 100-page limit, and build attachments from untrusted bytes with `asyncio.to_thread`, since counting can take up to about a second. Images are sent as they are; the library does no resizing or rotation. Type a dependency as `ModelClient`, the protocol `AgentClient` implements, so a test double can stand in.
+An attachment's type is read from its first bytes, never from its name, and is capped at 5 MB per image and 24 MB per PDF. The per-call budget counts a PDF's pages from its bytes, which is best effort against a file built to hide them; when PDFs come from untrusted users, set `routing.count_pdf_pages = false` to budget every PDF at the API's 100-page limit, and build attachments from untrusted bytes with `asyncio.to_thread`: pages are still counted when an attachment is built, which can take up to about a second, even though strict mode then ignores the count. Images are sent as they are; the library does no resizing or rotation. Type a dependency as `ModelClient`, the protocol `AgentClient` implements, so a test double can stand in.
 
 `examples/routed_call.py` reads a synthetic invoice PDF in replay mode and prints its trace, fields and cost: `uv run --extra otel python examples/routed_call.py`. Add `--attachment other.pdf` to see a replay miss.
 
