@@ -64,6 +64,23 @@ jobs:
       fail-fast: false
       matrix:
         python: ["3.11", "3.12", "3.13", "3.14"]
+    # The Postgres audit and approval tests run against this container; with
+    # AGENT_CORE_REQUIRE_POSTGRES set they fail instead of skipping.
+    services:
+      postgres:
+        image: postgres:16-alpine@sha256:721873c34ceb9f8d8fc265984940dc982404c105f19ad51be9fdc5970a6080ea
+        env:
+          POSTGRES_HOST_AUTH_METHOD: trust
+        ports:
+          - 127.0.0.1:5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      AGENT_CORE_TEST_POSTGRES_ADMIN_URL: postgresql://postgres@127.0.0.1:5432/postgres
+      AGENT_CORE_REQUIRE_POSTGRES: "1"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
