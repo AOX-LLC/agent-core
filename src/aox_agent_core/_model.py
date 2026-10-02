@@ -22,6 +22,10 @@ ActionName = Annotated[
 
 
 class FrozenModel(BaseModel):
-    """Immutable model that rejects unknown fields."""
+    """Immutable model that rejects unknown fields.
 
-    model_config = ConfigDict(frozen=True, extra="forbid")
+    Validation errors never echo the rejected input: a guard that refuses a
+    secret must not then print it into a log.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid", hide_input_in_errors=True)
