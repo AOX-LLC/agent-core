@@ -10,6 +10,7 @@ audit events in the same transaction as the change they describe.
 """
 
 import asyncio
+import os
 import re
 import sqlite3
 from abc import ABC, abstractmethod
@@ -28,6 +29,8 @@ ResultT = TypeVar("ResultT")
 
 SQLITE_BUSY_TIMEOUT_SECONDS = 30.0
 POSTGRES_DEFAULT_PORT = 5432
+# Row-value comparisons, which approval listing uses, arrived in SQLite 3.15.
+SQLITE_MINIMUM_VERSION = (3, 15, 0)
 POSTGRES_ROLE_NAME = re.compile(r"[a-z_][a-z0-9_]{0,62}")
 
 
@@ -106,6 +109,11 @@ class SQLiteDatabase(Database):
     dialect = Dialect.SQLITE
 
     def __init__(self, path: Path) -> None:
+        if sqlite3.sqlite_version_info < SQLITE_MINIMUM_VERSION:
+            raise ConfigError(
+                f"SQLite {sqlite3.sqlite_version} is too old; the library needs "
+                f"{'.'.join(map(str, SQLITE_MINIMUM_VERSION))} or later."
+            )
         self.path = path
 
     def _identity(self) -> tuple[str, ...]:
@@ -150,11 +158,15 @@ class PostgresDatabase(Database):
         # schemas or privileges, so they are not treated as the same database.
         settings = self._psycopg.conninfo.conninfo_to_dict(self._url.get_secret_value())
         settings.pop("password", None)
-        # Spellings of the same address are one database: host names are case
-        # insensitive, and a TCP host without a port means the default port.
-        if "host" in settings:
-            settings["host"] = str(settings["host"]).lower()
-            settings.setdefault("port", str(POSTGRES_DEFAULT_PORT))
+        # Spellings of the same address are one database: TCP host names are case
+        # insensitive, and a TCP host without a port means libpq's default port.
+        # Unix socket directories are paths, so their case is kept.
+        host = str(settings.get("host", ""))
+        is_tcp_host = bool(host) and not host.startswith(("/", "@"))
+        if is_tcp_host:
+            settings["host"] = host.lower()
+            default_port = os.environ.get("PGPORT", str(POSTGRES_DEFAULT_PORT))
+            settings.setdefault("port", default_port)
         return (self.dialect.value, *(f"{key}={value}" for key, value in sorted(settings.items())))
 
     @contextmanager

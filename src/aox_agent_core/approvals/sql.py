@@ -213,26 +213,34 @@ class SQLApprovalQueue:
         narrowed_to = principal if uses_default_policy else None
         page_size = limit if uses_default_policy else max(limit, PENDING_PAGE_SIZE)
 
-        # All pages are read in one transaction on the worker thread, so a policy
-        # that rejects many requests costs one connection, not one per page.
-        def collect(session: Session) -> list[ApprovalRequest]:
-            eligible: list[ApprovalRequest] = []
-            after: ApprovalRequest | None = None
+        eligible: list[ApprovalRequest] = []
+        after: ApprovalRequest | None = None
+
+        def read_pages(session: Session) -> bool:
+            """Read pages until `limit` requests pass; return whether more pages remain."""
+            nonlocal after
             while len(eligible) < limit:
                 page = _load_pending_page(
                     session, now=now, after=after, narrowed_to=narrowed_to, limit=page_size
                 )
-                eligible += [
+                eligible.extend(
                     request
                     for request in page
                     if self._policy.evaluate(principal, request, now=now).allowed
-                ]
+                )
                 if len(page) < page_size:
-                    break
+                    return False
                 after = page[-1]
-            return eligible[:limit]
+                if session.dialect is Dialect.SQLITE:
+                    return True
+            return False
 
-        return await self.database.run(collect)
+        # Postgres reads never block writers, so all pages share one transaction.
+        # A SQLite read holds a lock that makes writers wait, so there each page is
+        # its own short transaction.
+        while await self.database.run(read_pages):
+            pass
+        return eligible[:limit]
 
     async def resolve(
         self,

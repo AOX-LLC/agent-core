@@ -494,3 +494,21 @@ async def test_custom_policy_listing_pages_through_tied_timestamps(
     listed = [request.id for request in await queue.list_pending(APPROVER, limit=10)]
 
     assert listed == in_listing_order[::3]
+
+
+def test_socket_paths_keep_their_case_and_pgport_sets_the_default_port(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def url(host: str) -> str:
+        return f"postgresql://agent_core_app@/audit?host={host}"
+
+    assert not open_database(url("/run/pg/A")).same_database(open_database(url("/run/pg/a")))
+
+    monkeypatch.setenv("PGPORT", "5433")
+    without_port = open_database("postgresql://agent_core_app@db.example/audit")
+    assert without_port.same_database(
+        open_database("postgresql://agent_core_app@db.example:5433/audit")
+    )
+    assert not without_port.same_database(
+        open_database("postgresql://agent_core_app@db.example:5432/audit")
+    )

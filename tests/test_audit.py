@@ -417,3 +417,10 @@ def test_a_write_sent_as_a_read_on_a_missing_file_fails_loudly(tmp_path: Path) -
 
     with pytest.raises(sqlite3.OperationalError, match="readonly"):
         database.run_sync(lambda session: session.execute("CREATE TABLE stray (a INTEGER)"))
+
+
+def test_too_old_sqlite_is_refused(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(sqlite3, "sqlite_version_info", (3, 14, 2))
+
+    with pytest.raises(ConfigError, match="too old"):
+        open_database(f"sqlite:///{tmp_path / 'audit.sqlite3'}")
