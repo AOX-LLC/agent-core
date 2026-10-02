@@ -1,0 +1,96 @@
+# Defaults shipped with aox-agent-core.
+#
+# A project overrides any part of this file with its own TOML file, named by
+# AGENT_CORE_CONFIG. Tables merge key by key, so overriding one tier or adding
+# one price does not require restating the rest.
+
+mode = "replay"
+
+[routing]
+default_tier = "mid"
+on_budget_exceeded = "raise"
+escalate_on_structured_failure = false
+
+[routing.tiers.small]
+provider = "anthropic"
+model = "claude-haiku-4-5-20251001"
+max_tokens = 16000
+
+[routing.tiers.mid]
+provider = "anthropic"
+model = "claude-sonnet-5-5"
+max_tokens = 16000
+
+[routing.tiers.large]
+provider = "anthropic"
+model = "claude-opus-5-5"
+max_tokens = 16000
+
+# Prices are US dollars per million tokens, written as strings so they parse
+# to exact decimals. Re-check them against the source before every release.
+# Tables merge key by key, so a project overriding a price must restate every
+# field of that model, and that provider's as_of and source; otherwise the
+# defaults' values and date silently remain.
+
+[pricing.anthropic]
+as_of = 2026-10-02
+source = "https://platform.claude.com/docs/en/about-claude/pricing"
+
+[pricing.anthropic.models."claude-haiku-4-5-20251001"]
+input_usd_per_mtok = "1.00"
+output_usd_per_mtok = "5.00"
+cache_write_5m_usd_per_mtok = "1.25"
+cache_write_1h_usd_per_mtok = "2.00"
+cache_read_usd_per_mtok = "0.10"
+
+[pricing.anthropic.models."claude-sonnet-5-5"]
+input_usd_per_mtok = "2.00"
+output_usd_per_mtok = "10.00"
+cache_write_5m_usd_per_mtok = "2.50"
+cache_write_1h_usd_per_mtok = "4.00"
+cache_read_usd_per_mtok = "0.20"
+
+[pricing.anthropic.models."claude-opus-5-5"]
+input_usd_per_mtok = "4.00"
+output_usd_per_mtok = "20.00"
+cache_write_5m_usd_per_mtok = "5.00"
+cache_write_1h_usd_per_mtok = "8.00"
+cache_read_usd_per_mtok = "0.20"
+
+# Bedrock bills separately through AWS Marketplace. These are the on-demand
+# "Standard" regional rates for us-east-1, which are 1.1x the global-endpoint
+# rates. Keys are the model IDs the Bedrock Mantle endpoint accepts.
+
+[pricing.bedrock]
+as_of = 2026-10-02
+source = "https://pricing.us-east-1.amazonaws.com/offers/v1.0/aws/AmazonBedrockFoundationModels/current/us-east-1/index.json"
+region = "us-east-1"
+
+[pricing.bedrock.models."anthropic.claude-haiku-4-5"]
+input_usd_per_mtok = "1.10"
+output_usd_per_mtok = "5.50"
+cache_write_5m_usd_per_mtok = "1.375"
+cache_write_1h_usd_per_mtok = "2.20"
+cache_read_usd_per_mtok = "0.11"
+
+[pricing.bedrock.models."anthropic.claude-sonnet-5-5"]
+input_usd_per_mtok = "2.20"
+output_usd_per_mtok = "11.00"
+cache_write_5m_usd_per_mtok = "2.75"
+cache_write_1h_usd_per_mtok = "4.40"
+cache_read_usd_per_mtok = "0.22"
+
+[pricing.bedrock.models."anthropic.claude-opus-5-5"]
+input_usd_per_mtok = "4.40"
+output_usd_per_mtok = "22.00"
+cache_write_5m_usd_per_mtok = "5.50"
+cache_write_1h_usd_per_mtok = "8.80"
+cache_read_usd_per_mtok = "0.22"
+
+[replay]
+cassette_dir = "replays"
+cassette = "default"
+on_secret = "refuse"
+
+[tracing]
+capture_content = false
