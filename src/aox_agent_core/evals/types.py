@@ -77,8 +77,8 @@ class CaseResult(FrozenModel):
 class Scorecard(FrozenModel):
     """A suite run's results. Written as JSON and Markdown; its JSON shape is public API.
 
-    accuracy is the share of cases whose every score passed; a case that errored
-    counts as failed.
+    accuracy is the share of cases whose every score passed. A case that errored
+    or has no scores counts as failed.
     """
 
     format_version: Literal[1] = SCORECARD_FORMAT_VERSION
@@ -96,5 +96,7 @@ class Scorecard(FrozenModel):
         return [
             result
             for result in self.results
-            if result.error is not None or not all(score.passed for score in result.scores)
+            if result.error is not None
+            or not result.scores
+            or not all(score.passed for score in result.scores)
         ]

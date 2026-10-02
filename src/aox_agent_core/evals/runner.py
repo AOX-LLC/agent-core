@@ -28,6 +28,8 @@ class EvalRunner:
     """
 
     def __init__(self, scorers: Sequence[Scorer], *, concurrency: int = 4) -> None:
+        if not scorers:
+            raise ValueError("an eval run needs at least one scorer")
         if concurrency < 1:
             raise ValueError(f"concurrency must be at least 1, got {concurrency}")
         self._scorers = tuple(scorers)

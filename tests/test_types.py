@@ -25,7 +25,7 @@ from aox_agent_core.audit import (
     AuditRecord,
 )
 from aox_agent_core.config import Provider
-from aox_agent_core.evals import CaseResult, EvalCase, EvalSuite, Score, Scorecard
+from aox_agent_core.evals import CaseResult, EvalCase, EvalRunner, EvalSuite, Score, Scorecard
 from aox_agent_core.models import ProviderRequest
 from aox_agent_core.replay import Cassette
 
@@ -253,17 +253,23 @@ def test_scorecard_failures_include_errors_and_failed_scores() -> None:
         CaseResult(case_id="ok", scores=(passed,), latency_ms=5, cost_usd=Decimal(0)),
         CaseResult(case_id="wrong", scores=(failed,), latency_ms=5, cost_usd=Decimal(0)),
         CaseResult(case_id="crashed", latency_ms=5, cost_usd=Decimal(0), error="timeout"),
+        CaseResult(case_id="unscored", latency_ms=5, cost_usd=Decimal(0)),
     )
     scorecard = Scorecard(
         suite="sample",
         started_at=NOW,
         finished_at=NOW,
         results=results,
-        accuracy=1 / 3,
+        accuracy=1 / 4,
         latency_p50_ms=5,
         latency_p95_ms=5,
         cost_total_usd=Decimal(0),
         cost_per_case_usd=Decimal(0),
     )
 
-    assert [result.case_id for result in scorecard.failures()] == ["wrong", "crashed"]
+    assert [result.case_id for result in scorecard.failures()] == ["wrong", "crashed", "unscored"]
+
+
+def test_eval_runner_needs_a_scorer() -> None:
+    with pytest.raises(ValueError, match="at least one scorer"):
+        EvalRunner([])
