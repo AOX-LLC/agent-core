@@ -6,7 +6,12 @@ from typing import Any
 
 import pytest
 
+from aox_agent_core import Message, Provider, Role
 from aox_agent_core.cli import main
+from aox_agent_core.config import SecretAction
+from aox_agent_core.models import ProviderRequest
+from aox_agent_core.replay import DirectoryCassetteStore, PatternScrubber, RecordingProvider
+from support import ScriptedProvider, response
 
 EXAMPLE_CASSETTES = Path(__file__).parents[1] / "examples" / "replays"
 
@@ -74,3 +79,40 @@ def test_invalid_file_and_empty_directory(
 
     assert main(["cassettes", "check", str(tmp_path)]) == 1
     assert "not a valid cassette (name: Field required)" in capsys.readouterr().out
+
+
+async def test_redacted_cassette_passes_the_check(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    fake_key = "sk-ant-" + "r" * 24
+    redacting = DirectoryCassetteStore(
+        tmp_path, scrubber=PatternScrubber(), on_secret=SecretAction.REDACT
+    )
+    recorder = RecordingProvider(ScriptedProvider(response("ok")), redacting, "redacted")
+    await recorder.complete(
+        ProviderRequest(
+            provider=Provider.ANTHROPIC,
+            model="claude-haiku-4-5-20251001",
+            messages=(Message(role=Role.USER, content=f"key {fake_key}"),),
+            max_tokens=10,
+        )
+    )
+
+    assert main(["cassettes", "check", str(tmp_path)]) == 0
+    assert fake_key not in (tmp_path / "redacted.json").read_text()
+
+
+def test_unreadable_file_is_a_problem_not_a_crash(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    (tmp_path / "binary.json").write_bytes(b"\xff\xfe\x00")
+
+    assert main(["cassettes", "check", str(tmp_path)]) == 1
+    assert "unreadable (UnicodeDecodeError)" in capsys.readouterr().out
+
+
+def test_missing_directory_is_a_usage_error(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    assert main(["cassettes", "check", str(tmp_path / "absent")]) == 2
+    assert "is not a directory" in capsys.readouterr().err

@@ -1,11 +1,18 @@
+import gc
 import json
 from pathlib import Path
 
 import pytest
+from pydantic import JsonValue
 
 from aox_agent_core import Message, Provider, Role
 from aox_agent_core.config import SecretAction
-from aox_agent_core.errors import CassetteFormatError, ReplayMissError, SecretInRecordingError
+from aox_agent_core.errors import (
+    CassetteConflictError,
+    CassetteFormatError,
+    ReplayMissError,
+    SecretInRecordingError,
+)
 from aox_agent_core.models import ProviderRequest
 from aox_agent_core.replay import (
     Cassette,
@@ -91,6 +98,8 @@ async def test_cassette_file_is_sorted_json_with_sequence_numbers(tmp_path: Path
 async def test_recording_starts_the_cassette_afresh(tmp_path: Path) -> None:
     first = RecordingProvider(ScriptedProvider(response("old")), store(tmp_path), "fresh")
     await first.complete(request("stale"))
+    del first  # a later run: the first recorder is gone
+    gc.collect()
     second = RecordingProvider(ScriptedProvider(response("new")), store(tmp_path), "fresh")
     await second.complete(request())
 
@@ -139,3 +148,52 @@ def test_malformed_cassette_raises_format_error(tmp_path: Path) -> None:
 def test_store_rejects_names_that_escape_the_directory(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="name"):
         store(tmp_path).load("../outside")
+
+
+async def test_hash_like_extra_patterns_do_not_match_structural_fields(tmp_path: Path) -> None:
+    hex_pattern_store = DirectoryCassetteStore(
+        tmp_path, scrubber=PatternScrubber(extra_patterns={"hex_token": r"\b[0-9a-f]{32,}\b"})
+    )
+    recorder = RecordingProvider(ScriptedProvider(response("fine")), hex_pattern_store, "hex")
+
+    await recorder.complete(request())
+
+    assert (tmp_path / "hex.json").exists()
+
+
+class _BrokenRedactor(PatternScrubber):
+    def redact(self, value: JsonValue) -> JsonValue:
+        return 42
+
+
+async def test_redaction_that_breaks_the_cassette_is_refused(tmp_path: Path) -> None:
+    broken = DirectoryCassetteStore(
+        tmp_path, scrubber=_BrokenRedactor(), on_secret=SecretAction.REDACT
+    )
+    recorder = RecordingProvider(ScriptedProvider(response(f"key {FAKE_KEY}")), broken, "broken")
+
+    with pytest.raises(SecretInRecordingError, match="left it invalid"):
+        await recorder.complete(request())
+
+    assert not (tmp_path / "broken.json").exists()
+
+
+async def test_second_recorder_for_the_same_cassette_is_refused(tmp_path: Path) -> None:
+    first = RecordingProvider(
+        ScriptedProvider(response("a"), response("c")), store(tmp_path), "shared"
+    )
+    second = RecordingProvider(ScriptedProvider(response("b")), store(tmp_path), "shared")
+    await first.complete(request())
+
+    with pytest.raises(CassetteConflictError, match="already being recorded"):
+        await second.complete(request("other"))
+
+    await first.complete(request("more from the first"))
+    assert len(store(tmp_path).load("shared").entries) == 2
+
+
+async def test_cassette_files_are_world_readable(tmp_path: Path) -> None:
+    recorder = RecordingProvider(ScriptedProvider(response("a")), store(tmp_path), "mode")
+    await recorder.complete(request())
+
+    assert (tmp_path / "mode.json").stat().st_mode & 0o777 == 0o644

@@ -21,7 +21,9 @@ class CassetteEntry(FrozenModel):
     """One recorded call.
 
     sequence numbers repeated identical requests, so a prompt sent twice in one
-    run replays its two responses in order.
+    run replays its two responses in order. request_hash is always the hash of
+    the request as it was sent, so a redacted entry still matches the live
+    request it recorded, but no longer hashes to itself.
     """
 
     request_hash: Sha256Hex

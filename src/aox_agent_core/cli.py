@@ -12,7 +12,9 @@ from aox_agent_core.config import load_config
 from aox_agent_core.errors import AgentCoreError, CassetteFormatError
 from aox_agent_core.replay.cassette import Cassette, request_hash
 from aox_agent_core.replay.scrub import PatternScrubber
-from aox_agent_core.replay.store import parse_cassette
+from aox_agent_core.replay.store import parse_cassette, recorded_content
+
+REDACTION_MARKER = "[REDACTED:"
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -25,14 +27,18 @@ def main(argv: Sequence[str] | None = None) -> int:
         "check",
         help="validate cassettes and scan them for secrets",
         description=(
-            "Check every *.json cassette in a directory: format, request keys, "
-            "sequence numbers, and secrets. Exits 1 if anything is wrong. "
-            "Secret patterns added in AGENT_CORE_CONFIG are applied too."
+            "Check every *.json cassette in a directory: format, request hashes, "
+            "sequence numbers, and secrets in recorded content. Exits 1 if anything "
+            "is wrong and 2 if the check could not run. Secret patterns added in "
+            "AGENT_CORE_CONFIG are applied too."
         ),
     )
     check.add_argument("directory", type=Path)
     arguments = parser.parse_args(argv)
 
+    if not arguments.directory.is_dir():
+        print(f"error: {arguments.directory} is not a directory", file=sys.stderr)
+        return 2
     try:
         problems = check_cassettes(arguments.directory)
     except AgentCoreError as error:
@@ -53,8 +59,6 @@ def check_cassettes(directory: Path) -> list[str]:
     An empty list means every cassette is valid. Raises AgentCoreError if the
     configuration cannot be loaded.
     """
-    if not directory.is_dir():
-        return [f"{directory}: not a directory"]
     paths = sorted(directory.glob("*.json"))
     if not paths:
         return [f"{directory}: no cassettes (*.json) found"]
@@ -63,7 +67,12 @@ def check_cassettes(directory: Path) -> list[str]:
     problems: list[str] = []
     for path in paths:
         try:
-            cassette = parse_cassette(path.read_text(encoding="utf-8"), source=path)
+            text = path.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError) as error:
+            problems.append(f"{path}: unreadable ({type(error).__name__})")
+            continue
+        try:
+            cassette = parse_cassette(text, source=path)
         except CassetteFormatError as error:
             problems.append(f"{path}: not a valid cassette ({_first_validation_problem(error)})")
             continue
@@ -78,14 +87,17 @@ def _problems_in(path: Path, cassette: Cassette, scrubber: PatternScrubber) -> l
 
     sequences: dict[str, list[int]] = defaultdict(list)
     for index, entry in enumerate(cassette.entries):
-        if entry.request_hash != request_hash(entry.request):
+        # A redacted entry keeps the hash of the request as sent, which can no
+        # longer be recomputed from what was written.
+        is_redacted = REDACTION_MARKER in entry.request.model_dump_json()
+        if not is_redacted and entry.request_hash != request_hash(entry.request):
             problems.append(f"{path}: entries[{index}] request_hash does not match its request")
         sequences[entry.request_hash].append(entry.sequence)
     for key, numbers in sequences.items():
         if sorted(numbers) != list(range(len(numbers))):
             problems.append(f"{path}: request {key[:12]} has sequence numbers {sorted(numbers)}")
 
-    for finding in scrubber.find_secrets(cassette.model_dump(mode="json")):
+    for finding in scrubber.find_secrets(recorded_content(cassette.model_dump(mode="json"))):
         problems.append(f"{path}: possible secret ({finding.rule}) at {finding.path}")
     return problems
 
