@@ -7,6 +7,7 @@ import sys
 from collections import defaultdict
 from collections.abc import Sequence
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from pydantic import ValidationError
 
@@ -17,7 +18,7 @@ from aox_agent_core.errors import AgentCoreError, AuditIntegrityError, CassetteF
 from aox_agent_core.replay.cassette import Cassette, request_hash
 from aox_agent_core.replay.scrub import PatternScrubber
 from aox_agent_core.replay.store import parse_cassette, recorded_content
-from aox_agent_core.storage import open_database
+from aox_agent_core.storage import driver_errors, open_database
 
 REDACTION_MARKER = "[REDACTED:"
 
@@ -85,10 +86,21 @@ def _verify_audit(url: str | None, anchor_seq: int | None, anchor_hash: str | No
     if (anchor_seq is None) != (anchor_hash is None):
         print("error: pass --anchor-seq and --anchor-hash together", file=sys.stderr)
         return 2
+    if url is not None and urlsplit(url).password is not None:
+        print(
+            f"warning: the URL includes a password, which shell history and process lists "
+            f"can show; prefer {AUDIT_DATABASE_URL_ENV}",
+            file=sys.stderr,
+        )
     database_url = url or os.environ.get(AUDIT_DATABASE_URL_ENV, "").strip()
     if not database_url:
         print(f"error: pass a database URL or set {AUDIT_DATABASE_URL_ENV}", file=sys.stderr)
         return 2
+    reportable_errors: tuple[type[Exception], ...] = (
+        AgentCoreError,
+        ValidationError,
+        *driver_errors(),
+    )
     try:
         log = SQLAuditLog(open_database(database_url))
         anchor = (
@@ -100,8 +112,8 @@ def _verify_audit(url: str | None, anchor_seq: int | None, anchor_hash: str | No
     except AuditIntegrityError as error:
         print(f"FAILED: {error}")
         return 1
-    except (AgentCoreError, ValidationError) as error:
-        print(f"error: {error}", file=sys.stderr)
+    except reportable_errors as error:
+        print(f"error: {type(error).__name__}: {error}", file=sys.stderr)
         return 2
     anchored = " and matches the anchor" if anchor is not None else " (no anchor given)"
     print(f"OK: {head.seq} records, chain intact{anchored}. Head: {head.seq} {head.record_hash}")

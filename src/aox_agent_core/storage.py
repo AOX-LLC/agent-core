@@ -177,6 +177,16 @@ def open_database(url: str | SecretStr) -> Database:
     raise ConfigError(f"Unsupported database URL scheme {scheme!r}; use sqlite or postgresql.")
 
 
+def driver_errors() -> tuple[type[Exception], ...]:
+    """The database drivers' own error classes, for callers that report rather than crash."""
+    errors: tuple[type[Exception], ...] = (sqlite3.Error,)
+    try:
+        import psycopg
+    except ImportError:
+        return errors
+    return (*errors, psycopg.Error)
+
+
 def _import_psycopg() -> Any:
     try:
         import psycopg
@@ -222,6 +232,7 @@ __all__ = [
     "PostgresDatabase",
     "SQLiteDatabase",
     "Session",
+    "driver_errors",
     "install_postgres_schema",
     "open_database",
 ]

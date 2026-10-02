@@ -164,3 +164,14 @@ def test_audit_verify_needs_a_url_and_a_whole_anchor(capsys: pytest.CaptureFixtu
     assert main(["audit", "verify"]) == 2
     assert main(["audit", "verify", "sqlite:///x.sqlite3", "--anchor-seq", "1"]) == 2
     assert "together" in capsys.readouterr().err
+
+
+def test_audit_verify_warns_about_a_password_in_the_url(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    exit_code = main(["audit", "verify", "postgresql://app:hunter2@127.0.0.1:9/none"])
+
+    errors = capsys.readouterr().err
+    assert exit_code == 2  # nothing listens on port 9: reported, not a traceback
+    assert "includes a password" in errors
+    assert "OperationalError" in errors

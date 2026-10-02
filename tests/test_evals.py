@@ -145,3 +145,17 @@ async def test_scorecard_writers(tmp_path: Path) -> None:
     assert document["accuracy"] == 0.5
     assert "| 2 | 1 | 50.0% |" in markdown
     assert "| bad | exact_match: failed |" in markdown
+
+
+async def test_target_errors_are_scrubbed_in_the_scorecard() -> None:
+    suite = EvalSuite(name="sample", cases=(EvalCase(id="leaky", input="1"),))
+    fake_key = "sk-ant-" + "e" * 24
+
+    async def target(case: EvalCase) -> TargetOutput:
+        raise RuntimeError(f"request failed with key {fake_key}")
+
+    scorecard = await EvalRunner([ExactMatch()]).run(suite, target)
+
+    assert scorecard.results[0].error == (
+        "RuntimeError: request failed with key [REDACTED:anthropic_api_key]"
+    )

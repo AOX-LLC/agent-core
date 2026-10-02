@@ -20,6 +20,7 @@ from aox_agent_core.evals.types import (
     TargetOutput,
 )
 from aox_agent_core.models.client import AgentClient
+from aox_agent_core.replay.scrub import PatternScrubber
 
 # The system under test: takes one case and returns its output and cost.
 EvalTarget = Callable[[EvalCase], Awaitable[TargetOutput]]
@@ -74,7 +75,7 @@ class EvalRunner:
                 case_id=case.id,
                 latency_ms=(time.perf_counter() - started) * 1000,
                 cost_usd=Decimal(0),
-                error=f"{type(error).__name__}: {error}"[:MAX_ERROR_LENGTH],
+                error=_scrubbed_error(error),
             )
         latency_ms = (time.perf_counter() - started) * 1000
         scores = tuple(scorer.score(case, produced.output) for scorer in self._scorers)
@@ -144,3 +145,12 @@ def _percentile(sorted_values: list[float], percent: int) -> float:
     """Nearest-rank percentile: the smallest value with at least `percent`% at or below it."""
     rank = max(1, math.ceil(percent / 100 * len(sorted_values)))
     return sorted_values[rank - 1]
+
+
+def _scrubbed_error(error: Exception) -> str:
+    """The error's type and message, with anything secret-shaped redacted, then shortened.
+
+    A target's error can quote a request or a credential, and scorecards are shared.
+    """
+    redacted = PatternScrubber().redact(f"{type(error).__name__}: {error}")
+    return str(redacted)[:MAX_ERROR_LENGTH]

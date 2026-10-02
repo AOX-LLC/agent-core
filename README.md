@@ -114,6 +114,8 @@ approvals = SQLApprovalQueue(database, audit_log=audit_log)
 
 Keep the head from `await audit_log.head()` somewhere the application cannot write, and check against it with `await audit_log.verify(expected_head=...)` or `aox-agent-core audit verify`: the chain on its own cannot show that it was not rewritten or cut short.
 
+Approvals are enforced by the library and recorded in the audit log; the database alone does not protect them, since the application role may update the approvals table. Each approval authorizes one run: call `consume(..., principal=...)` right before acting.
+
 On Postgres, an operator creates the tables once as the owner role with `storage.install_postgres_schema(owner_url, app_role="...")`; the application then connects as the app role, which may only insert into and read the audit log. `examples/control_layer_demo.py` walks through both, and `evals/run_triage_eval.py` runs the synthetic eval suite and prints its scorecard.
 
 ## Bedrock

@@ -111,6 +111,7 @@ EXPECTED_EXPORTS = {
         "PostgresDatabase",
         "SQLiteDatabase",
         "Session",
+        "driver_errors",
         "install_postgres_schema",
         "open_database",
     ],
