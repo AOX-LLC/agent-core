@@ -21,7 +21,7 @@ from aox_agent_core.errors import (
 )
 from aox_agent_core.models.live import LiveProviders
 from aox_agent_core.models.pricing import cost_of, estimate_input_tokens
-from aox_agent_core.models.provider import ModelProvider
+from aox_agent_core.models.provider import ModelProvider, close_provider
 from aox_agent_core.models.router import ConfigRouter, RouteDecision, Router, RouteRequest
 from aox_agent_core.models.types import (
     CallResult,
@@ -244,19 +244,36 @@ class AgentClient:
         )
 
     def close(self) -> None:
-        """Close the event loop call_sync uses. The client can still be used with await."""
+        """Release connections and close the event loop call_sync uses.
+
+        The client stays usable afterwards; the next call opens new connections.
+        From async code, use `await client.aclose()` instead.
+        """
+        if self._runner is None:
+            return
+        _raise_if_event_loop_running()
         if self._close_loop_on_collect is not None:
             self._close_loop_on_collect.detach()
-        if self._runner is not None:
-            self._runner.close()
+        self._runner.run(close_provider(self._provider))
+        self._runner.close()
         self._runner = None
         self._close_loop_on_collect = None
+
+    async def aclose(self) -> None:
+        """Release the connections opened on the running event loop."""
+        await close_provider(self._provider)
 
     def __enter__(self) -> "AgentClient":
         return self
 
     def __exit__(self, *_exc_info: object) -> None:
         self.close()
+
+    async def __aenter__(self) -> "AgentClient":
+        return self
+
+    async def __aexit__(self, *_exc_info: object) -> None:
+        await self.aclose()
 
     def _provider_for_mode(self) -> ModelProvider:
         if self._config.mode is Mode.REPLAY:

@@ -14,3 +14,14 @@ class ModelProvider(Protocol):
     """
 
     async def complete(self, request: ProviderRequest) -> ProviderResponse: ...
+
+
+async def close_provider(provider: ModelProvider) -> None:
+    """Release a provider's connections on the running loop.
+
+    aclose() is optional: a provider that holds connections defines
+    `async def aclose(self) -> None`, and the client calls it when closed.
+    """
+    aclose = getattr(provider, "aclose", None)
+    if aclose is not None:
+        await aclose()

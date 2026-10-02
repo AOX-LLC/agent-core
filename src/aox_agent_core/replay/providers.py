@@ -3,7 +3,7 @@
 from collections import Counter, defaultdict
 
 from aox_agent_core.errors import ReplayMissError
-from aox_agent_core.models.provider import ModelProvider
+from aox_agent_core.models.provider import ModelProvider, close_provider
 from aox_agent_core.models.types import ProviderRequest, ProviderResponse
 from aox_agent_core.replay.cassette import Cassette, CassetteEntry, request_hash
 from aox_agent_core.replay.store import CassetteStore
@@ -72,3 +72,6 @@ class RecordingProvider:
         self._entries.append(entry)
         self._recorded[key] += 1
         return response
+
+    async def aclose(self) -> None:
+        await close_provider(self._live)

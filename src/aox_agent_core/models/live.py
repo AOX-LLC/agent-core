@@ -5,7 +5,7 @@ from pydantic import SecretStr
 from aox_agent_core.config import AgentCoreConfig, Provider
 from aox_agent_core.models.anthropic_provider import AnthropicProvider, refuse_sdk_header_injection
 from aox_agent_core.models.bedrock_provider import BedrockProvider
-from aox_agent_core.models.provider import ModelProvider
+from aox_agent_core.models.provider import ModelProvider, close_provider
 from aox_agent_core.models.types import ProviderRequest, ProviderResponse
 
 
@@ -24,6 +24,10 @@ class LiveProviders:
 
     async def complete(self, request: ProviderRequest) -> ProviderResponse:
         return await self._provider_for(request.provider).complete(request)
+
+    async def aclose(self) -> None:
+        for provider in self._providers.values():
+            await close_provider(provider)
 
     def _provider_for(self, provider: Provider) -> ModelProvider:
         if provider not in self._providers:

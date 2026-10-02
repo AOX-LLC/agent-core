@@ -1,6 +1,7 @@
 """Every test runs offline and ignores the developer's environment."""
 
 import socket
+from typing import Any
 
 import pytest
 from opentelemetry import trace
@@ -30,17 +31,31 @@ class NetworkBlockedError(OSError):
     """An OSError, so socket helpers close the socket as they would on a real failure."""
 
 
+LOOPBACK_HOSTS = {"127.0.0.1", "::1", "localhost"}
+
+
 @pytest.fixture(autouse=True)
 def _no_network(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Refuse every connection and lookup except loopback, for local test servers."""
+    connect = socket.socket.connect
+    getaddrinfo = socket.getaddrinfo
+
+    def connect_loopback_only(sock: socket.socket, address: object) -> None:
+        if isinstance(address, tuple) and address[0] in LOOPBACK_HOSTS:
+            return connect(sock, address)
+        raise NetworkBlockedError("Tests must not open network connections.")
+
     def refuse_connection(*_args: object, **_kwargs: object) -> None:
         raise NetworkBlockedError("Tests must not open network connections.")
 
-    def refuse_lookup(*_args: object, **_kwargs: object) -> None:
+    def lookup_loopback_only(host: object, *args: Any, **kwargs: Any) -> Any:
+        if host in LOOPBACK_HOSTS:
+            return getaddrinfo(host, *args, **kwargs)
         raise NetworkBlockedError("Tests must not resolve host names.")
 
-    monkeypatch.setattr(socket.socket, "connect", refuse_connection)
+    monkeypatch.setattr(socket.socket, "connect", connect_loopback_only)
     monkeypatch.setattr(socket.socket, "connect_ex", refuse_connection)
-    monkeypatch.setattr(socket, "getaddrinfo", refuse_lookup)
+    monkeypatch.setattr(socket, "getaddrinfo", lookup_loopback_only)
 
 
 @pytest.fixture(scope="session")

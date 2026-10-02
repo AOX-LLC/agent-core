@@ -1,6 +1,8 @@
 """The Anthropic Messages API provider."""
 
+import asyncio
 import os
+import weakref
 from collections.abc import Mapping
 
 import anthropic
@@ -50,13 +52,14 @@ class AnthropicProvider:
         http_client: anthropic.DefaultAsyncHttpxClient | None = None,
     ) -> None:
         refuse_sdk_header_injection()
-        self._client = anthropic.AsyncAnthropic(
-            api_key=api_key.get_secret_value(),
-            base_url=settings.base_url,
-            timeout=settings.timeout_seconds,
-            max_retries=settings.max_retries,
-            http_client=http_client,
-        )
+        self._api_key = api_key
+        self._settings = settings
+        self._http_client = http_client
+        # SDK connections belong to the event loop that opened them, so each loop
+        # gets its own SDK client; an injected http_client should serve one loop.
+        self._clients: weakref.WeakKeyDictionary[
+            asyncio.AbstractEventLoop, anthropic.AsyncAnthropic
+        ] = weakref.WeakKeyDictionary()
 
     async def complete(self, request: ProviderRequest) -> ProviderResponse:
         """Send one request and return the normalized response.
@@ -65,7 +68,7 @@ class AnthropicProvider:
         or a connection failure, and ProviderRequestError on any other API error.
         """
         try:
-            message = await self._client.messages.create(
+            message = await self._client_for_running_loop().messages.create(
                 model=request.model,
                 max_tokens=request.max_tokens,
                 messages=_messages_param(request),
@@ -81,8 +84,25 @@ class AnthropicProvider:
         return _normalize(message)
 
     async def aclose(self) -> None:
-        """Close the SDK client and its connections."""
-        await self._client.close()
+        """Close the SDK client used on the running event loop, if there is one."""
+        client = self._clients.pop(asyncio.get_running_loop(), None)
+        if client is not None:
+            await client.close()
+
+    def _client_for_running_loop(self) -> anthropic.AsyncAnthropic:
+        loop = asyncio.get_running_loop()
+        client = self._clients.get(loop)
+        if client is None:
+            refuse_sdk_header_injection()
+            client = anthropic.AsyncAnthropic(
+                api_key=self._api_key.get_secret_value(),
+                base_url=self._settings.base_url,
+                timeout=self._settings.timeout_seconds,
+                max_retries=self._settings.max_retries,
+                http_client=self._http_client,
+            )
+            self._clients[loop] = client
+        return client
 
 
 def _messages_param(request: ProviderRequest) -> list[MessageParam]:
