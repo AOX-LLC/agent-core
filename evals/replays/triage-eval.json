@@ -1,0 +1,576 @@
+{
+  "entries": [
+    {
+      "request": {
+        "effort": null,
+        "max_tokens": 16000,
+        "messages": [
+          {
+            "content": "Subject: Duplicate charge on invoice INV-2001\n\nWe were billed twice for INV-2001 this month. Please refund the duplicate today, our payment run closes this afternoon.",
+            "role": "user"
+          }
+        ],
+        "model": "claude-haiku-4-5-20251001",
+        "output_schema": {
+          "additionalProperties": false,
+          "properties": {
+            "queue": {
+              "enum": [
+                "billing",
+                "technical",
+                "account"
+              ],
+              "title": "Queue",
+              "type": "string"
+            },
+            "summary": {
+              "title": "Summary",
+              "type": "string"
+            },
+            "urgent": {
+              "title": "Urgent",
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "queue",
+            "urgent",
+            "summary"
+          ],
+          "title": "TicketTriage",
+          "type": "object"
+        },
+        "provider": "anthropic",
+        "system": "You triage support tickets for a fictional software company."
+      },
+      "request_hash": "63703ae774c06098acacbc83ee2131052b82c3cef941fc1715dbe849cf6e6d7e",
+      "response": {
+        "model": "claude-haiku-4-5-20251001",
+        "stop_reason": "end_turn",
+        "text": "{\"queue\": \"billing\", \"urgent\": true, \"summary\": \"Duplicate charge on INV-2001 needs a refund today.\"}",
+        "usage": {
+          "cache_creation_input_tokens": 0,
+          "cache_read_input_tokens": 0,
+          "input_tokens": 175,
+          "output_tokens": 42
+        }
+      },
+      "sequence": 0
+    },
+    {
+      "request": {
+        "effort": null,
+        "max_tokens": 16000,
+        "messages": [
+          {
+            "content": "Subject: Need a copy of last quarter's invoice\n\nCould you send a PDF of invoice INV-2002? Our accountant needs it sometime next week.",
+            "role": "user"
+          }
+        ],
+        "model": "claude-haiku-4-5-20251001",
+        "output_schema": {
+          "additionalProperties": false,
+          "properties": {
+            "queue": {
+              "enum": [
+                "billing",
+                "technical",
+                "account"
+              ],
+              "title": "Queue",
+              "type": "string"
+            },
+            "summary": {
+              "title": "Summary",
+              "type": "string"
+            },
+            "urgent": {
+              "title": "Urgent",
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "queue",
+            "urgent",
+            "summary"
+          ],
+          "title": "TicketTriage",
+          "type": "object"
+        },
+        "provider": "anthropic",
+        "system": "You triage support tickets for a fictional software company."
+      },
+      "request_hash": "24169234a25d1289f69da09b3a2ed6423441f351832920055858bbdb9991896e",
+      "response": {
+        "model": "claude-haiku-4-5-20251001",
+        "stop_reason": "end_turn",
+        "text": "{\"queue\": \"billing\", \"urgent\": false, \"summary\": \"Customer wants a PDF copy of invoice INV-2002.\"}",
+        "usage": {
+          "cache_creation_input_tokens": 0,
+          "cache_read_input_tokens": 0,
+          "input_tokens": 180,
+          "output_tokens": 49
+        }
+      },
+      "sequence": 0
+    },
+    {
+      "request": {
+        "effort": null,
+        "max_tokens": 16000,
+        "messages": [
+          {
+            "content": "Subject: Update billing address\n\nPlease change the billing address on our invoices to the new office. No rush, the next invoice is a month away.",
+            "role": "user"
+          }
+        ],
+        "model": "claude-haiku-4-5-20251001",
+        "output_schema": {
+          "additionalProperties": false,
+          "properties": {
+            "queue": {
+              "enum": [
+                "billing",
+                "technical",
+                "account"
+              ],
+              "title": "Queue",
+              "type": "string"
+            },
+            "summary": {
+              "title": "Summary",
+              "type": "string"
+            },
+            "urgent": {
+              "title": "Urgent",
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "queue",
+            "urgent",
+            "summary"
+          ],
+          "title": "TicketTriage",
+          "type": "object"
+        },
+        "provider": "anthropic",
+        "system": "You triage support tickets for a fictional software company."
+      },
+      "request_hash": "a73d9c81ed2af54a618ccf33edca92a7870259233f1ab72d0bb83d909500bd6c",
+      "response": {
+        "model": "claude-haiku-4-5-20251001",
+        "stop_reason": "end_turn",
+        "text": "{\"queue\": \"billing\", \"urgent\": false, \"summary\": \"Customer asks to change the billing address.\"}",
+        "usage": {
+          "cache_creation_input_tokens": 0,
+          "cache_read_input_tokens": 0,
+          "input_tokens": 185,
+          "output_tokens": 56
+        }
+      },
+      "sequence": 0
+    },
+    {
+      "request": {
+        "effort": null,
+        "max_tokens": 16000,
+        "messages": [
+          {
+            "content": "Subject: Card declined and service suspended\n\nOur card was declined after an expiry change and the workspace is now suspended. Our whole team is locked out, please reactivate it urgently.",
+            "role": "user"
+          }
+        ],
+        "model": "claude-haiku-4-5-20251001",
+        "output_schema": {
+          "additionalProperties": false,
+          "properties": {
+            "queue": {
+              "enum": [
+                "billing",
+                "technical",
+                "account"
+              ],
+              "title": "Queue",
+              "type": "string"
+            },
+            "summary": {
+              "title": "Summary",
+              "type": "string"
+            },
+            "urgent": {
+              "title": "Urgent",
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "queue",
+            "urgent",
+            "summary"
+          ],
+          "title": "TicketTriage",
+          "type": "object"
+        },
+        "provider": "anthropic",
+        "system": "You triage support tickets for a fictional software company."
+      },
+      "request_hash": "eefb339dd7706e3d35b1619b54d38c47d231a62aaba263f2689e5cd649a708e8",
+      "response": {
+        "model": "claude-haiku-4-5-20251001",
+        "stop_reason": "end_turn",
+        "text": "{\"queue\": \"account\", \"urgent\": true, \"summary\": \"Workspace suspended after a declined card; team locked out.\"}",
+        "usage": {
+          "cache_creation_input_tokens": 0,
+          "cache_read_input_tokens": 0,
+          "input_tokens": 190,
+          "output_tokens": 37
+        }
+      },
+      "sequence": 0
+    },
+    {
+      "request": {
+        "effort": null,
+        "max_tokens": 16000,
+        "messages": [
+          {
+            "content": "Subject: Dashboard returns a 500 error\n\nEvery report page has shown a 500 error since this morning. Our team cannot work until it is fixed.",
+            "role": "user"
+          }
+        ],
+        "model": "claude-haiku-4-5-20251001",
+        "output_schema": {
+          "additionalProperties": false,
+          "properties": {
+            "queue": {
+              "enum": [
+                "billing",
+                "technical",
+                "account"
+              ],
+              "title": "Queue",
+              "type": "string"
+            },
+            "summary": {
+              "title": "Summary",
+              "type": "string"
+            },
+            "urgent": {
+              "title": "Urgent",
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "queue",
+            "urgent",
+            "summary"
+          ],
+          "title": "TicketTriage",
+          "type": "object"
+        },
+        "provider": "anthropic",
+        "system": "You triage support tickets for a fictional software company."
+      },
+      "request_hash": "737dfdf75c7ddd0220eb09ffb382104c8dd99e1137de200384de18a4dcbc7e99",
+      "response": {
+        "model": "claude-haiku-4-5-20251001",
+        "stop_reason": "end_turn",
+        "text": "{\"queue\": \"technical\", \"urgent\": true, \"summary\": \"Report pages return a 500 error and block the team.\"}",
+        "usage": {
+          "cache_creation_input_tokens": 0,
+          "cache_read_input_tokens": 0,
+          "input_tokens": 195,
+          "output_tokens": 44
+        }
+      },
+      "sequence": 0
+    },
+    {
+      "request": {
+        "effort": null,
+        "max_tokens": 16000,
+        "messages": [
+          {
+            "content": "Subject: CSV export has wrong column order\n\nThe exported CSV lists the date column after the amount. It is a minor annoyance, nothing is broken.",
+            "role": "user"
+          }
+        ],
+        "model": "claude-haiku-4-5-20251001",
+        "output_schema": {
+          "additionalProperties": false,
+          "properties": {
+            "queue": {
+              "enum": [
+                "billing",
+                "technical",
+                "account"
+              ],
+              "title": "Queue",
+              "type": "string"
+            },
+            "summary": {
+              "title": "Summary",
+              "type": "string"
+            },
+            "urgent": {
+              "title": "Urgent",
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "queue",
+            "urgent",
+            "summary"
+          ],
+          "title": "TicketTriage",
+          "type": "object"
+        },
+        "provider": "anthropic",
+        "system": "You triage support tickets for a fictional software company."
+      },
+      "request_hash": "b019510040ed76d25832da38df1c40ec0b829fafefbce300308c0c59655b04c5",
+      "response": {
+        "model": "claude-haiku-4-5-20251001",
+        "stop_reason": "end_turn",
+        "text": "{\"queue\": \"technical\", \"urgent\": false, \"summary\": \"CSV export puts the date column after the amount.\"}",
+        "usage": {
+          "cache_creation_input_tokens": 0,
+          "cache_read_input_tokens": 0,
+          "input_tokens": 200,
+          "output_tokens": 51
+        }
+      },
+      "sequence": 0
+    },
+    {
+      "request": {
+        "effort": null,
+        "max_tokens": 16000,
+        "messages": [
+          {
+            "content": "Subject: API rate limit questions\n\nWhat is the request limit for the reports endpoint? We are planning an integration for next quarter.",
+            "role": "user"
+          }
+        ],
+        "model": "claude-haiku-4-5-20251001",
+        "output_schema": {
+          "additionalProperties": false,
+          "properties": {
+            "queue": {
+              "enum": [
+                "billing",
+                "technical",
+                "account"
+              ],
+              "title": "Queue",
+              "type": "string"
+            },
+            "summary": {
+              "title": "Summary",
+              "type": "string"
+            },
+            "urgent": {
+              "title": "Urgent",
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "queue",
+            "urgent",
+            "summary"
+          ],
+          "title": "TicketTriage",
+          "type": "object"
+        },
+        "provider": "anthropic",
+        "system": "You triage support tickets for a fictional software company."
+      },
+      "request_hash": "d16e531d8726fb5e838436a112c6240b263bba52946c625cc9af6bbdb2abdee3",
+      "response": {
+        "model": "claude-haiku-4-5-20251001",
+        "stop_reason": "end_turn",
+        "text": "{\"queue\": \"technical\", \"urgent\": false, \"summary\": \"Customer asks about the reports endpoint rate limit.\"}",
+        "usage": {
+          "cache_creation_input_tokens": 0,
+          "cache_read_input_tokens": 0,
+          "input_tokens": 205,
+          "output_tokens": 58
+        }
+      },
+      "sequence": 0
+    },
+    {
+      "request": {
+        "effort": null,
+        "max_tokens": 16000,
+        "messages": [
+          {
+            "content": "Subject: Cannot reset my password\n\nThe reset link for user@example.com says it has expired every time. I need to get into my account before a client meeting in one hour.",
+            "role": "user"
+          }
+        ],
+        "model": "claude-haiku-4-5-20251001",
+        "output_schema": {
+          "additionalProperties": false,
+          "properties": {
+            "queue": {
+              "enum": [
+                "billing",
+                "technical",
+                "account"
+              ],
+              "title": "Queue",
+              "type": "string"
+            },
+            "summary": {
+              "title": "Summary",
+              "type": "string"
+            },
+            "urgent": {
+              "title": "Urgent",
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "queue",
+            "urgent",
+            "summary"
+          ],
+          "title": "TicketTriage",
+          "type": "object"
+        },
+        "provider": "anthropic",
+        "system": "You triage support tickets for a fictional software company."
+      },
+      "request_hash": "f613e6c0a4f015e0e27f418e5a39b042d9bd303e28152b176d3734d467818115",
+      "response": {
+        "model": "claude-haiku-4-5-20251001",
+        "stop_reason": "end_turn",
+        "text": "{\"queue\": \"account\", \"urgent\": false, \"summary\": \"Password reset link expires immediately; meeting in an hour.\"}",
+        "usage": {
+          "cache_creation_input_tokens": 0,
+          "cache_read_input_tokens": 0,
+          "input_tokens": 210,
+          "output_tokens": 39
+        }
+      },
+      "sequence": 0
+    },
+    {
+      "request": {
+        "effort": null,
+        "max_tokens": 16000,
+        "messages": [
+          {
+            "content": "Subject: Add a teammate to our plan\n\nPlease add colleague@example.com as a member of our workspace. Whenever you get to it is fine.",
+            "role": "user"
+          }
+        ],
+        "model": "claude-haiku-4-5-20251001",
+        "output_schema": {
+          "additionalProperties": false,
+          "properties": {
+            "queue": {
+              "enum": [
+                "billing",
+                "technical",
+                "account"
+              ],
+              "title": "Queue",
+              "type": "string"
+            },
+            "summary": {
+              "title": "Summary",
+              "type": "string"
+            },
+            "urgent": {
+              "title": "Urgent",
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "queue",
+            "urgent",
+            "summary"
+          ],
+          "title": "TicketTriage",
+          "type": "object"
+        },
+        "provider": "anthropic",
+        "system": "You triage support tickets for a fictional software company."
+      },
+      "request_hash": "706b215cb9acc9184cd80a50b493b5ef8aec46efd621fdd57c99efd879aaa73d",
+      "response": {
+        "model": "claude-haiku-4-5-20251001",
+        "stop_reason": "end_turn",
+        "text": "{\"queue\": \"account\", \"urgent\": false, \"summary\": \"Customer asks to add a teammate to the workspace.\"}",
+        "usage": {
+          "cache_creation_input_tokens": 0,
+          "cache_read_input_tokens": 0,
+          "input_tokens": 215,
+          "output_tokens": 46
+        }
+      },
+      "sequence": 0
+    },
+    {
+      "request": {
+        "effort": null,
+        "max_tokens": 16000,
+        "messages": [
+          {
+            "content": "Subject: Close our account\n\nWe are winding down this project and would like to close our account and export our data. There is no deadline.",
+            "role": "user"
+          }
+        ],
+        "model": "claude-haiku-4-5-20251001",
+        "output_schema": {
+          "additionalProperties": false,
+          "properties": {
+            "queue": {
+              "enum": [
+                "billing",
+                "technical",
+                "account"
+              ],
+              "title": "Queue",
+              "type": "string"
+            },
+            "summary": {
+              "title": "Summary",
+              "type": "string"
+            },
+            "urgent": {
+              "title": "Urgent",
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "queue",
+            "urgent",
+            "summary"
+          ],
+          "title": "TicketTriage",
+          "type": "object"
+        },
+        "provider": "anthropic",
+        "system": "You triage support tickets for a fictional software company."
+      },
+      "request_hash": "121d34c59fb0edd4d79a1abcc747e958aea2794138cdc3c4ee64070b48d65ede",
+      "response": {
+        "model": "claude-haiku-4-5-20251001",
+        "stop_reason": "end_turn",
+        "text": "{\"queue\": \"account\", \"urgent\": false, \"summary\": \"Customer wants to close the account and export data.\"}",
+        "usage": {
+          "cache_creation_input_tokens": 0,
+          "cache_read_input_tokens": 0,
+          "input_tokens": 220,
+          "output_tokens": 53
+        }
+      },
+      "sequence": 0
+    }
+  ],
+  "format_version": 1,
+  "name": "triage-eval"
+}

@@ -1,0 +1,9 @@
+# Configuration for the triage eval. Relative paths resolve against this file.
+mode = "replay"
+
+[routing.tasks]
+extraction = "small"
+
+[replay]
+cassette_dir = "replays"
+cassette = "triage-eval"
