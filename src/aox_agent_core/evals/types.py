@@ -6,9 +6,17 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Annotated, Final, Literal, Self
 
-from pydantic import AwareDatetime, Field, JsonValue, StringConstraints, model_validator
+from pydantic import (
+    AwareDatetime,
+    Field,
+    JsonValue,
+    StringConstraints,
+    ValidationError,
+    model_validator,
+)
 
 from aox_agent_core._model import FrozenModel
+from aox_agent_core.errors import EvalError
 
 SCORECARD_FORMAT_VERSION: Final = 1
 
@@ -43,8 +51,28 @@ class EvalSuite(FrozenModel):
 
     @classmethod
     def from_jsonl(cls, path: Path, *, name: str | None = None) -> Self:
-        """Load one EvalCase per line. The suite is named after the file unless given a name."""
-        raise NotImplementedError("EvalSuite.from_jsonl is not implemented yet.")
+        """Load one EvalCase per line. The suite is named after the file unless given a name.
+
+        Blank lines are skipped. Raises EvalError naming the line of the first
+        problem.
+        """
+        try:
+            lines = path.read_text(encoding="utf-8").splitlines()
+        except (OSError, UnicodeDecodeError) as error:
+            raise EvalError(f"Cannot read eval suite {path}: {error}") from error
+
+        cases = []
+        for line_number, line in enumerate(lines, start=1):
+            if not line.strip():
+                continue
+            try:
+                cases.append(EvalCase.model_validate_json(line))
+            except ValidationError as error:
+                raise EvalError(f"{path}:{line_number} is not a valid eval case.") from error
+        try:
+            return cls(name=name if name is not None else path.stem, cases=tuple(cases))
+        except ValidationError as error:
+            raise EvalError(f"{path} is not a valid eval suite: {error}") from error
 
 
 class TargetOutput(FrozenModel):
