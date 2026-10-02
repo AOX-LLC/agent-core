@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "aox-agent-core"
-version = "0.1.0.dev0"
+version = "0.1.0a1"
 description = "Routed Claude calls with structured outputs, tracing with cost, record/replay, human approvals, an append-only audit log and evals."
 readme = "README.md"
 license = "MIT"
@@ -12,7 +12,7 @@ license-files = ["LICENSE"]
 authors = [{ name = "AOX LLC" }]
 requires-python = ">=3.11"
 classifiers = [
-    "Development Status :: 2 - Pre-Alpha",
+    "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3 :: Only",
