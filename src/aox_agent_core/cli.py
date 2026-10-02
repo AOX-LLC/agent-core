@@ -1,0 +1,103 @@
+"""The aox-agent-core command line: `aox-agent-core cassettes check <dir>`."""
+
+import argparse
+import sys
+from collections import defaultdict
+from collections.abc import Sequence
+from pathlib import Path
+
+from pydantic import ValidationError
+
+from aox_agent_core.config import load_config
+from aox_agent_core.errors import AgentCoreError, CassetteFormatError
+from aox_agent_core.replay.cassette import Cassette, request_hash
+from aox_agent_core.replay.scrub import PatternScrubber
+from aox_agent_core.replay.store import parse_cassette
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    """Run the command line and return the exit code: 0 clean, 1 problems, 2 error."""
+    parser = argparse.ArgumentParser(prog="aox-agent-core")
+    commands = parser.add_subparsers(dest="command", required=True)
+    cassettes = commands.add_parser("cassettes", help="work with replay cassettes")
+    cassette_commands = cassettes.add_subparsers(dest="cassette_command", required=True)
+    check = cassette_commands.add_parser(
+        "check",
+        help="validate cassettes and scan them for secrets",
+        description=(
+            "Check every *.json cassette in a directory: format, request keys, "
+            "sequence numbers, and secrets. Exits 1 if anything is wrong. "
+            "Secret patterns added in AGENT_CORE_CONFIG are applied too."
+        ),
+    )
+    check.add_argument("directory", type=Path)
+    arguments = parser.parse_args(argv)
+
+    try:
+        problems = check_cassettes(arguments.directory)
+    except AgentCoreError as error:
+        print(f"error: {error}", file=sys.stderr)
+        return 2
+    for problem in problems:
+        print(problem)
+    if problems:
+        print(f"{len(problems)} problem(s) found.", file=sys.stderr)
+        return 1
+    print(f"All cassettes in {arguments.directory} are valid.")
+    return 0
+
+
+def check_cassettes(directory: Path) -> list[str]:
+    """Return one line per problem found in the cassettes under `directory`.
+
+    An empty list means every cassette is valid. Raises AgentCoreError if the
+    configuration cannot be loaded.
+    """
+    if not directory.is_dir():
+        return [f"{directory}: not a directory"]
+    paths = sorted(directory.glob("*.json"))
+    if not paths:
+        return [f"{directory}: no cassettes (*.json) found"]
+
+    scrubber = PatternScrubber(extra_patterns=load_config().replay.extra_secret_patterns)
+    problems: list[str] = []
+    for path in paths:
+        try:
+            cassette = parse_cassette(path.read_text(encoding="utf-8"), source=path)
+        except CassetteFormatError as error:
+            problems.append(f"{path}: not a valid cassette ({_first_validation_problem(error)})")
+            continue
+        problems += _problems_in(path, cassette, scrubber)
+    return problems
+
+
+def _problems_in(path: Path, cassette: Cassette, scrubber: PatternScrubber) -> list[str]:
+    problems: list[str] = []
+    if cassette.name != path.stem:
+        problems.append(f"{path}: name {cassette.name!r} does not match the file name")
+
+    sequences: dict[str, list[int]] = defaultdict(list)
+    for index, entry in enumerate(cassette.entries):
+        if entry.request_hash != request_hash(entry.request):
+            problems.append(f"{path}: entries[{index}] request_hash does not match its request")
+        sequences[entry.request_hash].append(entry.sequence)
+    for key, numbers in sequences.items():
+        if sorted(numbers) != list(range(len(numbers))):
+            problems.append(f"{path}: request {key[:12]} has sequence numbers {sorted(numbers)}")
+
+    for finding in scrubber.find_secrets(cassette.model_dump(mode="json")):
+        problems.append(f"{path}: possible secret ({finding.rule}) at {finding.path}")
+    return problems
+
+
+def _first_validation_problem(error: CassetteFormatError) -> str:
+    cause = error.__cause__
+    if not isinstance(cause, ValidationError):
+        return "unreadable"
+    detail = cause.errors(include_input=False, include_url=False)[0]
+    location = ".".join(str(part) for part in detail["loc"]) or "<root>"
+    return f"{location}: {detail['msg']}"
+
+
+if __name__ == "__main__":
+    sys.exit(main())

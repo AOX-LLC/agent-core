@@ -37,6 +37,9 @@ otel = [
 ]
 testing = ["pytest>=8"]
 
+[project.scripts]
+aox-agent-core = "aox_agent_core.cli:main"
+
 [project.urls]
 Repository = "https://github.com/AOX-LLC/agent-core"
 Changelog = "https://github.com/AOX-LLC/agent-core/blob/main/CHANGELOG.md"
