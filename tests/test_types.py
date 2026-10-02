@@ -105,6 +105,7 @@ def audit_record_fields(**overrides: Any) -> dict[str, Any]:
         "actor_id": "user-17",
         "subject_id": None,
         "payload": {},
+        "run_context": None,
         "prev_hash": GENESIS_HASH,
         "record_hash": SAMPLE_HASH,
         **overrides,

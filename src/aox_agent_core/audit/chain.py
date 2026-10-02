@@ -35,6 +35,9 @@ def compute_record_hash(record: UnsealedAuditRecord) -> str:
             "actor_id": record.actor_id,
             "subject_id": record.subject_id,
             "payload": record.payload,
+            "run_context": (
+                record.run_context.as_json() if record.run_context is not None else None
+            ),
             "prev_hash": record.prev_hash,
         }
     )
