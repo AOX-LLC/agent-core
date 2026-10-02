@@ -1,0 +1,353 @@
+"""The audit log on SQLite or Postgres.
+
+Append-only is enforced three ways, not promised:
+
+- the API has no update or delete;
+- the database refuses them: BEFORE UPDATE and BEFORE DELETE triggers on both
+  backends, and a BEFORE TRUNCATE trigger on Postgres;
+- on Postgres the application connects as a role that may only INSERT and
+  SELECT, and the log refuses to write if that is not so.
+
+The hash chain then detects what the database cannot prevent: an owner or
+superuser who drops the triggers and edits rows. It cannot detect a rewritten
+chain on its own; compare against a head kept elsewhere (verify's expected_head).
+"""
+
+import json
+from collections.abc import AsyncIterator
+from datetime import UTC, datetime
+from functools import partial
+from typing import Any, Final
+from uuid import UUID, uuid4
+
+from pydantic import ValidationError
+
+from aox_agent_core._canonical import canonical_json
+from aox_agent_core.audit.chain import canonical_timestamp, compute_record_hash
+from aox_agent_core.audit.types import (
+    GENESIS_HASH,
+    AuditEvent,
+    AuditHead,
+    AuditRecord,
+    UnsealedAuditRecord,
+)
+from aox_agent_core.errors import AuditIntegrityError, AuditPayloadRejectedError, ConfigError
+from aox_agent_core.replay.scrub import PatternScrubber, Scrubber
+from aox_agent_core.storage import Database, Dialect, Session
+
+AUDIT_TABLE: Final = "agent_core_audit"
+UPDATE_TRIGGER: Final = "agent_core_audit_no_update"
+DELETE_TRIGGER: Final = "agent_core_audit_no_delete"
+UPDATE_DELETE_TRIGGER: Final = "agent_core_audit_no_update_delete"
+TRUNCATE_TRIGGER: Final = "agent_core_audit_no_truncate"
+
+# pg_advisory_xact_lock key that serializes appends: ASCII "agentcor" as an int64.
+APPEND_LOCK_KEY: Final = 0x6167656E74636F72
+
+READ_BATCH_SIZE = 500
+
+COLUMNS = (
+    "seq, schema_version, event_id, occurred_at, action, actor_id, subject_id, payload, "
+    "prev_hash, record_hash"
+)
+
+_TABLE_DDL = f"""
+CREATE TABLE {AUDIT_TABLE} (
+    seq BIGINT PRIMARY KEY,
+    schema_version INTEGER NOT NULL,
+    event_id TEXT NOT NULL UNIQUE,
+    occurred_at TEXT NOT NULL,
+    action TEXT NOT NULL,
+    actor_id TEXT NOT NULL,
+    subject_id TEXT,
+    payload TEXT NOT NULL,
+    prev_hash TEXT NOT NULL,
+    record_hash TEXT NOT NULL
+)"""
+
+SQLITE_SCHEMA: Final = (
+    _TABLE_DDL,
+    f"""CREATE TRIGGER {UPDATE_TRIGGER} BEFORE UPDATE ON {AUDIT_TABLE}
+    BEGIN SELECT RAISE(ABORT, '{AUDIT_TABLE} is append-only'); END""",
+    f"""CREATE TRIGGER {DELETE_TRIGGER} BEFORE DELETE ON {AUDIT_TABLE}
+    BEGIN SELECT RAISE(ABORT, '{AUDIT_TABLE} is append-only'); END""",
+)
+
+POSTGRES_SCHEMA: Final = (
+    _TABLE_DDL,
+    f"""CREATE FUNCTION {AUDIT_TABLE}_refuse_change() RETURNS trigger LANGUAGE plpgsql AS $$
+    BEGIN RAISE EXCEPTION '{AUDIT_TABLE} is append-only'; END $$""",
+    f"""CREATE TRIGGER {UPDATE_DELETE_TRIGGER} BEFORE UPDATE OR DELETE ON {AUDIT_TABLE}
+    FOR EACH ROW EXECUTE FUNCTION {AUDIT_TABLE}_refuse_change()""",
+    f"""CREATE TRIGGER {TRUNCATE_TRIGGER} BEFORE TRUNCATE ON {AUDIT_TABLE}
+    FOR EACH STATEMENT EXECUTE FUNCTION {AUDIT_TABLE}_refuse_change()""",
+    f"REVOKE ALL ON {AUDIT_TABLE} FROM PUBLIC",
+)
+
+
+def postgres_grants(app_role: str) -> tuple[str, ...]:
+    """The app role may read and append, nothing else."""
+    return (f'GRANT SELECT, INSERT ON {AUDIT_TABLE} TO "{app_role}"',)
+
+
+class SQLAuditLog:
+    """The AuditLog protocol on a Database.
+
+    On SQLite the log creates its table and triggers on first write. On Postgres
+    they are installed by the owner role (storage.install_postgres_schema), and
+    the first write checks that the connecting role is not a superuser, does not
+    own the table, and cannot UPDATE, DELETE or TRUNCATE it; otherwise it raises
+    ConfigError and writes nothing.
+    """
+
+    def __init__(self, database: Database, *, scrubber: Scrubber | None = None) -> None:
+        self.database = database
+        self._scrubber = scrubber if scrubber is not None else PatternScrubber()
+        self._protections_checked = False
+
+    async def append(self, event: AuditEvent) -> AuditRecord:
+        checked = self.checked_event(event)
+        return await self.database.run(lambda session: self.append_in(session, checked), write=True)
+
+    def checked_event(self, event: AuditEvent) -> AuditEvent:
+        """Re-validate an event and scan its payload strings for secrets."""
+        try:
+            revalidated = AuditEvent.model_validate(event.model_dump())
+        except ValidationError as error:
+            raise AuditPayloadRejectedError(
+                "The event was changed after it was built and is no longer valid."
+            ) from error
+        findings = self._scrubber.find_secrets(revalidated.payload)
+        if findings:
+            located = ", ".join(f"{finding.rule} at {finding.path}" for finding in findings)
+            raise AuditPayloadRejectedError(f"The audit payload contains {located}.")
+        return revalidated
+
+    def append_in(self, session: Session, event: AuditEvent) -> AuditRecord:
+        """Append within a write transaction on this log's database.
+
+        For callers that must write their own change and its audit event together.
+        The event must already have passed checked_event().
+        """
+        self._ensure_protected(session)
+        if session.dialect is Dialect.POSTGRES:
+            session.execute("SELECT pg_advisory_xact_lock(?)", (APPEND_LOCK_KEY,))
+        head = _head_in(session)
+        unsealed = UnsealedAuditRecord(
+            seq=head.seq + 1,
+            event_id=uuid4(),
+            occurred_at=datetime.now(UTC),
+            action=event.action,
+            actor_id=event.actor_id,
+            subject_id=event.subject_id,
+            payload=event.payload,
+            prev_hash=head.record_hash,
+        )
+        record = AuditRecord(**unsealed.model_dump(), record_hash=compute_record_hash(unsealed))
+        session.execute(
+            f"INSERT INTO {AUDIT_TABLE} ({COLUMNS}) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            _row_values(record),
+        )
+        return record
+
+    async def iter_records(self, *, after_seq: int = 0) -> AsyncIterator[AuditRecord]:
+        last_seq = after_seq
+        while True:
+            batch = partial(_rows_after, after_seq=last_seq, limit=READ_BATCH_SIZE)
+            rows = await self.database.run(batch)
+            for row in rows:
+                record = record_from_row(row)
+                last_seq = record.seq
+                yield record
+            if len(rows) < READ_BATCH_SIZE:
+                return
+
+    async def head(self) -> AuditHead:
+        return await self.database.run(_head_in)
+
+    async def verify(self, *, expected_head: AuditHead | None = None) -> AuditHead:
+        """Walk the whole chain, check every hash and seq, and return the head.
+
+        The chain alone proves nothing: anyone who can rewrite rows can also rebuild
+        every hash after them. Only a head kept somewhere else, passed here as
+        expected_head, shows the log has not been rewritten or cut short since that
+        head was taken. Raises AuditIntegrityError on any mismatch.
+        """
+        rows = await self.database.run(partial(_rows_after, after_seq=0, limit=None))
+        head = AuditHead(seq=0, record_hash=GENESIS_HASH)
+        anchored_hash = (
+            GENESIS_HASH if expected_head is not None and expected_head.seq == 0 else None
+        )
+        for row in rows:
+            record = record_from_row(row)
+            if record.seq != head.seq + 1:
+                raise AuditIntegrityError(
+                    f"Record {head.seq + 1} is missing: the next record is {record.seq}."
+                )
+            if record.prev_hash != head.record_hash:
+                raise AuditIntegrityError(
+                    f"Record {record.seq} does not link to record {head.seq}."
+                )
+            if compute_record_hash(record) != record.record_hash:
+                raise AuditIntegrityError(f"Record {record.seq} was altered after it was written.")
+            head = AuditHead(seq=record.seq, record_hash=record.record_hash)
+            if expected_head is not None and record.seq == expected_head.seq:
+                anchored_hash = record.record_hash
+
+        if expected_head is not None:
+            _check_anchor(head, expected_head, anchored_hash)
+        return head
+
+    def _ensure_protected(self, session: Session) -> None:
+        if self._protections_checked:
+            return
+        if session.dialect is Dialect.SQLITE:
+            _ensure_sqlite_schema(session)
+        else:
+            _check_postgres_role(session)
+            _require_triggers(
+                session, _postgres_triggers(session), {UPDATE_DELETE_TRIGGER, TRUNCATE_TRIGGER}
+            )
+        self._protections_checked = True
+
+
+def _check_anchor(head: AuditHead, expected: AuditHead, anchored_hash: str | None) -> None:
+    if expected.seq > head.seq:
+        raise AuditIntegrityError(
+            f"The log ends at record {head.seq}, but the anchor was taken at record "
+            f"{expected.seq}: records were removed from the end."
+        )
+    if anchored_hash != expected.record_hash:
+        raise AuditIntegrityError(
+            f"Record {expected.seq} no longer matches the anchor: the log was rewritten."
+        )
+
+
+def _ensure_sqlite_schema(session: Session) -> None:
+    """Create the table and triggers in a new database; refuse a table that lost them."""
+    if not _sqlite_table_exists(session):
+        for statement in SQLITE_SCHEMA:
+            session.execute(statement)
+        return
+    triggers = {
+        row[0]
+        for row in session.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'trigger' AND tbl_name = ?",
+            (AUDIT_TABLE,),
+        )
+    }
+    _require_triggers(session, triggers, {UPDATE_TRIGGER, DELETE_TRIGGER})
+
+
+def _require_triggers(session: Session, present: set[str], required: set[str]) -> None:
+    missing = sorted(required - present)
+    if missing:
+        raise AuditIntegrityError(
+            f"The audit table's protecting triggers are missing ({', '.join(missing)}), so "
+            "nothing more is written. Run verify to check the existing records, then "
+            "restore the triggers deliberately."
+        )
+
+
+def _check_postgres_role(session: Session) -> None:
+    rows = session.execute(
+        "SELECT r.rolsuper, t.tableowner = current_user, "
+        "has_table_privilege(current_user, ?, 'UPDATE'), "
+        "has_table_privilege(current_user, ?, 'DELETE'), "
+        "has_table_privilege(current_user, ?, 'TRUNCATE') "
+        "FROM pg_roles r, pg_tables t "
+        "WHERE r.rolname = current_user AND t.tablename = ?",
+        (AUDIT_TABLE, AUDIT_TABLE, AUDIT_TABLE, AUDIT_TABLE),
+    )
+    if not rows:
+        raise ConfigError(
+            f"Table {AUDIT_TABLE} does not exist; install it with "
+            "storage.install_postgres_schema as the owner role."
+        )
+    is_superuser, owns_table, *can_change = rows[0]
+    if is_superuser or owns_table or any(can_change):
+        raise ConfigError(
+            "The audit log's database role may only INSERT and SELECT on "
+            f"{AUDIT_TABLE}; this role is a superuser, owns the table, or can update, "
+            "delete or truncate it. Connect as the application role."
+        )
+
+
+def _postgres_triggers(session: Session) -> set[str]:
+    return {
+        row[0]
+        for row in session.execute(
+            "SELECT tgname FROM pg_trigger "
+            "WHERE tgrelid = to_regclass(?) AND NOT tgisinternal AND tgenabled <> 'D'",
+            (AUDIT_TABLE,),
+        )
+    }
+
+
+def _sqlite_table_exists(session: Session) -> bool:
+    return bool(
+        session.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?", (AUDIT_TABLE,)
+        )
+    )
+
+
+def _table_is_readable(session: Session) -> bool:
+    if session.dialect is Dialect.SQLITE:
+        return _sqlite_table_exists(session)
+    return bool(session.execute("SELECT to_regclass(?) IS NOT NULL", (AUDIT_TABLE,))[0][0])
+
+
+def _head_in(session: Session) -> AuditHead:
+    if not _table_is_readable(session):
+        return AuditHead(seq=0, record_hash=GENESIS_HASH)
+    rows = session.execute(f"SELECT seq, record_hash FROM {AUDIT_TABLE} ORDER BY seq DESC LIMIT 1")
+    if not rows:
+        return AuditHead(seq=0, record_hash=GENESIS_HASH)
+    seq, record_hash = rows[0]
+    return AuditHead(seq=seq, record_hash=record_hash)
+
+
+def _rows_after(session: Session, after_seq: int, limit: int | None) -> list[tuple[Any, ...]]:
+    if not _table_is_readable(session):
+        return []
+    limit_clause = f" LIMIT {int(limit)}" if limit is not None else ""
+    return session.execute(
+        f"SELECT {COLUMNS} FROM {AUDIT_TABLE} WHERE seq > ? ORDER BY seq{limit_clause}",
+        (after_seq,),
+    )
+
+
+def _row_values(record: AuditRecord) -> tuple[Any, ...]:
+    return (
+        record.seq,
+        record.schema_version,
+        str(record.event_id),
+        canonical_timestamp(record.occurred_at),
+        record.action,
+        record.actor_id,
+        record.subject_id,
+        canonical_json(record.payload).decode("utf-8"),
+        record.prev_hash,
+        record.record_hash,
+    )
+
+
+def record_from_row(row: tuple[Any, ...]) -> AuditRecord:
+    seq, schema_version, event_id, occurred_at, action, actor_id, subject_id = row[:7]
+    payload, prev_hash, record_hash = row[7:]
+    try:
+        return AuditRecord(
+            seq=seq,
+            schema_version=schema_version,
+            event_id=UUID(event_id),
+            occurred_at=datetime.fromisoformat(occurred_at),
+            action=action,
+            actor_id=actor_id,
+            subject_id=subject_id,
+            payload=json.loads(payload),
+            prev_hash=prev_hash,
+            record_hash=record_hash,
+        )
+    except (ValueError, TypeError, ValidationError) as error:
+        raise AuditIntegrityError(f"Record {seq} is malformed and cannot be checked.") from error

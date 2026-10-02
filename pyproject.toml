@@ -51,6 +51,7 @@ dev = [
     "opentelemetry-sdk>=1.30,<2",
     "packaging>=24",
     "pytest>=9.1",
+    "psycopg[binary]>=3.2,<4",
     "pytest-asyncio>=1.0",
     "ruff>=0.16.10",
 ]
@@ -92,7 +93,11 @@ select = [
 ]
 
 [tool.ruff.lint.per-file-ignores]
-"tests/**" = ["ASYNC240", "S101", "S603"]
+"tests/**" = ["ASYNC240", "S101", "S603", "S608"]
+# Table and column names in these modules are module constants; every value is
+# passed as a bound parameter.
+"src/aox_agent_core/audit/sql.py" = ["S608"]
+"src/aox_agent_core/approvals/sql.py" = ["S608"]
 
 [tool.ruff.lint.flake8-tidy-imports]
 ban-relative-imports = "all"

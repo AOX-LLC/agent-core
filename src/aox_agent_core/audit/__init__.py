@@ -2,6 +2,7 @@
 
 from aox_agent_core.audit.chain import compute_record_hash
 from aox_agent_core.audit.log import AuditLog
+from aox_agent_core.audit.sql import SQLAuditLog
 from aox_agent_core.audit.types import (
     AUDIT_SCHEMA_VERSION,
     FORBIDDEN_KEY_SUFFIXES,
@@ -22,6 +23,7 @@ __all__ = [
     "AuditHead",
     "AuditLog",
     "AuditRecord",
+    "SQLAuditLog",
     "UnsealedAuditRecord",
     "compute_record_hash",
 ]

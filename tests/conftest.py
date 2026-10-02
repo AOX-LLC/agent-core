@@ -1,6 +1,8 @@
 """Every test runs offline and ignores the developer's environment."""
 
 import socket
+from collections.abc import Iterator
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -8,6 +10,8 @@ from opentelemetry import trace
 from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import SimpleSpanProcessor
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
+
+from databases import ControlDatabase, postgres_database, sqlite_database
 
 AMBIENT_VARIABLES = (
     "AGENT_CORE_ANTHROPIC_API_KEY",
@@ -81,3 +85,13 @@ def spans(_session_span_exporter: InMemorySpanExporter) -> InMemorySpanExporter:
     """Finished spans from this test only."""
     _session_span_exporter.clear()
     return _session_span_exporter
+
+
+@pytest.fixture(params=["sqlite", "postgres"])
+def control_database(request: pytest.FixtureRequest, tmp_path: Path) -> Iterator[ControlDatabase]:
+    """The audit and approval tests run against both backends."""
+    if request.param == "sqlite":
+        yield sqlite_database(tmp_path)
+    else:
+        with postgres_database() as database:
+            yield database

@@ -1,6 +1,14 @@
 """Hashing records into a chain."""
 
+from datetime import UTC, datetime
+
+from aox_agent_core._canonical import sha256_of
 from aox_agent_core.audit.types import UnsealedAuditRecord
+
+
+def canonical_timestamp(moment: datetime) -> str:
+    """UTC ISO 8601 with exactly six fractional digits, as hashed and stored."""
+    return moment.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
 
 
 def compute_record_hash(record: UnsealedAuditRecord) -> str:
@@ -12,4 +20,16 @@ def compute_record_hash(record: UnsealedAuditRecord) -> str:
     Changing any of that breaks verification of existing logs, so it changes only
     with a new schema_version.
     """
-    raise NotImplementedError("compute_record_hash is not implemented yet.")
+    return sha256_of(
+        {
+            "schema_version": record.schema_version,
+            "seq": record.seq,
+            "event_id": str(record.event_id),
+            "occurred_at": canonical_timestamp(record.occurred_at),
+            "action": record.action,
+            "actor_id": record.actor_id,
+            "subject_id": record.subject_id,
+            "payload": record.payload,
+            "prev_hash": record.prev_hash,
+        }
+    )

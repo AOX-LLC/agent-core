@@ -81,6 +81,7 @@ EXPECTED_EXPORTS = {
         "AuditHead",
         "AuditLog",
         "AuditRecord",
+        "SQLAuditLog",
         "UnsealedAuditRecord",
         "compute_record_hash",
     ],
@@ -99,6 +100,15 @@ EXPECTED_EXPORTS = {
         "write_scorecard_json",
     ],
     "aox_agent_core.testing": ["cassette_client"],
+    "aox_agent_core.storage": [
+        "Database",
+        "Dialect",
+        "PostgresDatabase",
+        "SQLiteDatabase",
+        "Session",
+        "install_postgres_schema",
+        "open_database",
+    ],
 }
 
 
