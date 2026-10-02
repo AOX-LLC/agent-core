@@ -109,10 +109,12 @@ class RoutingConfig(FrozenModel):
     tasks maps a task name such as "extraction" to a tier, so callers can pass
     task="extraction" instead of naming a tier.
 
-    When a call's estimated cost is over budget_usd_per_call, on_budget_exceeded
-    decides what happens: RAISE raises BudgetExceededError; DROP_ONE_TIER retries
-    the estimate one tier lower and raises only if that is still over budget or
-    there is no lower tier.
+    budget_usd_per_call caps the worst-case spend of a whole call, retries and
+    escalation included. When the first attempt's estimate is over budget,
+    on_budget_exceeded decides what happens: RAISE raises BudgetExceededError;
+    DROP_ONE_TIER retries the estimate one tier lower and raises only if that is
+    still over budget or there is no lower tier. A retry or escalation that could
+    take the total over budget raises BudgetExceededError instead of being sent.
     """
 
     tiers: Mapping[Tier, TierConfig]

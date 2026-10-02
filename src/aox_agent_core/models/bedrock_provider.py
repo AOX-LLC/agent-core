@@ -1,5 +1,6 @@
 """The Amazon Bedrock provider interface. Not implemented in this release."""
 
+from aox_agent_core.errors import ProviderRequestError
 from aox_agent_core.models.types import ProviderRequest, ProviderResponse
 
 
@@ -15,7 +16,7 @@ class BedrockProvider:
         self._region = region
 
     async def complete(self, request: ProviderRequest) -> ProviderResponse:
-        raise NotImplementedError(
+        raise ProviderRequestError(
             "The Bedrock provider is not implemented yet; route this tier to provider "
             "'anthropic' or use replay mode."
         )

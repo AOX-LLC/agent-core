@@ -11,7 +11,7 @@ import anthropic
 from opentelemetry.trace import Span, Status, StatusCode
 from pydantic import BaseModel, SecretStr, ValidationError
 
-from aox_agent_core.config import AgentCoreConfig, Mode, Provider, Tier, load_config
+from aox_agent_core.config import AgentCoreConfig, Mode, ModelPrice, Provider, Tier, load_config
 from aox_agent_core.credentials import resolve_api_key
 from aox_agent_core.errors import (
     BudgetExceededError,
@@ -20,7 +20,7 @@ from aox_agent_core.errors import (
     StructuredOutputError,
 )
 from aox_agent_core.models.live import LiveProviders
-from aox_agent_core.models.pricing import cost_of, estimate_input_tokens
+from aox_agent_core.models.pricing import cost_of, estimate_input_tokens, worst_case_cost
 from aox_agent_core.models.provider import ModelProvider, close_provider
 from aox_agent_core.models.router import ConfigRouter, RouteDecision, Router, RouteRequest
 from aox_agent_core.models.types import (
@@ -41,6 +41,7 @@ OutputModelT = TypeVar("OutputModelT", bound=BaseModel)
 Prompt = str | Sequence[Message]
 
 REFUSAL_STOP_REASON = "refusal"
+MAX_TOKENS_STOP_REASON = "max_tokens"
 GEN_AI_PROVIDER_NAMES = {Provider.ANTHROPIC: "anthropic", Provider.BEDROCK: "aws.bedrock"}
 
 
@@ -76,6 +77,7 @@ class AgentClient:
         self._config = config if config is not None else load_config()
         self._api_key = resolve_api_key(api_key) if api_key is not None else None
         self._router = router if router is not None else ConfigRouter(self._config)
+        self._live_key: SecretStr | None = None
         self._provider = provider if provider is not None else self._provider_for_mode()
         self._runner: asyncio.Runner | None = None
         self._close_loop_on_collect: weakref.finalize[[], AgentClient] | None = None
@@ -148,6 +150,7 @@ class AgentClient:
             system=system,
             output=output,
             max_attempts=max_attempts,
+            task=task,
         )
 
         # The span records failures itself, by class name only: an error message
@@ -159,7 +162,7 @@ class AgentClient:
             try:
                 value, final_decision, response = await call.run(decision, route_request)
             except Exception as error:
-                call.annotate(span, decision)
+                call.annotate(span, call.current_decision or decision)
                 span.set_attribute("error.type", type(error).__name__)
                 span.set_status(Status(StatusCode.ERROR, type(error).__name__))
                 raise
@@ -280,6 +283,7 @@ class AgentClient:
             return ReplayProvider(self._cassette_store(), self._config.replay.cassette)
 
         api_key = self._api_key if self._api_key is not None else resolve_api_key()
+        self._live_key = api_key
         live = LiveProviders(self._config, api_key=api_key)
         if self._config.mode is Mode.LIVE:
             return live
@@ -302,7 +306,10 @@ class AgentClient:
     ) -> None:
         if not self._config.tracing.capture_content:
             return
-        scrubber = PatternScrubber(extra_patterns=self._config.replay.extra_secret_patterns)
+        scrubber = PatternScrubber(
+            extra_patterns=self._config.replay.extra_secret_patterns,
+            known_secrets=tuple(key for key in (self._live_key, self._api_key) if key is not None),
+        )
         prompt = "\n\n".join(message.content for message in messages)
         span.add_event("gen_ai.content.prompt", {"text": str(scrubber.redact(prompt))})
         span.add_event("gen_ai.content.completion", {"text": str(scrubber.redact(response.text))})
@@ -329,10 +336,12 @@ class _CallInProgress:
         system: str | None,
         output: type[BaseModel] | None,
         max_attempts: int,
+        task: str | None,
     ) -> None:
         self._config = config
         self._provider = provider
         self._router = router
+        self._task = task
         self._messages = messages
         self._system = system
         self._output = output
@@ -341,6 +350,7 @@ class _CallInProgress:
         self.usage = Usage(input_tokens=0, output_tokens=0)
         self.cost_usd = Decimal(0)
         self.attempts = 0
+        self.current_decision: RouteDecision | None = None
 
     async def run(
         self, decision: RouteDecision, route_request: RouteRequest
@@ -360,12 +370,19 @@ class _CallInProgress:
             return value, escalated, response
 
     async def _attempt_tier(self, decision: RouteDecision) -> tuple[Any, ProviderResponse]:
+        self.current_decision = decision
         conversation = list(self._messages)
         failures: list[str] = []
         for _ in range(self._max_attempts):
             response = await self._send(decision, conversation)
             if self._output is None:
                 return response.text, response
+            if response.stop_reason == MAX_TOKENS_STOP_REASON:
+                # Retrying with the same limit would be cut off again.
+                raise self._structured_error(
+                    decision,
+                    [*failures, f"output cut off at max_tokens={decision.max_tokens}"],
+                )
             try:
                 return self._output.model_validate_json(response.text), response
             except ValidationError as error:
@@ -385,6 +402,8 @@ class _CallInProgress:
 
     async def _send(self, decision: RouteDecision, conversation: list[Message]) -> ProviderResponse:
         config = self._config
+        # Priced before sending, so a misconfigured route fails before it costs anything.
+        price = config.price_for(decision.provider, decision.model)
         request = ProviderRequest(
             provider=decision.provider,
             model=decision.model,
@@ -394,17 +413,35 @@ class _CallInProgress:
             effort=config.routing.tiers[decision.tier].effort,
             output_schema=self._output_schema,
         )
+        self._refuse_over_budget(request, price)
         response = await self._provider.complete(request)
 
         self.attempts += 1
         self.usage = _add_usage(self.usage, response.usage)
-        price = config.price_for(decision.provider, decision.model)
         self.cost_usd += cost_of(response.usage, price)
         if response.stop_reason == REFUSAL_STOP_REASON:
             raise ModelRefusalError(
                 f"The model declined the request on tier {decision.tier.value} ({decision.model})."
             )
         return response
+
+    def _refuse_over_budget(self, request: ProviderRequest, price: ModelPrice) -> None:
+        """Raise BudgetExceededError if this attempt could take the call over its budget.
+
+        The budget covers the whole call: every retry and an escalation included.
+        """
+        budget = self._config.routing.budget_usd_per_call
+        if budget is None:
+            return
+        input_tokens = estimate_input_tokens(
+            request.system, *(message.content for message in request.messages)
+        )
+        worst_case = worst_case_cost(input_tokens, request.max_tokens, price)
+        if self.cost_usd + worst_case > budget:
+            raise BudgetExceededError(
+                f"Attempt {self.attempts + 1} could cost up to ${worst_case}; with "
+                f"${self.cost_usd} already spent that is over the per-call budget ${budget}."
+            )
 
     def _escalation(
         self, decision: RouteDecision, route_request: RouteRequest
@@ -461,6 +498,8 @@ class _CallInProgress:
                 attributes.AGENT_CORE_STRUCTURED_ATTEMPTS: self.attempts,
             }
         )
+        if self._task is not None:
+            span.set_attribute(attributes.AGENT_CORE_TASK, self._task)
         if response is not None:
             span.set_attribute(attributes.GEN_AI_RESPONSE_MODEL, response.model)
             span.set_attribute(attributes.GEN_AI_RESPONSE_FINISH_REASONS, [response.stop_reason])

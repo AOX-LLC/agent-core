@@ -7,7 +7,12 @@ from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanE
 from pydantic import BaseModel
 
 from aox_agent_core import AgentClient, Mode, Role, Tier
-from aox_agent_core.errors import ModelRefusalError, ReplayMissError, StructuredOutputError
+from aox_agent_core.errors import (
+    BudgetExceededError,
+    ModelRefusalError,
+    ReplayMissError,
+    StructuredOutputError,
+)
 from aox_agent_core.replay import DirectoryCassetteStore, PatternScrubber, RecordingProvider
 from aox_agent_core.tracing import attributes
 from support import ScriptedProvider, make_config, response
@@ -200,3 +205,81 @@ def test_replay_mode_serves_a_recorded_cassette(tmp_path: Path) -> None:
         assert replayed.output == Triage(queue="billing", urgent=True)
         with pytest.raises(ReplayMissError):
             replayer.call_sync("something never recorded")
+
+
+def budgeted(provider: ScriptedProvider, budget: str, **routing: Any) -> AgentClient:
+    config = make_config(routing={"budget_usd_per_call": budget, **routing})
+    return AgentClient(config, provider=provider)
+
+
+async def test_budget_covers_retries() -> None:
+    # Small tier: worst case per attempt is 10,000 output tokens x $5/M = $0.05.
+    expensive_failure = response(INVALID, input_tokens=100, output_tokens=5_000)
+    provider = ScriptedProvider(expensive_failure, response(VALID))
+
+    with pytest.raises(BudgetExceededError, match="Attempt 2 could cost"):
+        await budgeted(provider, "0.06").call(
+            "t", output=Triage, tier=Tier.SMALL, max_tokens=10_000
+        )
+
+    assert len(provider.requests) == 1
+
+
+async def test_budget_covers_escalation() -> None:
+    # Two small attempts spend $0.0004. The mid tier's worst case, $0.100002, fits
+    # the budget alone but not on top of what was already spent.
+    provider = ScriptedProvider(response(INVALID), response(INVALID), response(VALID))
+    escalating = budgeted(provider, "0.1003", escalate_on_structured_failure=True)
+
+    with pytest.raises(BudgetExceededError):
+        await escalating.call("t", output=Triage, tier=Tier.SMALL, max_tokens=10_000)
+
+    assert len(provider.requests) == 2
+
+
+async def test_truncated_structured_output_is_not_retried() -> None:
+    provider = ScriptedProvider(response('{"queue": "bil', stop_reason="max_tokens"))
+
+    with pytest.raises(StructuredOutputError, match="after 1 attempts") as caught:
+        await client(provider).call("t", output=Triage, max_tokens=5)
+
+    assert caught.value.attempts == ("output cut off at max_tokens=5",)
+    assert len(provider.requests) == 1
+
+
+async def test_failed_escalated_call_reports_the_escalated_tier(
+    spans: InMemorySpanExporter,
+) -> None:
+    provider = ScriptedProvider(
+        response(INVALID), response(INVALID), response("", stop_reason="refusal")
+    )
+    escalating = AgentClient(
+        make_config(routing={"escalate_on_structured_failure": True}), provider=provider
+    )
+
+    with pytest.raises(ModelRefusalError):
+        await escalating.call("t", output=Triage, tier=Tier.SMALL)
+
+    (span,) = spans.get_finished_spans()
+    assert dict(span.attributes or {})[attributes.AGENT_CORE_TIER] == "mid"
+
+
+async def test_task_is_recorded_on_the_span(spans: InMemorySpanExporter) -> None:
+    await client(ScriptedProvider(response("ok"))).call("t", task="extraction")
+
+    (span,) = spans.get_finished_spans()
+    assert dict(span.attributes or {})[attributes.AGENT_CORE_TASK] == "extraction"
+
+
+async def test_captured_content_never_shows_the_live_key(spans: InMemorySpanExporter) -> None:
+    live_key = "plain-live-key-for-this-test"
+    capturing = AgentClient(
+        make_config(tracing={"capture_content": True}),
+        api_key=live_key,
+        provider=ScriptedProvider(response(f"echo {live_key}")),
+    )
+
+    await capturing.call(f"my key is {live_key}")
+
+    (span,) = spans.get_finished_spans()
+    assert live_key not in str(span.to_json())
