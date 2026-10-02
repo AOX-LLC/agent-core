@@ -195,22 +195,37 @@ class SQLApprovalQueue:
     ) -> Sequence[ApprovalRequest]:
         """Up to `limit` pending, unexpired requests this principal may resolve, oldest first.
 
-        The database narrows by status, expiry, role and requester; the policy then
-        has the final say on each request.
+        The policy decides each request. With the default RoleApproverPolicy the
+        database also narrows by role and requester, which keeps a large queue
+        cheap; with any other policy the queue is read page by page until `limit`
+        requests pass or none are left, so a custom policy sees every candidate.
         """
         if limit < 1:
             raise ValueError(f"limit must be at least 1, got {limit}")
-        if principal.kind is not PrincipalKind.HUMAN or not principal.roles:
+        uses_default_policy = type(self._policy) is RoleApproverPolicy
+        if uses_default_policy and (
+            principal.kind is not PrincipalKind.HUMAN or not principal.roles
+        ):
             return []
         now = self._now()
-        pending = await self.database.run(
-            partial(_load_pending, principal=principal, now=now, limit=limit)
-        )
-        return [
-            request
-            for request in pending
-            if self._policy.evaluate(principal, request, now=now).allowed
-        ]
+        narrowed_to = principal if uses_default_policy else None
+        eligible: list[ApprovalRequest] = []
+        after: ApprovalRequest | None = None
+        while len(eligible) < limit:
+            page = await self.database.run(
+                partial(
+                    _load_pending_page, now=now, after=after, narrowed_to=narrowed_to, limit=limit
+                )
+            )
+            eligible += [
+                request
+                for request in page
+                if self._policy.evaluate(principal, request, now=now).allowed
+            ]
+            if len(page) < limit:
+                break
+            after = page[-1]
+        return eligible[:limit]
 
     async def resolve(
         self,
@@ -469,25 +484,37 @@ def _load(session: Session, request_id: UUID) -> ApprovalRequest | None:
     return _request_from_row(rows[0]) if rows else None
 
 
-def _load_pending(
-    session: Session, *, principal: Principal, now: datetime, limit: int
+def _load_pending_page(
+    session: Session,
+    *,
+    now: datetime,
+    after: ApprovalRequest | None,
+    narrowed_to: Principal | None,
+    limit: int,
 ) -> list[ApprovalRequest]:
+    """One page of pending, unexpired requests after `after`, in (created_at, id) order.
+
+    With `narrowed_to`, only requests that principal could resolve under the
+    default policy: a role it holds, and not its own.
+    """
     if not _table_exists(session):
         return []
-    roles = sorted(principal.roles)
-    role_placeholders = ", ".join("?" for _ in roles)
     # Canonical timestamps are fixed-width UTC strings, so they compare as text.
+    conditions = ["status = ?", "expires_at > ?"]
+    parameters: list[Any] = [ApprovalStatus.PENDING.value, canonical_timestamp(now)]
+    if after is not None:
+        conditions.append("(created_at > ? OR (created_at = ? AND id > ?))")
+        created_at = canonical_timestamp(after.created_at)
+        parameters += [created_at, created_at, str(after.id)]
+    if narrowed_to is not None:
+        roles = sorted(narrowed_to.roles)
+        conditions.append(f"required_role IN ({', '.join('?' for _ in roles)})")
+        conditions.append("requested_by <> ?")
+        parameters += [*roles, narrowed_to.id]
     rows = session.execute(
-        f"SELECT {_COLUMNS} FROM {APPROVALS_TABLE} "
-        f"WHERE status = ? AND expires_at > ? AND required_role IN ({role_placeholders}) "
-        "AND requested_by <> ? ORDER BY created_at LIMIT ?",
-        (
-            ApprovalStatus.PENDING.value,
-            canonical_timestamp(now),
-            *roles,
-            principal.id,
-            limit,
-        ),
+        f"SELECT {_COLUMNS} FROM {APPROVALS_TABLE} WHERE {' AND '.join(conditions)} "
+        "ORDER BY created_at, id LIMIT ?",
+        (*parameters, limit),
     )
     return [_request_from_row(row) for row in rows]
 

@@ -396,3 +396,61 @@ async def test_naive_clock_is_refused(control_database: ControlDatabase) -> None
 
     with pytest.raises(ValueError, match="timezone-aware"):
         await submitted(queue)
+
+
+async def test_list_pending_follows_a_custom_policy(control_database: ControlDatabase) -> None:
+    class AdminsApproveAnything:
+        def evaluate(
+            self, principal: Principal, request: ApprovalRequest, *, now: datetime
+        ) -> ResolveVerdict:
+            if "admin" in principal.roles:
+                return ResolveVerdict(allowed=True)
+            return ResolveVerdict(allowed=False, reason=DenialReason.MISSING_ROLE)
+
+    admin = Principal(id="user-1", kind=PrincipalKind.HUMAN, roles=frozenset({"admin"}))
+    log = SQLAuditLog(control_database.database)
+    queue = SQLApprovalQueue(
+        control_database.database, audit_log=log, policy=AdminsApproveAnything(), clock=Clock()
+    )
+    request = await submitted(queue)
+
+    assert [pending.id for pending in await queue.list_pending(admin)] == [request.id]
+
+
+async def test_list_pending_pages_past_requests_a_strict_policy_rejects(
+    control_database: ControlDatabase,
+) -> None:
+    class OnlyTheNewest(RoleApproverPolicy):
+        newest: UUID | None = None
+
+        def evaluate(
+            self, principal: Principal, request: ApprovalRequest, *, now: datetime
+        ) -> ResolveVerdict:
+            if request.id != self.newest:
+                return ResolveVerdict(allowed=False, reason=DenialReason.MISSING_ROLE)
+            return super().evaluate(principal, request, now=now)
+
+    policy = OnlyTheNewest()
+    clock = Clock()
+    queue = SQLApprovalQueue(
+        control_database.database,
+        audit_log=SQLAuditLog(control_database.database),
+        policy=policy,
+        clock=clock,
+    )
+    for minute in range(5):
+        clock.now = NOW + timedelta(minutes=minute)
+        newest = await submitted(queue)
+    policy.newest = newest.id
+
+    assert [pending.id for pending in await queue.list_pending(APPROVER, limit=2)] == [newest.id]
+
+
+def test_postgres_urls_differing_in_user_or_options_are_different_databases() -> None:
+    base = "postgresql://agent_core_app@127.0.0.1:4202/audit"
+    same = open_database(base)
+
+    assert open_database(base).same_database(same)
+    assert not open_database(base.replace("agent_core_app", "other")).same_database(same)
+    assert not open_database(f"{base}?options=-c%20search_path%3Dother").same_database(same)
+    assert open_database(base.replace("app@", "app:secret@")).same_database(same)

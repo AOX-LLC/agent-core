@@ -175,3 +175,13 @@ def test_audit_verify_warns_about_a_password_in_the_url(
     assert exit_code == 2  # nothing listens on port 9: reported, not a traceback
     assert "includes a password" in errors
     assert "OperationalError" in errors
+
+
+def test_audit_verify_refuses_a_missing_sqlite_file(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    missing = tmp_path / "typo" / "audit.sqlite3"
+
+    assert main(["audit", "verify", f"sqlite:///{missing}"]) == 2
+    assert "no audit database" in capsys.readouterr().err
+    assert not missing.parent.exists()

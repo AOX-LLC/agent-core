@@ -18,7 +18,7 @@ from aox_agent_core.errors import AgentCoreError, AuditIntegrityError, CassetteF
 from aox_agent_core.replay.cassette import Cassette, request_hash
 from aox_agent_core.replay.scrub import PatternScrubber
 from aox_agent_core.replay.store import parse_cassette, recorded_content
-from aox_agent_core.storage import driver_errors, open_database
+from aox_agent_core.storage import SQLiteDatabase, driver_errors, open_database
 
 REDACTION_MARKER = "[REDACTED:"
 
@@ -99,10 +99,15 @@ def _verify_audit(url: str | None, anchor_seq: int | None, anchor_hash: str | No
     reportable_errors: tuple[type[Exception], ...] = (
         AgentCoreError,
         ValidationError,
+        OSError,
         *driver_errors(),
     )
     try:
-        log = SQLAuditLog(open_database(database_url))
+        database = open_database(database_url)
+        if isinstance(database, SQLiteDatabase) and not database.path.is_file():
+            print(f"error: no audit database at {database.path}", file=sys.stderr)
+            return 2
+        log = SQLAuditLog(database)
         anchor = (
             AuditHead(seq=anchor_seq, record_hash=anchor_hash)
             if anchor_seq is not None and anchor_hash is not None

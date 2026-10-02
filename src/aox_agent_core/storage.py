@@ -27,7 +27,6 @@ from aox_agent_core.errors import ConfigError
 ResultT = TypeVar("ResultT")
 
 SQLITE_BUSY_TIMEOUT_SECONDS = 30.0
-POSTGRES_DEFAULT_PORT = 5432
 POSTGRES_ROLE_NAME = re.compile(r"[a-z_][a-z0-9_]{0,62}")
 
 
@@ -101,7 +100,7 @@ class Database(ABC):
 
 
 class SQLiteDatabase(Database):
-    """A SQLite file. The file is created on first use."""
+    """A SQLite file. The file is created by the first write, never by a read."""
 
     dialect = Dialect.SQLITE
 
@@ -113,10 +112,15 @@ class SQLiteDatabase(Database):
 
     @contextmanager
     def _transaction(self, *, write: bool) -> Iterator[Session]:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        connection = sqlite3.connect(
-            self.path, timeout=SQLITE_BUSY_TIMEOUT_SECONDS, isolation_level=None
-        )
+        if not write and not self.path.exists():
+            # A file that does not exist reads as an empty database; reading never
+            # creates it, so a mistyped path is not silently turned into a new log.
+            connection = sqlite3.connect(":memory:", isolation_level=None)
+        else:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            connection = sqlite3.connect(
+                self.path, timeout=SQLITE_BUSY_TIMEOUT_SECONDS, isolation_level=None
+            )
         try:
             connection.execute("BEGIN IMMEDIATE" if write else "BEGIN")
             try:
@@ -139,10 +143,12 @@ class PostgresDatabase(Database):
         self._psycopg = _import_psycopg()
 
     def _identity(self) -> tuple[str, ...]:
-        parts = urlsplit(self._url.get_secret_value())
-        host = (parts.hostname or "localhost").lower()
-        port = str(parts.port or POSTGRES_DEFAULT_PORT)
-        return (self.dialect.value, host, port, parts.path.lstrip("/"))
+        # Every connection setting but the password: two URLs that differ in user,
+        # socket directory, options or search_path may reach different databases,
+        # schemas or privileges, so they are not treated as the same database.
+        settings = self._psycopg.conninfo.conninfo_to_dict(self._url.get_secret_value())
+        settings.pop("password", None)
+        return (self.dialect.value, *(f"{key}={value}" for key, value in sorted(settings.items())))
 
     @contextmanager
     def _transaction(self, *, write: bool) -> Iterator[Session]:

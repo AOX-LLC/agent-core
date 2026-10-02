@@ -402,3 +402,11 @@ async def test_a_temporary_table_cannot_stand_in_for_the_audit_table(
         app.execute(f"CREATE TEMP TABLE {audit_sql.AUDIT_TABLE} AS SELECT 1000::bigint AS seq")
         with pytest.raises(psycopg.Error, match="append-only"):
             app.execute(forge_after_gap)
+
+
+async def test_reading_a_missing_sqlite_file_does_not_create_it(tmp_path: Path) -> None:
+    missing = tmp_path / "typo" / "audit.sqlite3"
+    log = SQLAuditLog(open_database(f"sqlite:///{missing}"))
+
+    assert (await log.verify()).seq == 0
+    assert not missing.parent.exists()
