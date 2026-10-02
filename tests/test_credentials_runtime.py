@@ -18,14 +18,20 @@ DECOY_VALUES = {
     "ANTHROPIC_AUTH_TOKEN": "decoy-auth-token-from-the-environment",
     "ANTHROPIC_BASE_URL": "https://decoy.invalid",
     "ANTHROPIC_PROFILE": "decoy-profile",
+    "ANTHROPIC_WORKSPACE_ID": "decoy-workspace",
+    "ANTHROPIC_FEDERATION_RULE_ID": "decoy-federation-rule",
+    "ANTHROPIC_ORGANIZATION_ID": "decoy-organization",
+    "ANTHROPIC_SERVICE_ACCOUNT_ID": "decoy-service-account",
+    "ANTHROPIC_IDENTITY_TOKEN": "decoy-identity-token",
 }
 LIBRARY_KEY = "library-test-key-not-real"
 
 
 @pytest.fixture
-def sdk_variables_set(monkeypatch: pytest.MonkeyPatch) -> None:
+def sdk_variables_set(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     for name, value in DECOY_VALUES.items():
         monkeypatch.setenv(name, value)
+    monkeypatch.setenv("ANTHROPIC_CONFIG_DIR", str(tmp_path / "decoy-config-dir"))
 
 
 @pytest.fixture
