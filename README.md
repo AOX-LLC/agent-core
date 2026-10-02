@@ -4,7 +4,21 @@ agent-core is a small Python library for routed Claude model calls, structured o
 
 ## Status
 
-Pre-release. Only the package layout and public interfaces exist so far. Behavior arrives in later releases. The first usable pre-release will be `v0.1.0a1`.
+Pre-release. The model layer works: routed calls, structured outputs, cost, tracing and record/replay. Approvals, the audit log and evals are still interfaces only. The first usable pre-release will be `v0.1.0a1`.
+
+## Quick start
+
+```python
+from aox_agent_core import AgentClient, Tier
+
+with AgentClient() as client:
+    result = client.call_sync("Summarize this ticket: ...", tier=Tier.SMALL)
+    print(result.output, result.cost_usd, result.trace_id)
+```
+
+In async code use `await client.call(...)`; `call_sync` raises if an event loop is already running. Pass `output=SomePydanticModel` for validated structured output, and `task="extraction"` instead of a tier once `routing.tasks` maps it.
+
+`examples/routed_call.py` makes one routed call in replay mode and prints its trace and cost: `uv run --extra otel python examples/routed_call.py`.
 
 ## Install
 
@@ -52,6 +66,31 @@ model = "claude-sonnet-5-5"
 [routing.tasks]
 extraction = "small"
 ```
+
+## Record and replay
+
+In `replay` mode every call is served from a cassette, a JSON file under `replay.cassette_dir`, so a project runs and tests with no API key. To record, set `AGENT_CORE_MODE=record` and `AGENT_CORE_ANTHROPIC_API_KEY`, then run the code once; commit the cassettes it writes. Recording refuses to write a cassette that contains anything that looks like a key, and the live key itself is always caught.
+
+Check cassettes in CI with:
+
+```sh
+aox-agent-core cassettes check replays/
+```
+
+In tests, install the `testing` extra and enable the fixtures from a `conftest.py`:
+
+```python
+pytest_plugins = ["aox_agent_core.testing.pytest_plugin"]
+
+
+def test_triage(use_cassette):
+    client = use_cassette("triage-urgent")
+    ...
+```
+
+## Bedrock
+
+The Bedrock provider is an interface only in this release. `bedrock.tier_models` maps the mid and large tiers to Bedrock model IDs, priced under `pricing.bedrock`. The small tier has no Bedrock default: Claude Haiku 4.5 reaches end of life on Bedrock no sooner than 2026-10-16, so a project routing the small tier to Bedrock must choose and price the model itself.
 
 ## Development
 
