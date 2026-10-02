@@ -1,0 +1,48 @@
+# Bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Build and packaging
+build/
+dist/
+develop-eggs/
+eggs/
+.eggs/
+*.egg-info/
+*.egg
+wheels/
+sdist/
+.installed.cfg
+MANIFEST
+
+# Installer logs
+pip-log.txt
+pip-delete-this-directory.txt
+
+# Test and tool caches
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.tox/
+.nox/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# IDEs
+.idea/
+.vscode/
+
+# Local environment and tooling
+.env
+.env.*
+!.env.example
+.venv/
+.worktrees/
+CLAUDE.local.md
+.claude/agent-memory/
