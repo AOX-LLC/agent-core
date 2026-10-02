@@ -47,12 +47,12 @@
       "response": {
         "model": "claude-haiku-4-5-20251001",
         "stop_reason": "end_turn",
-        "text": "{\"queue\": \"billing\", \"urgent\": true, \"summary\": \"Customer was charged twice on invoice INV-1042 and needs the duplicate refunded before Friday.\"}",
+        "text": "{\"queue\": \"billing\", \"urgent\": true, \"summary\": \"Customer was charged twice for September invoice INV-1042; requesting refund before month-end close on Friday\"}",
         "usage": {
           "cache_creation_input_tokens": 0,
           "cache_read_input_tokens": 0,
-          "input_tokens": 180,
-          "output_tokens": 45
+          "input_tokens": 303,
+          "output_tokens": 42
         }
       },
       "sequence": 0

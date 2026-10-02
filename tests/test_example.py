@@ -18,7 +18,9 @@ def test_example_prints_a_trace_and_a_cost() -> None:
         timeout=60,
     )
 
+    # The cassette was recorded live: 303 input and 42 output tokens on the small
+    # tier, so 303 x $1/M + 42 x $5/M.
     assert '"name": "agent_core.model_call"' in completed.stdout
-    assert '"agent_core.cost_usd": 0.000405' in completed.stdout
-    assert "cost: $0.000405" in completed.stdout
+    assert '"agent_core.cost_usd": 0.000513' in completed.stdout
+    assert "cost: $0.000513" in completed.stdout
     assert "mode: replay" in completed.stdout

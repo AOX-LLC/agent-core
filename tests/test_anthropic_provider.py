@@ -1,4 +1,4 @@
-"""The Anthropic provider against hand-written API responses (see fixtures/sdk)."""
+"""The Anthropic provider against recorded and hand-written API responses (see fixtures/sdk)."""
 
 import json
 from typing import Literal
@@ -53,9 +53,9 @@ def request(**fields: object) -> ProviderRequest:
 
 
 async def test_text_reply_skips_thinking_blocks_and_keeps_cache_usage() -> None:
-    reply = await provider_returning(200, fixture("text_reply")).complete(request())
+    reply = await provider_returning(200, fixture("text_reply_with_thinking")).complete(request())
 
-    body = fixture("text_reply")
+    body = fixture("text_reply_with_thinking")
     assert isinstance(body, dict)
     text_blocks = [block["text"] for block in body["content"] if block["type"] == "text"]
     assert reply.text == "".join(text_blocks)
@@ -146,3 +146,11 @@ async def test_structured_retry_end_to_end_through_the_real_provider() -> None:
     assert result.output.queue == "billing"
     assert result.attempts == 2
     assert bodies == []
+
+
+async def test_live_recorded_reply_parses_with_its_real_model_string() -> None:
+    reply = await provider_returning(200, fixture("text_reply")).complete(request())
+
+    assert reply.model == "claude-haiku-4-5-20251001"
+    assert reply.stop_reason == "end_turn"
+    assert reply.text
