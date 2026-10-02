@@ -78,7 +78,11 @@ class NotAuthorizedToResolveError(ApprovalError):
 
 
 class ApprovalAlreadyResolvedError(ApprovalError):
-    """The approval request was already approved, rejected, expired or cancelled."""
+    """The request is no longer open: already resolved, consumed or cancelled."""
+
+
+class ApprovalNotGrantedError(ApprovalError):
+    """The action was attempted while its request was pending or after it was rejected."""
 
 
 class ApprovalExpiredError(ApprovalError):
@@ -86,7 +90,7 @@ class ApprovalExpiredError(ApprovalError):
 
 
 class ApprovalPayloadMismatchError(ApprovalError):
-    """The action payload differs from the payload that was approved."""
+    """The action or its payload differs from what was approved."""
 
 
 class AuditError(AgentCoreError):

@@ -10,7 +10,7 @@ from aox_agent_core.approvals.types import ApprovalRequest, Decision, Principal
 
 
 class ApprovalQueue(Protocol):
-    """Stores approval requests and enforces who may resolve them.
+    """Stores approval requests, enforces who may resolve them, and allows one run each.
 
     Every submission, resolution and denied attempt writes an audit event; when
     the queue and the audit log share a database, in the same transaction.
@@ -54,10 +54,14 @@ class ApprovalQueue(Protocol):
         """
         ...
 
-    async def ensure_approved(
-        self, request_id: UUID, payload: Mapping[str, JsonValue]
+    async def consume(
+        self, request_id: UUID, *, action: str, payload: Mapping[str, JsonValue]
     ) -> ApprovalRequest:
-        """Call right before acting. Returns the request if it was approved for exactly
-        this payload; raises ApprovalPayloadMismatchError if the payload changed.
+        """Call right before acting. Atomically moves an approved request to CONSUMED.
+
+        One approval authorizes one run. Raises ApprovalPayloadMismatchError if the
+        action or payload differ from what was approved, ApprovalNotGrantedError if
+        the request is pending or was rejected, ApprovalAlreadyResolvedError if it
+        was already consumed or cancelled, and ApprovalExpiredError if it expired.
         """
         ...

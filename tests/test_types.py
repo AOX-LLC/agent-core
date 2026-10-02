@@ -9,7 +9,10 @@ import pytest
 from pydantic import JsonValue, ValidationError
 
 from aox_agent_core.approvals import (
+    TTL_SECONDS_MAX,
     ApprovalRequest,
+    ApprovalStatus,
+    Decision,
     DenialReason,
     Principal,
     PrincipalKind,
@@ -158,6 +161,67 @@ def test_approval_request_must_expire_after_it_is_created() -> None:
 def test_approval_request_needs_aware_timestamps() -> None:
     with pytest.raises(ValidationError):
         ApprovalRequest(**approval_request_fields(created_at=datetime(2026, 10, 2, 12, 0)))
+
+
+RESOLVED = {"resolved_by": "user-17", "resolved_at": NOW + timedelta(minutes=5)}
+
+
+@pytest.mark.parametrize(
+    "state",
+    [
+        {},
+        {"status": ApprovalStatus.APPROVED, "decision": Decision.APPROVE, **RESOLVED},
+        {"status": ApprovalStatus.REJECTED, "decision": Decision.REJECT, **RESOLVED},
+        {
+            "status": ApprovalStatus.CONSUMED,
+            "decision": Decision.APPROVE,
+            "consumed_at": NOW + timedelta(minutes=6),
+            **RESOLVED,
+        },
+        {"status": ApprovalStatus.EXPIRED},
+        {"status": ApprovalStatus.CANCELLED},
+    ],
+)
+def test_approval_request_accepts_consistent_states(state: dict[str, Any]) -> None:
+    ApprovalRequest(**approval_request_fields(**state))
+
+
+@pytest.mark.parametrize(
+    "state",
+    [
+        {"status": ApprovalStatus.APPROVED, "decision": Decision.REJECT, **RESOLVED},
+        {"status": ApprovalStatus.APPROVED, "decision": Decision.APPROVE},
+        {"status": ApprovalStatus.PENDING, "decision": Decision.APPROVE, **RESOLVED},
+        {"resolved_by": "user-17"},
+        {
+            "status": ApprovalStatus.APPROVED,
+            "decision": Decision.APPROVE,
+            "resolved_by": "agent-intake",
+            "resolved_at": NOW,
+        },
+        {
+            "status": ApprovalStatus.APPROVED,
+            "decision": Decision.APPROVE,
+            "consumed_at": NOW,
+            **RESOLVED,
+        },
+        {"status": ApprovalStatus.CONSUMED, "decision": Decision.APPROVE, **RESOLVED},
+        {"expires_at": NOW + timedelta(seconds=TTL_SECONDS_MAX + 1)},
+    ],
+    ids=[
+        "status-decision-mismatch",
+        "approved-without-resolver",
+        "pending-with-decision",
+        "resolver-without-decision",
+        "self-approval",
+        "consumed-at-while-approved",
+        "consumed-without-time",
+        "lifetime-over-limit",
+    ],
+)
+def test_approval_request_rejects_impossible_states(state: dict[str, Any]) -> None:
+    with pytest.raises(ValidationError):
+        ApprovalRequest(**approval_request_fields(**state))
 
 
 def test_approval_request_expiry_check() -> None:
