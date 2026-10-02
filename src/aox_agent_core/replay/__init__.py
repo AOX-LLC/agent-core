@@ -6,6 +6,7 @@ from aox_agent_core.replay.cassette import (
     CassetteEntry,
     request_key,
 )
+from aox_agent_core.replay.providers import RecordingProvider, ReplayProvider
 from aox_agent_core.replay.scrub import (
     DEFAULT_SECRET_PATTERNS,
     PatternScrubber,
@@ -22,6 +23,8 @@ __all__ = [
     "CassetteStore",
     "DirectoryCassetteStore",
     "PatternScrubber",
+    "RecordingProvider",
+    "ReplayProvider",
     "Scrubber",
     "SecretFinding",
     "request_key",

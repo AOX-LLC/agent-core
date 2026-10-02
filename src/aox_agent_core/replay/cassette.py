@@ -9,6 +9,7 @@ from typing import Annotated, Final, Literal
 
 from pydantic import Field
 
+from aox_agent_core._canonical import sha256_of
 from aox_agent_core._model import CassetteName, FrozenModel, Sha256Hex
 from aox_agent_core.models.types import ProviderRequest, ProviderResponse
 
@@ -42,4 +43,4 @@ def request_key(request: ProviderRequest) -> str:
     The digest covers the request as canonical JSON: keys sorted, no insignificant
     whitespace, UTF-8, with fields that are None left out.
     """
-    raise NotImplementedError("request_key is not implemented yet.")
+    return sha256_of(request.model_dump(mode="json", exclude_none=True))

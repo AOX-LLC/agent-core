@@ -49,6 +49,8 @@ EXPECTED_EXPORTS = {
         "CassetteStore",
         "DirectoryCassetteStore",
         "PatternScrubber",
+        "RecordingProvider",
+        "ReplayProvider",
         "Scrubber",
         "SecretFinding",
         "request_key",
