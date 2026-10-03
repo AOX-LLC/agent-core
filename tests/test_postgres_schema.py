@@ -880,6 +880,14 @@ def test_the_installer_lists_finished_requests_whose_finish_time_a_client_backda
         payload_purged_at=stamp(now),
     )
     still_open = plant(status="'pending'")
+    # Values past the shape pattern that no timestamp parser accepts: the report must not fail.
+    impossible_day = plant(status="'cancelled'", closed_at="'2026-02-30T00:00:00.000000Z'")
+    impossible_time = plant(status="'cancelled'", closed_at="'2026-01-01T25:61:61.000000Z'")
+    impossible_created = plant(
+        status="'cancelled'",
+        created_at="'2026-13-01T00:00:00.000000Z'",
+        closed_at=stamp(now),
+    )
 
     report = install_postgres_schema(
         control_database.owner_url,
@@ -889,9 +897,16 @@ def test_the_installer_lists_finished_requests_whose_finish_time_a_client_backda
     )
 
     assert set(report.backdated_finishes) == {cancelled_before_created, consumed_before_approved}
-    assert {honest, skewed_requester, skewed_approver, purged, still_open}.isdisjoint(
-        report.backdated_finishes
-    )
+    assert {
+        honest,
+        skewed_requester,
+        skewed_approver,
+        purged,
+        still_open,
+        impossible_day,
+        impossible_time,
+        impossible_created,
+    }.isdisjoint(report.backdated_finishes)
     assert cancelled_before_created in str(report)
     again = install_postgres_schema(
         control_database.owner_url,

@@ -804,13 +804,17 @@ async def _unaudited_approvals(session: Session, schema: str, approver_role: str
 
 
 async def _backdated_finishes(session: Session, schema: str) -> list[str]:
-    """Finished requests still holding a payload whose finish time is more than the guard's
-    5 minutes of clock skew before their creation or before their own decision: what a client
+    """Finished requests still holding a payload whose finish time is more than 5 minutes
+    (the guard's clock skew) before their creation or before their own decision: what a client
     that wrote its own finish time (0.1.0a4) could leave. It finds only that: a finish time
     moved back but still after the request's own history looks real and is not listed.
 
-    Every column is shape-checked before it is cast, in a CASE so no cast runs on a row
-    with another spelling (such rows are never purged, so they are not listed).
+    Every value is shape-checked and then checked to be a valid timestamp
+    (pg_input_is_valid, Postgres 16 and later) before it is cast, in a CASE so no cast runs on
+    a planted row with another spelling or an impossible date such as 2026-02-30: such a row
+    must not make the installer fail and roll back the upgrade. The shape pattern alone is
+    looser than the guard's. Rows that fail either check are never purged, so they are not
+    listed.
     """
     approvals = _qualified_tables(schema)["approvals"]
     finished = layout.FINISHED_AT_EXPRESSION
@@ -819,6 +823,8 @@ async def _backdated_finishes(session: Session, schema: str) -> list[str]:
     def before(column: str) -> str:
         return (
             f"CASE WHEN ({finished}) ~ {shape} AND {column} ~ {shape} "
+            f"AND pg_input_is_valid(({finished}), 'timestamptz') "
+            f"AND pg_input_is_valid({column}, 'timestamptz') "
             f"THEN ({finished})::timestamptz < {column}::timestamptz - interval '5 minutes' "
             "ELSE false END"
         )

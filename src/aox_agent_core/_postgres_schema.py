@@ -663,7 +663,9 @@ class InstallReport:
     decision (at most 1000, by id). 0.1.0a4 let the role that closed a request write that
     time, so each of these is purgeable at once under any retention floor, whenever it
     really finished; since 0.1.0a5 the database writes the time. The installer changes
-    nothing about them: check them before the first purge. An empty list does not show that
+    nothing about them: check them before the first purge. Rows written under 0.1.0a4, which
+    bounded none of these times, can be listed for honest skew between the requester's and
+    the approver's hosts, so read the list as candidates. An empty list does not show that
     nothing was backdated: a time moved back but still after the request's own history is
     not detectable here.
     """
