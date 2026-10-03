@@ -130,8 +130,11 @@ class _Outcome:
 class SQLApprovalQueue:
     """The ApprovalQueue protocol on a Database.
 
-    The policy (RoleApproverPolicy by default) is applied inside resolve(); a
-    caller cannot skip it. A denied attempt is audited and committed before its
+    The policy is applied inside resolve(); a caller cannot skip it. The
+    default, RoleApproverPolicy() with no map, refuses every request: an
+    approver-side queue passes RoleApproverPolicy(roles_by_action=...), which
+    decides the role each action needs. A requester-side queue never resolves,
+    so it needs no policy. A denied attempt is audited and committed before its
     error is raised. consume() is called right before acting: it moves an approved
     request to CONSUMED, so one approval authorizes exactly one run, and its audit
     event names the principal about to act.

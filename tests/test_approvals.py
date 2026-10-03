@@ -31,7 +31,13 @@ from aox_agent_core.errors import (
     NotTheRequesterError,
 )
 from aox_agent_core.storage import open_database
-from databases import ControlDatabase, SplitQueue, split_queue, sqlite_database
+from databases import (
+    TEST_ACTION_ROLES,
+    ControlDatabase,
+    SplitQueue,
+    split_queue,
+    sqlite_database,
+)
 
 REQUESTER = Principal(id="agent-intake", kind=PrincipalKind.AGENT)
 APPROVER = Principal(id="user-17", kind=PrincipalKind.HUMAN, roles=frozenset({"ops.approver"}))
@@ -304,7 +310,8 @@ def test_role_policy_checks_in_order(
     )
     now = NOW + timedelta(hours=2) if expired else NOW
 
-    verdict = RoleApproverPolicy().evaluate(principal, request, now=now)
+    policy = RoleApproverPolicy(roles_by_action=TEST_ACTION_ROLES)
+    verdict = policy.evaluate(principal, request, now=now)
 
     assert verdict.reason == (DenialReason(reason) if reason else None)
     assert verdict.allowed is (reason is None)
@@ -464,7 +471,7 @@ async def test_list_pending_pages_past_requests_a_strict_policy_rejects(
                 return ResolveVerdict(allowed=False, reason=DenialReason.MISSING_ROLE)
             return super().evaluate(principal, request, now=now)
 
-    policy = OnlyTheNewest()
+    policy = OnlyTheNewest(roles_by_action=TEST_ACTION_ROLES)
     clock = Clock()
     queue = split_queue(control_database, policy=policy, clock=clock)
     for minute in range(5):
@@ -499,6 +506,7 @@ async def test_custom_policy_listing_pages_through_tied_timestamps(
 
     class EveryThird(RoleApproverPolicy):
         def __init__(self, wanted: set[UUID]) -> None:
+            super().__init__(roles_by_action=TEST_ACTION_ROLES)
             self.wanted = wanted
 
         def evaluate(
@@ -616,3 +624,77 @@ async def test_an_approver_side_role_map_overrides_what_the_requester_asked_for(
     reasons = [reason for _, _, reason in await audit_actions(control_database)]
     assert "role_mismatch" in reasons
     assert "unknown_action" in reasons
+
+
+async def test_without_a_role_map_every_request_is_refused(
+    control_database: ControlDatabase,
+) -> None:
+    queue = split_queue(control_database, policy=RoleApproverPolicy(), clock=Clock())
+    request = await submitted(queue)
+
+    with pytest.raises(NotAuthorizedToResolveError, match="unknown_action"):
+        await queue.resolve(request.id, decision=Decision.APPROVE, principal=APPROVER)
+
+    assert await queue.list_pending(APPROVER) == []
+    assert (await audit_actions(control_database))[-1] == (
+        "approval.resolve_denied",
+        "user-17",
+        "unknown_action",
+    )
+
+
+async def test_trusting_the_requesters_role_is_an_explicit_opt_out(
+    control_database: ControlDatabase,
+) -> None:
+    trusting = RoleApproverPolicy(trust_requester_role=True)
+    queue = split_queue(control_database, policy=trusting, clock=Clock())
+    unlisted = await queue.submit(
+        action="billing.refund",
+        summary="s",
+        payload=PAYLOAD,
+        requested_by=REQUESTER,
+        required_role="ops.approver",
+        ttl_seconds=3_600,
+    )
+    weaker_than_needed = await queue.submit(
+        action="billing.refund",
+        summary="s",
+        payload=PAYLOAD,
+        requested_by=REQUESTER,
+        required_role="finance.approver",
+        ttl_seconds=3_600,
+    )
+
+    approved = await queue.resolve(unlisted.id, decision=Decision.APPROVE, principal=APPROVER)
+    with pytest.raises(NotAuthorizedToResolveError, match="missing_role"):
+        await queue.resolve(weaker_than_needed.id, decision=Decision.APPROVE, principal=APPROVER)
+
+    assert approved.status is ApprovalStatus.APPROVED
+
+
+def test_a_role_map_and_the_opt_out_cannot_be_combined() -> None:
+    with pytest.raises(ValueError, match="not both"):
+        RoleApproverPolicy(roles_by_action=TEST_ACTION_ROLES, trust_requester_role=True)
+
+
+def test_a_subclass_that_skips_init_refuses_rather_than_trusts() -> None:
+    class Custom(RoleApproverPolicy):
+        def __init__(self) -> None:
+            pass
+
+    request = ApprovalRequest.model_validate(
+        {
+            "id": UUID("00000000-0000-4000-8000-000000000002"),
+            "action": "crm.update_contact",
+            "summary": "s",
+            "payload_sha256": "a" * 64,
+            "requested_by": "agent-intake",
+            "required_role": "ops.approver",
+            "created_at": NOW,
+            "expires_at": NOW + timedelta(hours=1),
+        }
+    )
+
+    verdict = Custom().evaluate(APPROVER, request, now=NOW)
+
+    assert verdict.reason is DenialReason.UNKNOWN_ACTION

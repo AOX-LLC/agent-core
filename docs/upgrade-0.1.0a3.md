@@ -76,7 +76,7 @@ It refuses:
 A deployment runs two queues. The agent side connects as the requester role. The decision side connects as the approver role.
 
 ```python
-from aox_agent_core.approvals import SQLApprovalQueue
+from aox_agent_core.approvals import RoleApproverPolicy, SQLApprovalQueue
 from aox_agent_core.audit import SQLAuditLog
 from aox_agent_core.storage import open_database
 
@@ -86,7 +86,9 @@ agent_queue = SQLApprovalQueue(agent_db, audit_log=agent_audit)
 
 decision_db = open_database("postgresql://agent_core_approver@db.example/agent_core")
 decision_audit = SQLAuditLog(decision_db)
-decision_queue = SQLApprovalQueue(decision_db, audit_log=decision_audit)
+# The approver side decides which role each action needs.
+policy = RoleApproverPolicy(roles_by_action={"crm.update_contact": "ops.approver"})
+decision_queue = SQLApprovalQueue(decision_db, audit_log=decision_audit, policy=policy)
 ```
 
 - Requester side: `submit`, `consume`, `cancel`, `expire_due`, `get`.
@@ -156,7 +158,7 @@ The database enforces:
 The library enforces:
 
 - that the approver is a human who holds `required_role` (the database cannot know principals, because every agent shares the requester role);
-- with `RoleApproverPolicy(roles_by_action={...})` on the approver side, which role each action needs. The requester chooses `required_role` when it submits, so without that map a requester can ask for a weaker role than an action deserves;
+- which role each action needs, decided on the approver side by `RoleApproverPolicy(roles_by_action={...})`: a request for an unlisted action, or whose stored `required_role` differs from the listed role, is refused and audited. The requester writes `required_role`, so it is never trusted by default; `trust_requester_role=True` opts out, for local development only;
 - that `consume` is called by the requester or one of the request's delegates, else `NotTheRequesterError`;
 - that `cancel` is called by the requester, never a delegate;
 - the action and payload match on `consume`.

@@ -49,6 +49,8 @@ RUN = RunContext(run_id="run-0001", external_ids={"execution_id": "ex-42"})
 REQUESTER = Principal(id="agent-intake", kind=PrincipalKind.AGENT)
 APPROVER = Principal(id="user-17", kind=PrincipalKind.HUMAN, roles=frozenset({"ops.approver"}))
 PAYLOAD: dict[str, JsonValue] = {"contact_id": "c-1001"}
+# The approver side decides which role each action needs.
+ROLES = {"crm.update_contact": "ops.approver"}
 
 
 class InMemoryAuditLog:
@@ -100,7 +102,7 @@ class InMemoryApprovalQueue:
 
     def __init__(self, audit_log: AuditLog) -> None:
         self._audit_log = audit_log
-        self._policy = RoleApproverPolicy()
+        self._policy = RoleApproverPolicy(roles_by_action=ROLES)
         self._requests: dict[UUID, ApprovalRequest] = {}
 
     async def submit(
@@ -277,7 +279,9 @@ async def approve_and_act(queue: ApprovalQueue) -> ApprovalRequest:
 
 def sql_queue(tmp_path: Path, audit_log: AuditLog) -> ApprovalQueue:
     return SQLApprovalQueue(
-        open_database(f"sqlite:///{tmp_path / 'queue.sqlite3'}"), audit_log=audit_log
+        open_database(f"sqlite:///{tmp_path / 'queue.sqlite3'}"),
+        audit_log=audit_log,
+        policy=RoleApproverPolicy(roles_by_action=ROLES),
     )
 
 

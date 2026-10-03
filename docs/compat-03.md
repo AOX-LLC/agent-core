@@ -287,7 +287,8 @@ class ApprovalQueue(Protocol):
 - `decision` takes `Decision.APPROVE` or `Decision.REJECT`.
 - `actor` becomes a `Principal`. `note` becomes `reason`.
 - `edited_subject` has no equivalent. See item 8 below.
-- The default `RoleApproverPolicy` needs a human who holds `required_role` and is not the requester.
+- `RoleApproverPolicy(roles_by_action={...})` on the approver side decides which role each action needs. A request for an unlisted action, or whose stored `required_role` differs from the listed role, is refused (`unknown_action`, `role_mismatch`) and audited. The approver must also be a human who holds that role and is not the requester.
+- The default `RoleApproverPolicy()`, with no map, refuses every request. `RoleApproverPolicy(trust_requester_role=True)` takes the requester's `required_role` as given; it is for local development only, never where the requester may be compromised.
 - Errors: `ApprovalAlreadyResolvedError` (close to 03's not-pending), `ApprovalExpiredError`, `NotAuthorizedToResolveError`, `ApprovalNotFoundError`.
 - Resolution is compare-and-set, so a request is resolved once.
 
@@ -451,6 +452,7 @@ If project 03 implements `ApprovalQueue` itself, as item 5 says, its backend mus
 - Add `cancel(request_id, *, principal, reason=None, context=None)` and `expire_due(*, principal, now=None, limit=500) -> int`, with these exact signatures.
 - Accept `submit(..., delegates=...)`, at most 16 ids, kept unchanged for the life of the request.
 - Refuse `consume` by a principal who is neither the requester nor a delegate, with `NotTheRequesterError`.
+- Decide the required role on the approver side, as `RoleApproverPolicy(roles_by_action=...)` does: the requester writes `required_role`, so trusting it lets a compromised requester ask for the weakest role. If the ops kit keeps its own approver policy, it should refuse unlisted actions and mismatched roles the same way.
 - Set `closed_at` when storing EXPIRED or CANCELLED. `ApprovalRequest` validates it.
 - If it builds records with agent-core's types, expect `AuditRecord.db_role` and audit schema 3.
 - If it uses agent-core's installer, call the new signature with `requester_role` and `approver_role`. `app_role` is gone.

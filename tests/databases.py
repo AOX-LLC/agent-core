@@ -18,6 +18,7 @@ from uuid import uuid4
 import psycopg
 import pytest
 
+from aox_agent_core.approvals import RoleApproverPolicy
 from aox_agent_core.approvals.sql import SQLApprovalQueue
 from aox_agent_core.audit.sql import SQLAuditLog
 from aox_agent_core.replay.scrub import Scrubber
@@ -28,6 +29,8 @@ REQUIRE_ENV = "AGENT_CORE_REQUIRE_POSTGRES"
 OWNER_ROLE = "agent_core_owner"
 REQUESTER_ROLE = "agent_core_requester"
 APPROVER_ROLE = "agent_core_approver"
+# The role each action in the tests needs, as an approver side would configure it.
+TEST_ACTION_ROLES = {"crm.update_contact": "ops.approver", "crm.delete_contact": "ops.approver"}
 # The single application role of 0.1.0a2, for the upgrade tests.
 LEGACY_APP_ROLE = "agent_core_app"
 
@@ -188,6 +191,7 @@ def split_queue(
     """Both sides of the approval queue on `database`, built with the same options."""
 
     schema = database.schema if database.backend == "postgres" else None
+    options.setdefault("policy", RoleApproverPolicy(roles_by_action=TEST_ACTION_ROLES))
 
     def side(connection: Database) -> SQLApprovalQueue:
         log = SQLAuditLog(connection, scrubber=scrubber, schema=schema)

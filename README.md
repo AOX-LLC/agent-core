@@ -142,11 +142,13 @@ def test_triage(use_cassette):
 ```python
 from aox_agent_core.storage import open_database
 from aox_agent_core.audit import SQLAuditLog
-from aox_agent_core.approvals import SQLApprovalQueue
+from aox_agent_core.approvals import RoleApproverPolicy, SQLApprovalQueue
 
 database = open_database("sqlite:///control.sqlite3")
 audit_log = SQLAuditLog(database)
-approvals = SQLApprovalQueue(database, audit_log=audit_log)
+# On the approver side, the policy decides which role each action needs.
+policy = RoleApproverPolicy(roles_by_action={"crm.update_contact": "ops.approver"})
+approvals = SQLApprovalQueue(database, audit_log=audit_log, policy=policy)
 ```
 
 Keep the head from `await audit_log.head()` somewhere the application cannot write, and check against it with `await audit_log.verify(expected_head=...)` or `aox-agent-core audit verify`: the chain on its own cannot show that it was not rewritten or cut short.
@@ -155,7 +157,7 @@ Pass `context=RunContext(...)` to `AuditEvent`, `submit`, `resolve` and `consume
 
 Each approval authorizes one run: call `consume(..., principal=...)` right before acting. Only the requester may consume it, unless `submit(..., delegates={...})` named other principals (at most 16, fixed for the request and shown to the approver); anyone else gets `NotTheRequesterError`. The requester can withdraw a pending request with `cancel(...)`. `expire_due(principal=...)` stores EXPIRED on pending requests past their lifetime. `get()` reports such a request as expired whether or not the sweep has run.
 
-On Postgres, the database enforces who may do what. An operator creates two roles, then runs `storage.install_postgres_schema(owner_url, requester_role="...", approver_role="...")` once as the owner. The requester role (the agent side) submits, consumes and cancels. The approver role (the decision side) approves and rejects. A guard trigger on the approvals table checks every insert and update against a fixed transition table, so a role holding only its own credentials cannot approve a request with plain SQL. A deployment runs two queues, one connected as each role. Before its first statement, a queue checks the setup and raises `ConfigError` if it is wrong. The database cannot know principals, so "the approver is a human holding the required role" and "the consumer is the requester or a delegate" stay library rules. The requester chooses `required_role`; on the approver side, `RoleApproverPolicy(roles_by_action={"crm.update_contact": "ops.approver"})` decides which role each action needs, and refuses unlisted actions. Pass `schema="..."` to `SQLAuditLog` and `SQLApprovalQueue` to use a Postgres schema other than `public`.
+On Postgres, the database enforces who may do what. An operator creates two roles, then runs `storage.install_postgres_schema(owner_url, requester_role="...", approver_role="...")` once as the owner. The requester role (the agent side) submits, consumes and cancels. The approver role (the decision side) approves and rejects. A guard trigger on the approvals table checks every insert and update against a fixed transition table, so a role holding only its own credentials cannot approve a request with plain SQL. A deployment runs two queues, one connected as each role. Before its first statement, a queue checks the setup and raises `ConfigError` if it is wrong. The database cannot know principals, so "the approver is a human holding the required role" and "the consumer is the requester or a delegate" stay library rules. The requester writes `required_role` when it submits, so the approver side decides: `RoleApproverPolicy(roles_by_action={...})` lists the role each action needs, and a request for an unlisted action, or whose stored role differs, is refused and audited. The default policy, with no map, refuses everything. `RoleApproverPolicy(trust_requester_role=True)` takes the requester's role as given, for local development only. Pass `schema="..."` to `SQLAuditLog` and `SQLApprovalQueue` to use a Postgres schema other than `public`.
 
 Each audit record carries `db_role`, the database role that inserted it, set by the database and outside the hash. Both roles may append audit rows, so `db_role` is how to tell who really wrote an `approval.resolved` record.
 
