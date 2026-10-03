@@ -397,6 +397,7 @@ Other changes for the operator:
 
 Still not verified for 0.1.0a6:
 
+- **A sweep with a small `limit`.** `expire_due` and `purge_payloads` skip requests another transaction holds. If the oldest `limit` due requests are all held, a batch changes nothing and the run stops; the requests behind them wait for the next run.
 - **A real pooler.** The design fits a transaction-mode pooler. It has not been run against pgbouncer or any other pooler, and a pgbouncer CI job is planned for 0.1.0a7.
 - **Postgres 18 and later.** CI runs 16 on Python 3.11 to 3.14 and 17 on Python 3.12 in a separate job.
 - **0.1.0a6 on a large or busy database.** The upgrade was tested on small databases only, not on production-sized ones or with writers active.
