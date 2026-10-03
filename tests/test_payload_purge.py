@@ -1,12 +1,15 @@
 """purge_payloads: finished requests lose their stored payload, never their hash."""
 
 import asyncio
-from datetime import datetime, timedelta
+import contextlib
+from datetime import UTC, datetime, timedelta
 from typing import Any
 from uuid import UUID
 
+import psycopg
 import pytest
 
+from aox_agent_core import _postgres_schema as layout
 from aox_agent_core.approvals import (
     ApprovalRequest,
     ApprovalStatus,
@@ -14,10 +17,11 @@ from aox_agent_core.approvals import (
     Principal,
     PrincipalKind,
 )
+from aox_agent_core.approvals.sql import purgeable_select
 from aox_agent_core.audit.chain import canonical_timestamp
 from aox_agent_core.audit.sql import SQLAuditLog
 from aox_agent_core.errors import ConfigError
-from aox_agent_core.storage import install_postgres_schema
+from aox_agent_core.storage import Dialect, TableName, install_postgres_schema
 from databases import APPROVER_ROLE, REQUESTER_ROLE, ControlDatabase, SplitQueue, split_queue
 from test_approval_payload import ACTION, APPROVALS
 from test_approvals import APPROVER, REQUESTER
@@ -250,3 +254,255 @@ async def test_a_library_transaction_does_not_wait_unbounded_for_a_row_either(
         with pytest.raises(psycopg.errors.LockNotAvailable):
             await approver.resolve(request.id, decision=Decision.APPROVE, principal=APPROVER)
         assert time.monotonic() - started < 3
+
+
+class SlowRunClock:
+    """The queue's clock as a purge run sees it when the run began six minutes ago.
+
+    Each reading is a second after the last. A run over a large backlog reads the clock
+    at its start and writes minutes later; the database's own clock has moved on.
+    """
+
+    def __init__(self) -> None:
+        self.reading = datetime.now(UTC) - timedelta(minutes=6)
+
+    def __call__(self) -> datetime:
+        self.reading += timedelta(seconds=1)
+        return self.reading
+
+
+async def test_a_purge_whose_run_outlasts_the_five_minute_bound_still_completes(
+    control_database: ControlDatabase,
+) -> None:
+    clock = SlowRunClock()
+    queue = split_queue(control_database, clock=clock)
+    requests = [await make(queue, number, ttl_seconds=3_600) for number in range(3)]
+    for request in requests:
+        await queue.cancel(request.id, principal=REQUESTER)
+        age(control_database, request.id, timedelta(days=3))
+
+    purged = await queue.approver.purge_payloads(
+        principal=SWEEPER, older_than=timedelta(days=2), limit=1
+    )
+
+    assert purged == 3
+    stamps = control_database.raw(f"SELECT payload_purged_at FROM {APPROVALS}")
+    purged_at = [datetime.fromisoformat(value) for (value,) in stamps]
+    assert len(purged_at) == 3
+    if control_database.backend == "postgres":
+        # The guard wrote them, by the database's clock, not the run's.
+        assert all(abs(datetime.now(UTC) - moment) < timedelta(minutes=1) for moment in purged_at)
+    else:
+        # No guard on SQLite: each batch stamps its own reading of the application clock.
+        assert len(set(purged_at)) == 3
+
+
+BACKLOG = 40_000
+
+
+def test_the_purge_scan_reads_a_large_due_backlog_through_its_index(
+    control_database: ControlDatabase,
+) -> None:
+    """The library's own scan, not a copy of it, on a backlog far larger than one batch.
+
+    The scan filters on a canonical finish time as well, and the index carries that
+    condition; without it the planner read every due row and sorted them for each batch.
+    """
+    if control_database.superuser_url is None:
+        pytest.skip("the plan is read on Postgres")
+    table = TableName("agent_core_approvals", control_database.schema)
+    columns = (
+        "id, action, summary, payload_sha256, requested_by, required_role, created_at, "
+        "expires_at, status, delegates, payload_json, payload_purged_at, closed_at"
+    )
+    stamp = (
+        "to_char(timestamp '2026-01-01' + g * interval '1 second', "
+        '\'YYYY-MM-DD"T"HH24:MI:SS.US"Z"\')'
+    )
+    created = "'2025-12-31T00:00:00.000000Z'"
+    expires = "'2025-12-31T01:00:00.000000Z'"
+
+    def rows(prefix: str, count: int, closed: str, payload: str, purged: str) -> str:
+        return (
+            f"INSERT INTO {table.sql} ({columns}) SELECT '{prefix}' || g, 'ops.update', 's', "
+            f"md5('{prefix}' || g) || md5(g::text || '{prefix}'), 'agent-intake', 'ops.approver', "
+            f"{created}, {expires}, 'cancelled', '[]', {payload}, {purged}, {closed} "
+            f"FROM generate_series(1, {count}) g"
+        )
+
+    payload = "'{\"a\": 1}'"
+    with psycopg.connect(control_database.superuser_url, autocommit=True) as connection:
+        connection.execute("SET session_replication_role = replica")
+        connection.execute(rows("due", BACKLOG, stamp, payload, "NULL"))
+        connection.execute(rows("odd", BACKLOG // 4, "'finished-' || g", payload, "NULL"))
+        connection.execute(
+            rows("new", BACKLOG // 4, "'2099-01-01T00:00:00.000000Z'", payload, "NULL")
+        )
+        connection.execute(
+            rows(
+                "gone",
+                BACKLOG // 2,
+                "'2026-01-01T00:00:00.000000Z'",
+                "NULL",
+                "'2026-02-01T00:00:00.000000Z'",
+            )
+        )
+        connection.execute(f"ANALYZE {table.sql}")
+        scan = purgeable_select(table, Dialect.POSTGRES).replace("?", "%s")
+        plan = [
+            line
+            for (line,) in connection.execute(
+                "EXPLAIN (ANALYZE, COSTS OFF) " + scan, (86_400.0, 500)
+            ).fetchall()
+        ]
+        found = connection.execute(scan, (86_400.0, 500)).fetchall()
+
+    shown = "\n".join(plan)
+    assert f"Index Scan using {layout.PURGEABLE_INDEX}" in shown, shown
+    assert "Sort" not in shown, shown
+    assert "Bitmap" not in shown, shown
+    assert len(found) == 500
+
+
+def test_the_installer_replaces_the_purge_index_an_a5_install_left_behind(
+    control_database: ControlDatabase,
+) -> None:
+    if control_database.owner_url is None or control_database.superuser_url is None:
+        pytest.skip("indexes are read on Postgres")
+    table = f"{control_database.schema}.agent_core_approvals"
+    control_database.raw(f"DROP INDEX {control_database.schema}.{layout.PURGEABLE_INDEX}")
+    control_database.raw(
+        f"CREATE INDEX {layout.LEGACY_PURGEABLE_INDEX} ON {table} "
+        f"(({layout.FINISHED_AT_EXPRESSION}), id) WHERE {layout.PURGEABLE_PREDICATE}"
+    )
+
+    install_postgres_schema(
+        control_database.owner_url,
+        requester_role=REQUESTER_ROLE,
+        approver_role=APPROVER_ROLE,
+        schema=control_database.schema,
+    )
+
+    names = control_database.raw(
+        "SELECT indexname FROM pg_indexes WHERE tablename = 'agent_core_approvals' "
+        f"AND schemaname = '{control_database.schema}' "
+        "AND indexname LIKE 'agent_core_approvals_pur%'"
+    )
+    assert names == [(layout.PURGEABLE_INDEX,)]
+
+
+def approver_with_short_lock_timeout(control_database: ControlDatabase) -> Any:
+    from aox_agent_core.approvals import RoleApproverPolicy
+    from aox_agent_core.approvals.sql import SQLApprovalQueue
+    from databases import TEST_ACTION_ROLES
+
+    log = SQLAuditLog(
+        control_database.approver_database,
+        schema=control_database.schema,
+        lock_timeout=timedelta(milliseconds=300),
+    )
+    return SQLApprovalQueue(
+        control_database.approver_database,
+        audit_log=log,
+        schema=control_database.schema,
+        policy=RoleApproverPolicy(roles_by_action=TEST_ACTION_ROLES),
+    )
+
+
+async def test_the_expiry_sweep_skips_a_request_another_transaction_holds(
+    control_database: ControlDatabase,
+) -> None:
+    if control_database.owner_url is None:
+        pytest.skip("row locks held by another transaction are Postgres")
+    import psycopg
+
+    queue = split_queue(control_database)
+    held, free = await make(queue, 1, ttl_seconds=1), await make(queue, 2, ttl_seconds=1)
+    await asyncio.sleep(1.3)
+    sweeper = approver_with_short_lock_timeout(control_database)
+
+    with psycopg.connect(control_database.url) as holder:
+        holder.execute(f"SELECT 1 FROM {APPROVALS} WHERE id = '{held.id}' FOR UPDATE")
+        # The other request expires; the held one is left for the next sweep, not an error.
+        assert await sweeper.expire_due(principal=SWEEPER) == 1
+        statuses = control_database.raw(
+            f"SELECT id, status FROM {APPROVALS} WHERE id IN ('{held.id}', '{free.id}')"
+        )
+        assert dict(statuses) == {str(held.id): "pending", str(free.id): "expired"}
+
+    assert await sweeper.expire_due(principal=SWEEPER) == 1
+    assert (await queue.get(held.id)).status is ApprovalStatus.EXPIRED
+
+
+async def test_the_purge_skips_a_request_another_transaction_holds(
+    control_database: ControlDatabase,
+) -> None:
+    if control_database.owner_url is None:
+        pytest.skip("row locks held by another transaction are Postgres")
+    import psycopg
+
+    queue = split_queue(control_database)
+    held, free = await make(queue, 1), await make(queue, 2)
+    for request in (held, free):
+        await queue.cancel(request.id, principal=REQUESTER)
+        age(control_database, request.id, timedelta(days=3))
+    purger = approver_with_short_lock_timeout(control_database)
+
+    with psycopg.connect(control_database.url) as holder:
+        holder.execute(f"SELECT 1 FROM {APPROVALS} WHERE id = '{held.id}' FOR UPDATE")
+        purged = await purger.purge_payloads(principal=SWEEPER, older_than=timedelta(days=2))
+        assert purged == 1
+        assert (await queue.get(held.id)).payload is not None
+        assert (await queue.get(free.id)).payload is None
+
+    assert await purger.purge_payloads(principal=SWEEPER, older_than=timedelta(days=2)) == 1
+    assert (await queue.get(held.id)).payload is None
+
+
+async def test_sqlite_drops_the_a5_purge_index_and_builds_the_new_one_on_first_use(
+    tmp_path: Any,
+) -> None:
+    import sqlite3
+
+    from aox_agent_core.approvals.sql import SQLApprovalQueue
+    from aox_agent_core.storage import open_database
+
+    path = tmp_path / "control.sqlite3"
+    database = open_database(f"sqlite:///{path}")
+    queue = SQLApprovalQueue(database, audit_log=SQLAuditLog(database))
+    await queue.submit(
+        action=ACTION,
+        summary="s",
+        payload={"a": 1},
+        requested_by=REQUESTER,
+        required_role="ops.approver",
+        ttl_seconds=60,
+    )
+    await database.aclose()
+    with contextlib.closing(sqlite3.connect(path)) as raw:
+        raw.execute(
+            f"CREATE INDEX {layout.LEGACY_PURGEABLE_INDEX} ON agent_core_approvals "
+            f"(({layout.FINISHED_AT_EXPRESSION}), id) WHERE {layout.PURGEABLE_PREDICATE}"
+        )
+        raw.execute(f"DROP INDEX {layout.PURGEABLE_INDEX}")
+        raw.commit()
+    reopened = open_database(f"sqlite:///{path}")
+
+    await SQLApprovalQueue(reopened, audit_log=SQLAuditLog(reopened)).submit(
+        action=ACTION,
+        summary="s2",
+        payload={"a": 2},
+        requested_by=REQUESTER,
+        required_role="ops.approver",
+        ttl_seconds=60,
+    )
+    await reopened.aclose()
+
+    with contextlib.closing(sqlite3.connect(path)) as raw:
+        names = {
+            row[0]
+            for row in raw.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'index' AND name LIKE '%purge%'"
+            )
+        }
+    assert names == {layout.PURGEABLE_INDEX}

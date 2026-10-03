@@ -1,14 +1,16 @@
-# Upgrading from 0.1.0a4 to 0.1.0a5
+# Upgrading from 0.1.0a4 to 0.1.0a6
 
-Release 0.1.0a5 completes the approvals model. A repeated submit returns the open request, an approval that lapses unused expires, stored payloads can be purged, an approver may be neither the requester nor a delegate, free text loses its control characters, and the audit append lock is bounded and keyed per schema. It changes the `ApprovalQueue` protocol, the `ApprovalRequest` model and the Postgres schema. There is one operator reinstall: run `install_postgres_schema` as the owner role again.
+0.1.0a5 was tagged but never released: there is no GitHub release and no wheel for it. 0.1.0a6 is the fix release and contains everything 0.1.0a5 had. Go from 0.1.0a4 straight to 0.1.0a6, in one step. This page describes that step. Nothing here asks you to install 0.1.0a5.
 
-This part of the page has an operator section, one for project 03 (its own backends), one for project 04 (the SQL backends), and a sub-section on the delegate rule, which is a behavior change. The upgrade from 0.1.0a3 to 0.1.0a4 follows further down and still applies to a database that is on a3. "What is not verified" at the end covers both.
+Release 0.1.0a6 completes the approvals model. A repeated submit returns the open request, an approval that lapses unused expires, stored payloads can be purged, an approver may be neither the requester nor a delegate, free text loses its control characters, and the audit append lock is bounded and keyed per schema. It changes the `ApprovalQueue` protocol, the `ApprovalRequest` model and the Postgres schema. There is one operator reinstall: run `install_postgres_schema` from 0.1.0a6 as the owner role again.
 
-Everything below was taken from the 0.1.0a5 change set. Where this page says "not tested", nothing was run.
+This part of the page has an operator section, one for project 03 (its own backends), one for project 04 (the SQL backends), and a sub-section on the delegate rule, which is a behavior change. The upgrade from 0.1.0a3 to 0.1.0a4 follows further down and still applies to a database that is on a3: a database on a3 gets the a4 changes and the changes below from the same single installer run of 0.1.0a6, and the a3 notes on the report still apply. "What is not verified" at the end covers both.
 
-## Operators (0.1.0a5)
+Everything below was taken from the 0.1.0a5 and 0.1.0a6 change sets (see CHANGELOG.md). Where this page says "not tested", nothing was run.
 
-1. **Install first, then deploy a5.** Run the installer as the owner role, with the same roles as before:
+## Operators (0.1.0a6)
+
+1. **Install first, then deploy a6.** Run the installer as the owner role, with the same roles as before:
 
    ```python
    from datetime import timedelta
@@ -26,11 +28,15 @@ Everything below was taken from the 0.1.0a5 change set. Where this page says "no
    print(report)
    ```
 
-   Both new keywords are shown at their defaults. The installer changes, in one run: it adds the column `approvals.payload_purged_at`; builds the unique index `agent_core_approvals_one_open` and the purge index `agent_core_approvals_purgeable`; replaces the approvals guard function (`approved -> expired`, the database stamping `closed_at` and `consumed_at` itself, the purge rule, the delegate rule, the `resolved_at` bound, the free-text rule, the revision comment and the floor comment); replaces the audit insert trigger (schema-keyed lock, revision comment); and grants the approver role column UPDATE on `payload_json` and `payload_purged_at`.
+   Both new keywords are shown at their defaults. The installer changes, in one run: it adds the column `approvals.payload_purged_at`; builds the unique index `agent_core_approvals_one_open` and the purge index `agent_core_approvals_purge_due`; replaces the approvals guard function (`approved -> expired`, the database stamping `closed_at`, `consumed_at`, a rejection's `resolved_at` and `payload_purged_at` itself, the purge rule, the delegate rule, the `resolved_at` bound, the free-text rule, the revision comment and the floor comment); replaces the audit insert trigger (schema-keyed lock, revision comment); and grants the approver role column UPDATE on `payload_json` and `payload_purged_at`.
 
-2. **A refused a4 schema.** An a5 queue or audit log refuses an a4 schema with a `ConfigError` before it writes anything. The insert trigger carries `-- agent-core audit trigger revision 5` and the guard `-- agent-core guard revision 5`; a connection that finds an older one tells the operator to run `install_postgres_schema` from 0.1.0a5 again. So run the installer before the first a5 process connects.
+   About the purge index: its predicate also requires the finish time to be a canonical timestamp, which matches the library's purge query on Postgres, so the planner can use it for the ordered scan. If the index `agent_core_approvals_purgeable` is present, the installer drops it. SQLite does the same on first use. A database coming from 0.1.0a4 has only the new index to build.
 
-3. **a4 code against an a5 schema: not tested.** What is known: the a4 library checked its schema by columns and had no knowledge of the new rules, so it would not detect the new guard and trigger. Whether it works against them was not tried. Plan a short window with no writers: stop the a4 processes, run the installer, start a5.
+   About the stamps: the guard writes `closed_at`, `consumed_at`, a rejection's `resolved_at` (never before the request's `created_at`) and `payload_purged_at` from the database clock, whatever the statement carried. An approval's `resolved_at` is not stamped, because it is not a finish time. It keeps its bound: not before `created_at`, within 5 minutes of the database clock.
+
+2. **A refused a4 schema.** An a6 queue or audit log refuses an a4 schema with a `ConfigError` before it writes anything. The insert trigger carries `-- agent-core audit trigger revision 5` and the guard `-- agent-core guard revision 6`; a connection that finds an older guard or trigger tells the operator to run `install_postgres_schema` from 0.1.0a6 again. So run the installer before the first a6 process connects.
+
+3. **a4 code against an a6 schema: not tested.** What is known: the a4 library checked its schema by columns and had no knowledge of the new rules, so it would not detect the new guard and trigger. Whether it works against them was not tried. Plan a short window with no writers: stop the a4 processes, run the installer, start a6.
 
 4. **Duplicates and `close_duplicates`.** 0.1.0a4 allowed several open requests for one requester, action and payload hash. A database that holds any is refused by the installer with a `ConfigError` that lists them, and nothing is changed. With `close_duplicates=True` the installer keeps each group's approved request (or, if none is approved, its oldest) and cancels the other pending ones. It writes no audit event for them. The ids it cancelled are in `InstallReport.closed_duplicates`; copy them into your own record. A group with two approved requests is still refused: a person decides which one stands, then the installer is run again.
 
@@ -38,15 +44,21 @@ Everything below was taken from the 0.1.0a5 change set. Where this page says "no
 
 6. **Purging needs the approver role.** The approver role gets column UPDATE on `(payload_json, payload_purged_at)`; the installer adds the grant once, when it upgrades a schema that predates the column, and a later run does not give back what you revoked. The requester role must not have that grant, and a connect check refuses a requester role that does. Whatever runs `purge_payloads` therefore connects as the approver role. See the project 04 section for the schedule.
 
-7. **SQLite needs nothing from you.** A file is upgraded in place on first use: the `payload_purged_at` column is added and the unique index is built. While the file holds duplicate open requests the library refuses, with a `ConfigError` that lists the ids, at the first submit. `cancel()` and reads still work, so the extras can be cancelled and the submit retried.
+   **Check `backdated_finishes` before the first purge.** The installer report has a new field, `backdated_finishes`: finished requests that still hold a payload and whose finish time is before their own creation or decision. 0.1.0a4 let the closing role write `closed_at` and `consumed_at`, so such a row is purgeable at once under any retention floor. At most 1000 ids are listed, by id. The installer changes nothing about them. A backdated time that still falls after the request's creation and decision cannot be told from a real one and is not listed. Look at each listed request before you run `purge_payloads`.
+
+7. **SQLite needs a new enough library, and nothing else from you.** A file is upgraded in place on first use: the `payload_purged_at` column is added, the unique index is built, the purge index `agent_core_approvals_purge_due` is built, and `agent_core_approvals_purgeable` is dropped if it exists. While the file holds duplicate open requests the library refuses, with a `ConfigError` that lists the ids, at the first submit. `cancel()` and reads still work, so the extras can be cancelled and the submit retried.
+
+   **SQLite 3.35 or later is required.** The queue reads back what it wrote with `UPDATE ... RETURNING`, which SQLite added in 3.35 (March 2021). `open_database` for a `sqlite:` URL refuses an older SQLite library with a `ConfigError` that names the version found and the minimum. The library is the one your Python is linked against: check `sqlite3.sqlite_version`. A Python build that links an older SQLite has to be replaced with one that links a newer SQLite, or you use Postgres. Postgres is not affected.
 
 8. **Check the lock settings.** A role that can connect can still hold the audit append lock and delay writers, for up to `lock_timeout` (5 seconds by default) for the library's own transactions. Set `idle_in_transaction_session_timeout` on the runtime roles.
 
-9. **A clock more than 5 minutes off.** The guard now requires an approver's `resolved_at` to be within 5 minutes of the database clock. The library writes the application's clock (`max(now, created_at)`), so an application host whose clock is more than 5 minutes off the database's has its `resolve` calls refused. Keep both on NTP.
+9. **A clock more than 5 minutes off.** The guard requires an approver's `resolved_at` to be within 5 minutes of the database clock. The library writes the application's clock (`max(now, created_at)`), so an application host whose clock is more than 5 minutes off the database's has its `resolve` calls refused. Keep both on NTP. The purge is not affected: the guard writes `payload_purged_at` itself, so `purge_payloads` no longer fails when a run lasts more than 5 minutes.
+
+10. **Sweeps skip a request another transaction holds.** On Postgres, `expire_due` and `purge_payloads` skip a request that another transaction holds (`FOR UPDATE SKIP LOCKED`) instead of failing the sweep with `LockNotAvailable` after `lock_timeout`. The next run takes it. SQLite is unchanged.
 
 A request already approved by one of its own delegates stays readable and consumable.
 
-## Project 03: its own backends (0.1.0a5)
+## Project 03: its own backends (0.1.0a6)
 
 If project 03's backends implement `ApprovalQueue`, they must match these rules. Nothing changes for the `AuditLog` protocol.
 
@@ -65,7 +77,7 @@ If project 03's backends implement `ApprovalQueue`, they must match these rules.
 
    It sets the stored payload to nothing, records when, keeps `payload_sha256`, and returns the count. The rules are in the project 04 section.
 
-2. **Make `submit` idempotent.** At most one request is open (pending, or approved and not yet consumed) per requester, action and payload hash, and the rule must hold when calls race, which means the store enforces it, not only the code. An exact repeat (same `required_role`, same lifetime, same `delegates`) returns the existing open request, with its stored payload if one was stored, and writes no audit event. A repeat that differs in `summary`, `required_role`, lifetime or `delegates` raises `ApprovalConflictError`, audited as `approval.submit_conflict`; so does one that asks for the payload to be stored (`include_payload`) when the open request has none. `context` is not compared. An open request past its lifetime is closed as expired in the same transaction and the new one is queued. The protocol docstring states this rule.
+2. **Make `submit` idempotent.** At most one request is open (pending, or approved and not yet consumed) per requester, action and payload hash, and the rule must hold when calls race, which means the store enforces it, not only the code. An exact repeat (same `required_role`, same lifetime, same `delegates`) returns the existing open request, with its stored payload if one was stored, and writes no audit event. A repeat that differs in `summary`, `required_role`, lifetime or `delegates` raises `ApprovalConflictError`, audited as `approval.submit_conflict` (its payload carries `approval_action`, as the other `approval.*` events do); so does one that asks for the payload to be stored (`include_payload`) when the open request has none. `context` is not compared. An open request past its lifetime is closed as expired in the same transaction and the new one is queued. The protocol docstring states this rule.
 
 3. **Allow `EXPIRED` with `decision` `approve`.** An approval that lapses unused is now `EXPIRED`, and keeps `decision`, `resolved_by` and `resolved_at`. `expire_due` sweeps approved, unconsumed requests too, and `get` reports a pending or approved request past its lifetime as `EXPIRED`. A backend that forbids `approved -> expired` would hold the unique key forever.
 
@@ -73,7 +85,7 @@ If project 03's backends implement `ApprovalQueue`, they must match these rules.
 
 5. **Add `payload_purged_at`.** `ApprovalRequest.payload_purged_at` is `AwareDatetime | None`. A purged request reads `payload` as `None` with `payload_purged_at` set. A request that never stored a payload reads both as `None`.
 
-6. **Handle `ApprovalConflictError`.** It is an `ApprovalError` with `existing: UUID` and `differs`, a sorted tuple that is a subset of `("delegates", "lifetime", "required_role")`.
+6. **Handle `ApprovalConflictError`.** It is an `ApprovalError` with `existing: UUID` and `differs`, a sorted tuple that is a subset of `("delegates", "lifetime", "payload", "required_role", "summary")`, or `("row",)` or `("payload",)` for an open request that cannot be read or whose stored payload fails its hash. It keeps its notes (`add_note`) as well as `existing` and `differs` when pickled or copied.
 
 7. **Free text.** `summary`, `reason` and a cancel reason may not contain control (Cc), format (Cf) or line and paragraph separator (Zl, Zp) characters. `SQLApprovalQueue` raises `ValidationError` for `summary` and `ValueError` for `reason`. Text already stored with them is shown with each such character replaced by U+FFFD. Audit and stored approval payloads may not contain NUL in any key or string.
 
@@ -81,7 +93,7 @@ If project 03's backends implement `ApprovalQueue`, they must match these rules.
 
 If 03 uses agent-core's `SQLAuditLog` and `Database`, the changes of the next section apply.
 
-## Project 04: the SQL backends (0.1.0a5)
+## Project 04: the SQL backends (0.1.0a6)
 
 1. **Expect the first request back from a repeated submit.** The same requester, action and payload hash, while a request is open, returns the existing request and writes no audit event. Tests that submit the same payload twice from one requester now get the first request back; change the payload, the action or the requester in a test that needs two requests.
 
@@ -98,7 +110,9 @@ If 03 uses agent-core's `SQLAuditLog` and `Database`, the changes of the next se
        ...
    ```
 
-   Decide in your code whether to wait for the existing request, cancel it and submit again, or surface the conflict. The conflict is audited as `approval.submit_conflict`. `context` is not compared, so a repeat that differs only in it returns the first request with the first context. A different `summary` is a conflict, which is what stops a row planted for your principal by another holder of the requester role from being adopted with its own summary. Because `requested_by` is written by the requester role, a compromised requester role can occupy another principal's key with a request of other terms. That principal then gets `ApprovalConflictError` naming the request, may cancel it (it is theirs by `requested_by`), and resubmit. This is a documented limit.
+   Two refusals are not an `ApprovalConflictError`. An open request stored with an id that is not a UUID raises `ApprovalIntegrityError` (audited as `approval.submit_conflict` with no `subject_id`). An open request the library cannot parse (reason `malformed_row`) cannot be cancelled through the library: the table owner must close it, see "A stored request the library cannot read" at the end of this page. A request whose stored payload fails its hash can still be cancelled.
+
+   Decide in your code whether to wait for the existing request, cancel it and submit again, or surface the conflict. The conflict is audited as `approval.submit_conflict`, and its audit payload carries `approval_action`. `context` is not compared, so a repeat that differs only in it returns the first request with the first context. A different `summary` is a conflict, which is what stops a row planted for your principal by another holder of the requester role from being adopted with its own summary. Because `requested_by` is written by the requester role, a compromised requester role can occupy another principal's key with a request of other terms. That principal then gets `ApprovalConflictError` naming the request, may cancel it (it is theirs by `requested_by`), and resubmit. This is a documented limit.
 
 3. **Do not read `APPROVED` as "usable".** An approved request past its lifetime now reads as `EXPIRED`, and `expire_due()` closes it. Check `is_expired`, or call `consume()`, which is the real test.
 
@@ -117,6 +131,7 @@ If 03 uses agent-core's `SQLAuditLog` and `Database`, the changes of the next se
    - It must run on a queue connected as the approver role: a requester-side queue raises `ConfigError`. Give the scheduled job approver credentials, and keep them apart from the requester's.
    - `older_than` must be at or above the installed floor (24 hours by default), or `ValueError`. 7 days is above it.
    - It purges requests that are consumed, rejected, cancelled or expired and have a stored payload, whose finish time is older than `older_than` by the database's clock (the application's on SQLite). The finish time is `consumed_at`, `resolved_at` (rejected) or `closed_at` (cancelled, expired). Pending and approved requests are never purged.
+   - On Postgres it skips a request another transaction holds, and the next run takes it, so a short batch does not always mean the backlog is empty. A run may last more than 5 minutes: the guard stamps `payload_purged_at` from the database clock.
    - It works in batches of `limit`, so run it until it returns less than `limit`. Each purged request gets one `approval.payload_purged` audit event in the same transaction. `payload_sha256` is kept.
    - A purged request reads `payload` as `None` and `payload_purged_at` as set. A UI must handle a request without a payload, and must not read `None` as "never stored" without checking `payload_purged_at`.
 
@@ -132,7 +147,7 @@ If 03 uses agent-core's `SQLAuditLog` and `Database`, the changes of the next se
 
 10. **The delegate rule.** See the next section: a `resolve` by a delegate is now refused.
 
-## The delegate rule (0.1.0a5)
+## The delegate rule (0.1.0a6)
 
 This is a behavior change, in its own commit.
 
@@ -320,7 +335,7 @@ Project 04 uses `SQLAuditLog` and `SQLApprovalQueue` on Postgres 17, with wrappe
    - **A host pool of size 1 delays that write.** If your pool has one connection and you hold it, the separate write waits 2 seconds, logs a warning and falls back to your transaction.
    - **The log must share the queue's database.** With `connection=`, a queue whose audit log is not a `SQLAuditLog` on the same `Database` object, or one opened from the same connection settings, raises `ConfigError`: events appended through another log would commit before your transaction does. A `from_pool` Database and a Database opened from a URL count as different, even on one server.
    - **Worst case: a refusal can be lost, and the only trace is the log.** Any role that can connect can hold the append lock (see below), so every refusal waits out its 2 seconds, falls back into your transaction, and is lost if you roll back. The log line names the action, subject, actor and reason. If the fallback fails too, the refusal is still raised, with a note on the exception saying it was not audited.
-   - **Other limits.** A separate refusal record carries the audit pool's `db_role`, not your connection's. If the separate commit fails in an ambiguous way, the fallback can leave a second copy of the refusal. Any role that can connect can hold the append lock with an idle transaction and stall every writer: set `idle_in_transaction_session_timeout` on the runtime roles. The lock is one key for the whole database, so all schemas share it. Both changed in 0.1.0a5: a `lock_timeout` on the library's own append transactions, and a lock key that includes the schema (see the 0.1.0a5 sections above).
+   - **Other limits.** A separate refusal record carries the audit pool's `db_role`, not your connection's. If the separate commit fails in an ambiguous way, the fallback can leave a second copy of the refusal. Any role that can connect can hold the append lock with an idle transaction and stall every writer: set `idle_in_transaction_session_timeout` on the runtime roles. The lock is one key for the whole database, so all schemas share it. Both changed in 0.1.0a5, which ships in 0.1.0a6: a `lock_timeout` on the library's own append transactions, and a lock key that includes the schema (see the 0.1.0a6 sections above).
 
 9. Use `append_many` for batches. One lock and one commit for up to 1000 events; all or nothing; an error names the event's index.
 
@@ -337,7 +352,7 @@ Project 04 uses `SQLAuditLog` and `SQLApprovalQueue` on Postgres 17, with wrappe
     request.payload  # the exact payload, or None if it was not stored
     ```
 
-    `summary` is written by the requester and is not covered by `payload_sha256`. A UI must show `payload` when it is present, and must not decide from `summary` alone. Handle `ApprovalIntegrityError` from `get`, and expect `list_pending` to omit a request whose stored payload does not match its hash. The payload is never copied into the audit log. Nothing purges a stored payload in 0.1.0a4: count it in your retention plan. (0.1.0a5 adds `purge_payloads`.)
+    `summary` is written by the requester and is not covered by `payload_sha256`. A UI must show `payload` when it is present, and must not decide from `summary` alone. Handle `ApprovalIntegrityError` from `get`, and expect `list_pending` to omit a request whose stored payload does not match its hash. The payload is never copied into the audit log. Nothing purges a stored payload in 0.1.0a4: count it in your retention plan. (0.1.0a6 adds `purge_payloads`.)
 
 12. Check that nothing in your wrappers depends on a connection per call. Every statement now runs with `prepare=False`, and isolation and `search_path` are set per transaction, never per session (`SET TRANSACTION`, `SET LOCAL`). There is no `LISTEN`, and advisory locks are transaction-level. That is what a transaction-mode pooler needs. It was not tested against one (see the end of this page).
 
@@ -368,7 +383,7 @@ It keeps every row and does not change a grant that is already there. The a3 not
 
 Other changes for the operator:
 
-- **Postgres 16 or later.** An older server is refused with a `ConfigError` at connect and at install. The message reads "This Postgres server is version 15; agent-core 0.1.0a4 needs 16 or later." (with the server's version).
+- **Postgres 16 or later.** An older server is refused with a `ConfigError` at connect and at install. The message reads "This Postgres server is version 15; agent-core <release> needs 16 or later." with the server's version and a release number (the current code names 0.1.0a5 there).
 - **Until you re-run the installer, an a3 schema is refused.** The audit log raises a `ConfigError` before it writes anything, and the approvals queue does the same when its table lacks `payload_json`. The audit log's message:
 
   > Table agent_core_audit was created by an earlier agent-core and has no recorded_at column. As the owner role, run install_postgres_schema from 0.1.0a4 with the requester and approver roles: it upgrades the schema in place and keeps every row.
@@ -380,19 +395,42 @@ Other changes for the operator:
 
 ## What is not verified
 
-Still not verified for 0.1.0a5:
+Still not verified for 0.1.0a6:
 
-- **A real pooler.** The design fits a transaction-mode pooler. It has not been run against pgbouncer or any other pooler, and a pgbouncer CI job is planned for 0.1.0a6.
+- **A sweep with a small `limit`.** `expire_due` and `purge_payloads` skip requests another transaction holds. If the oldest `limit` due requests are all held, a batch changes nothing and the run stops; the requests behind them wait for the next run.
+- **A real pooler.** The design fits a transaction-mode pooler. It has not been run against pgbouncer or any other pooler, and a pgbouncer CI job is planned for 0.1.0a7.
 - **Postgres 18 and later.** CI runs 16 on Python 3.11 to 3.14 and 17 on Python 3.12 in a separate job.
-- **0.1.0a5 on a large or busy database.** The upgrade was tested on small databases only, not on production-sized ones or with writers active.
+- **0.1.0a6 on a large or busy database.** The upgrade was tested on small databases only, not on production-sized ones or with writers active.
 - **An a4 database upgraded in place under load.** Plan a window with no writers.
-- **a4 code against an a5 schema.** Not tested.
+- **a4 code against an a6 schema.** Not tested.
+- **A SQLite library older than 3.35.** The refusal in `open_database` was not run against one.
 - **SQLite with two event loops on one `Database`.**
 - **The full house-standard checklists.** The audit checklists were not run in full.
-- **The full a4 to a5 installer path on a database that holds both duplicate open requests and approved requests,** beyond what the tests cover.
+- **The full a4 to a6 installer path on a database that holds both duplicate open requests and approved requests,** beyond what the tests cover.
 
 Carried over from the a3 to a4 upgrade:
 
 - **Postgres 17 in CI.** The Postgres test files passed against `postgres:17-alpine` on a developer machine. Postgres 18 and later were not tested.
 - **This upgrade on a large or busy database.** `tests/test_upgrade_from_a3.py` replays a schema dump made by 0.1.0a3 with four audit rows and one approval, upgrades it, and checks the rows, the chain and a second installer run. It has not been run on a production-sized database, or with writers active.
 - **Mixed versions.** An a3 library writing to an a4 schema has not been tested. Plan a short window with no writers: stop the a3 processes, run the installer, start a4.
+
+## A stored request the library cannot read
+
+An open request (pending, or approved and not yet used) holds its requester, action and payload hash: no second one can be queued while it stands. A row the library cannot parse, or one stored with an id that is not a UUID, cannot be used, cancelled or expired through the library, so a `submit` that meets it is refused and audited as `approval.submit_conflict`, and it keeps the key until the table owner closes it. Such a row exists only if it was written before the guard (0.1.0a2) or past it; the guard refuses to insert one.
+
+`submit` names what it found. For a row with a UUID it raises `ApprovalConflictError` with `existing` set and `reason` `malformed_row` in the audit event, and says the owner must close it. For an id that is not a UUID it raises `ApprovalIntegrityError` and the audit event has no `subject_id`. A request whose payload fails its hash is different: it can still be cancelled, which its error says.
+
+To free the key, as the table owner (the guard has to be switched off for the one statement, so this is a person's decision, and it writes no audit event: record it yourself):
+
+```sql
+BEGIN;
+ALTER TABLE public.agent_core_approvals DISABLE TRIGGER agent_core_approvals_guard;
+UPDATE public.agent_core_approvals
+   SET status = 'cancelled',
+       closed_at = to_char(now() AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"')
+ WHERE id = '<the id>' AND status IN ('pending', 'approved');
+ALTER TABLE public.agent_core_approvals ENABLE TRIGGER agent_core_approvals_guard;
+COMMIT;
+```
+
+Use your schema in place of `public`. The row stays in the table, unreadable, but no longer open.

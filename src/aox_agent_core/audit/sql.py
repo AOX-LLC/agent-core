@@ -391,7 +391,7 @@ class SQLAuditLog:
                     f"The audit insert trigger on {self._table} is older than this release "
                     f"(revision {revision or 'before 5'}, this release needs "
                     f"{layout.AUDIT_TRIGGER_REVISION}). As the owner role, run "
-                    "install_postgres_schema from 0.1.0a5 with the requester and approver roles."
+                    "install_postgres_schema from 0.1.0a6 with the requester and approver roles."
                 )
         await bring_table_up_to_date(session, AUDIT_TABLE, ADDED_COLUMNS, schema=self._table.schema)
         self._protections_checked = True

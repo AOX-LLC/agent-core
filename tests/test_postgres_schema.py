@@ -35,6 +35,8 @@ from databases import (
     postgres_database,
     split_queue,
 )
+from test_approval_payload import raw_request
+from test_approvals import REQUESTER
 
 A2_SCHEMA = Path(__file__).parent / "fixtures" / "postgres" / "a2_schema.sql"
 STATES = ("pending", "approved", "rejected", "consumed", "cancelled", "expired")
@@ -819,3 +821,128 @@ def test_closing_is_refused_when_the_audit_log_lives_elsewhere(
         )
 
     assert status_of(pg, request_id) == "approved"
+
+
+def test_the_installer_lists_finished_requests_whose_finish_time_a_client_backdated(
+    control_database: ControlDatabase,
+) -> None:
+    """0.1.0a4 let the closing role write closed_at and consumed_at: such a row is purgeable
+    at once under any floor. The report names them, only those still holding a payload."""
+    if control_database.owner_url is None or control_database.superuser_url is None:
+        pytest.skip("the installer is Postgres only")
+    now = datetime.now(UTC)
+
+    def stamp(moment: datetime) -> str:
+        return "'" + moment.strftime("%Y-%m-%dT%H:%M:%S.%fZ") + "'"
+
+    def plant(**columns: str) -> str:
+        row_id = str(uuid4())
+        control_database.superuser_raw(
+            "SET session_replication_role = replica; "
+            + raw_request(
+                **{
+                    "id": f"'{row_id}'",
+                    "created_at": stamp(now - timedelta(days=2)),
+                    "expires_at": stamp(now - timedelta(days=1)),
+                    "payload_json": "'{\"a\": 1}'",
+                    **columns,
+                }
+            )
+        )
+        return row_id
+
+    decided = {
+        "decision": "'approve'",
+        "resolved_by": "'user-17'",
+        "resolved_at": stamp(now - timedelta(days=1, hours=12)),
+    }
+    cancelled_before_created = plant(status="'cancelled'", closed_at=stamp(now - timedelta(days=9)))
+    consumed_before_approved = plant(
+        status="'consumed'", consumed_at=stamp(now - timedelta(days=1, hours=20)), **decided
+    )
+    honest = plant(status="'cancelled'", closed_at=stamp(now - timedelta(hours=3)))
+    # Clock skew the guard allows (5 minutes) is not tampering: the stamp is the database's.
+    skewed_requester = plant(
+        status="'cancelled'",
+        created_at=stamp(now + timedelta(minutes=3)),
+        expires_at=stamp(now + timedelta(hours=1)),
+        closed_at=stamp(now),
+    )
+    skewed_approver = plant(
+        status="'consumed'",
+        consumed_at=stamp(now),
+        **{**decided, "resolved_at": stamp(now + timedelta(minutes=4))},
+    )
+    purged = plant(
+        status="'cancelled'",
+        closed_at=stamp(now - timedelta(days=9)),
+        payload_json="NULL",
+        payload_purged_at=stamp(now),
+    )
+    still_open = plant(status="'pending'")
+    # Values past the shape pattern that no timestamp parser accepts: the report must not fail.
+    impossible_day = plant(status="'cancelled'", closed_at="'2026-02-30T00:00:00.000000Z'")
+    impossible_time = plant(status="'cancelled'", closed_at="'2026-01-01T25:61:61.000000Z'")
+    impossible_created = plant(
+        status="'cancelled'",
+        created_at="'2026-13-01T00:00:00.000000Z'",
+        closed_at=stamp(now),
+    )
+
+    report = install_postgres_schema(
+        control_database.owner_url,
+        requester_role=REQUESTER_ROLE,
+        approver_role=APPROVER_ROLE,
+        schema=control_database.schema,
+    )
+
+    assert set(report.backdated_finishes) == {cancelled_before_created, consumed_before_approved}
+    assert {
+        honest,
+        skewed_requester,
+        skewed_approver,
+        purged,
+        still_open,
+        impossible_day,
+        impossible_time,
+        impossible_created,
+    }.isdisjoint(report.backdated_finishes)
+    assert cancelled_before_created in str(report)
+    again = install_postgres_schema(
+        control_database.owner_url,
+        requester_role=REQUESTER_ROLE,
+        approver_role=APPROVER_ROLE,
+        schema=control_database.schema,
+    )
+    assert again.backdated_finishes == report.backdated_finishes
+
+
+async def test_an_approvals_guard_of_revision_5_is_refused_until_the_installer_is_run_again(
+    control_database: ControlDatabase,
+) -> None:
+    if control_database.superuser_url is None:
+        pytest.skip("the guard is Postgres only")
+    schema = control_database.schema
+    definition = control_database.superuser_raw(
+        f"SELECT pg_get_functiondef('{schema}.agent_core_approvals_guard()'::regprocedure)"
+    )[0][0]
+    assert "-- agent-core guard revision 6" in definition
+    control_database.superuser_raw(
+        definition.replace("-- agent-core guard revision 6", "-- agent-core guard revision 5")
+    )
+
+    queue = split_queue(control_database)
+    with pytest.raises(ConfigError, match=r"revision 5; this release needs 6"):
+        await queue.submit(
+            action="crm.update_contact",
+            summary="s",
+            payload={"a": 1},
+            requested_by=REQUESTER,
+            required_role="ops.approver",
+            ttl_seconds=60,
+        )
+    with pytest.raises(ConfigError, match=r"revision 5; this release needs 6"):
+        await queue.approver.purge_payloads(
+            principal=Principal(id="svc-retention", kind=PrincipalKind.SERVICE),
+            older_than=timedelta(days=2),
+        )

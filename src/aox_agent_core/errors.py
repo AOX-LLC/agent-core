@@ -161,7 +161,9 @@ class ApprovalConflictError(ApprovalError):
         self.differs = differs
 
     def __reduce__(self) -> tuple[Any, ...]:
-        return (_conflict_error, (self.args[0], self.existing, self.differs))
+        # The third item is the instance dict, which carries `existing`, `differs` and any
+        # notes added with add_note(), so none of them is lost on pickling or copying.
+        return (_conflict_error, (self.args[0], self.existing, self.differs), self.__dict__)
 
 
 def _conflict_error(

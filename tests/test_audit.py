@@ -434,11 +434,20 @@ async def test_a_write_sent_as_a_read_on_a_missing_file_fails_loudly(tmp_path: P
         await database.run(lambda session: session.execute("CREATE TABLE stray (a INTEGER)"))
 
 
-def test_too_old_sqlite_is_refused(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(sqlite3, "sqlite_version_info", (3, 14, 2))
+@pytest.mark.parametrize("version", [(3, 14, 2), (3, 34, 1)])
+def test_a_sqlite_older_than_3_35_is_refused_with_what_to_do(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, version: tuple[int, int, int]
+) -> None:
+    monkeypatch.setattr(sqlite3, "sqlite_version_info", version)
 
-    with pytest.raises(ConfigError, match="too old"):
+    with pytest.raises(ConfigError, match=r"needs 3\.35\.0 or later.*RETURNING.*use Postgres"):
         open_database(f"sqlite:///{tmp_path / 'audit.sqlite3'}")
+
+
+def test_sqlite_3_35_is_accepted(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(sqlite3, "sqlite_version_info", (3, 35, 0))
+
+    open_database(f"sqlite:///{tmp_path / 'audit.sqlite3'}")
 
 
 # db_role: who wrote each row, as the database saw it

@@ -4,7 +4,7 @@ agent-core is a small Python library for routed Claude model calls, structured o
 
 ## Status
 
-`v0.1.0a5`, the fifth pre-release. What works:
+`v0.1.0a6`, the sixth pre-release (`v0.1.0a5` was tagged but never released). What works:
 
 - routed Claude calls with cost-based tiers, structured outputs, cost and OpenTelemetry tracing;
 - versioned prompts (`PromptRef`) and PNG, JPEG and PDF attachments;
@@ -56,22 +56,22 @@ An attachment's type is read from its first bytes, never from its name, and is c
 
 ## Install
 
-The distribution is named `aox-agent-core`. Replace `vX.Y.Z` with a release tag. The examples use `v0.1.0a5`.
+The distribution is named `aox-agent-core`. Replace `vX.Y.Z` with a release tag. The examples use `v0.1.0a6`.
 
 ```sh
-pip install "aox-agent-core @ git+https://github.com/AOX-LLC/agent-core@v0.1.0a5"
+pip install "aox-agent-core @ git+https://github.com/AOX-LLC/agent-core@v0.1.0a6"
 ```
 
 With extras:
 
 ```sh
-pip install "aox-agent-core[postgres,otel] @ git+https://github.com/AOX-LLC/agent-core@v0.1.0a5"
+pip install "aox-agent-core[postgres,otel] @ git+https://github.com/AOX-LLC/agent-core@v0.1.0a6"
 ```
 
 With uv:
 
 ```sh
-uv add "aox-agent-core @ git+https://github.com/AOX-LLC/agent-core" --tag v0.1.0a5
+uv add "aox-agent-core @ git+https://github.com/AOX-LLC/agent-core" --tag v0.1.0a6
 ```
 
 | Extra      | Adds                                         |
@@ -156,7 +156,7 @@ async def main() -> None:
         )
 ```
 
-Storage is async. A Postgres `Database` owns a connection pool (`max_connections`, default 10) that opens on first use, on the running event loop: use one `Database` per event loop, and close it with `await database.aclose()` or `async with`. `PostgresDatabase.from_pool(pool)` borrows a pool you own and never closes it. SQLite keeps one connection per `Database` on a worker thread, one transaction at a time. Postgres 16 or later is required, and the library refuses an older server with a `ConfigError`. Every statement runs with `prepare=False`, and isolation and `search_path` are set per transaction, so a transaction-mode pooler is the design target; it has not been tested against one.
+Storage is async. A Postgres `Database` owns a connection pool (`max_connections`, default 10) that opens on first use, on the running event loop: use one `Database` per event loop, and close it with `await database.aclose()` or `async with`. `PostgresDatabase.from_pool(pool)` borrows a pool you own and never closes it. SQLite keeps one connection per `Database` on a worker thread, one transaction at a time. Postgres 16 or later is required, and the library refuses an older server with a `ConfigError`. SQLite 3.35 or later is required (the library uses `UPDATE ... RETURNING`); `open_database` refuses an older SQLite library, the one your Python is linked against, with a `ConfigError`. Every statement runs with `prepare=False`, and isolation and `search_path` are set per transaction, so a transaction-mode pooler is the design target; it has not been tested against one.
 
 A script with no event loop of its own wraps a log or a queue in `aox_agent_core.sync`, which runs it on a background loop thread:
 
@@ -196,7 +196,7 @@ Each audit record carries `db_role`, the database role that inserted it, set by 
 
 SQLite has no roles and is not a trust boundary: anyone who can write the file is fully trusted, and the library's checks are all it has. A SQLite queue acts for both sides.
 
-See [docs/upgrade-0.1.0a3.md](docs/upgrade-0.1.0a3.md) for the role layout, the transition table, setup and the upgrade from `v0.1.0a2`, which let one app role set a request to approved with plain SQL. To go from `v0.1.0a4` to `v0.1.0a5` (or from a3), see [docs/upgrading.md](docs/upgrading.md): the operator re-runs `install_postgres_schema` as the owner, and an older schema is refused until then. `examples/control_layer_demo.py` walks through the audit log and approvals, and `evals/run_triage_eval.py` runs the synthetic eval suite and prints its scorecard.
+See [docs/upgrade-0.1.0a3.md](docs/upgrade-0.1.0a3.md) for the role layout, the transition table, setup and the upgrade from `v0.1.0a2`, which let one app role set a request to approved with plain SQL. To go from `v0.1.0a4` to `v0.1.0a6` (or from a3; a5 was never released), see [docs/upgrading.md](docs/upgrading.md): the operator re-runs `install_postgres_schema` as the owner, and an older schema is refused until then. `examples/control_layer_demo.py` walks through the audit log and approvals, and `evals/run_triage_eval.py` runs the synthetic eval suite and prints its scorecard.
 
 ## Bedrock
 

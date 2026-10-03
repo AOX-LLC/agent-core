@@ -8,11 +8,42 @@ Pre-releases are spelled the PEP 440 way, so tags look like `v0.1.0a1`.
 
 ## [Unreleased]
 
-### 0.1.0a5
+## [0.1.0a6] - 2026-10-03
+
+Fix release for 0.1.0a5. **0.1.0a5 was tagged but never released** (see below): upgrade from 0.1.0a4 straight to 0.1.0a6. Details are added below as each fix lands.
+
+### Changed (breaking)
+
+- The guard writes `payload_purged_at` itself, from the database's clock, whatever the purge statement carried (it still requires a canonical timestamp there), as it does for `closed_at` and `consumed_at`. In 0.1.0a5 the guard required the supplied value to be within 5 minutes of its clock, and `purge_payloads` took one reading of the application clock at the start of the run, so a run that went on for more than 5 minutes (a large backlog, `limit` batches) was refused partway. `purge_payloads` now reads the application clock per batch (which only SQLite stores).
+- A rejection's `resolved_at` is its finish time, which the retention floor counts from, so the guard writes it too: the database's clock, never before the request's `created_at`. Before, the approver role chose it, within 5 minutes of the database clock, which was enough to slip under a short installed floor. An approval's `resolved_at` is not a finish time and is unchanged. `resolve` returns the stored value.
+- The approvals guard is revision 6 (`-- agent-core guard revision 6`). A connection refuses revision 5, so run `install_postgres_schema` from 0.1.0a6 as the owner role before the first 0.1.0a6 process connects (see docs/upgrading.md).
+
+### Fixed
+
+- The purge index now matches the library's purge query on Postgres. `purge_payloads` also requires the finish time to be a canonical timestamp, which the 0.1.0a5 index predicate did not carry, so the planner could not use the index for the ordered scan: it read every due row and sorted them, for each batch, under a backlog (300,000 due rows in a probe: 3.8 s per batch, 0.26 ms with the index). The index is `agent_core_approvals_purge_due`, with the condition in its predicate; the installer drops the 0.1.0a5 index `agent_core_approvals_purgeable` and builds the new one (SQLite does the same on first use). A request whose finish time is not canonical is still never purged.
+
+### Changed
+
+- SQLite 3.35 (March 2021) is the declared minimum, up from the 3.15 the code checked. The approval queue reads back what the store wrote with `UPDATE ... RETURNING` (closed, and since this release a decision's `resolved_at`), which SQLite added in 3.35. `open_database` for a `sqlite:` URL raises a `ConfigError` that names the version your Python is linked against and the minimum, and says to use a Python build with a newer SQLite or Postgres, instead of failing with a syntax error on the first close. Postgres is unaffected. `sqlite3.sqlite_version` shows what you have.
+- `ApprovalConflictError` keeps its notes (`add_note`) as well as `existing` and `differs` when it is pickled or copied.
+- The `approval.submit_conflict` audit event records `approval_action` in its payload, as the other `approval.*` events do.
+- A `submit` that meets an open request stored with an id that is not a UUID no longer crashes with a `ValueError`. It raises `ApprovalIntegrityError` naming the id (cut to 40 characters), and audits `approval.submit_conflict` with no `subject_id`.
+- The refusal for an open request the library cannot parse (`malformed_row`) no longer says "Cancel it, then submit again": `cancel` cannot read such a row, so that advice failed. It says the table owner must close it, and docs/upgrading.md gives the procedure ("A stored request the library cannot read"). A request whose stored payload fails its hash can be cancelled, and still says so. The row keeps its key until the owner acts: the library cannot close what it cannot read.
+- `expire_due` and `purge_payloads` skip a request another transaction holds (`FOR UPDATE SKIP LOCKED`, taken by the UPDATE after the audit append lock, so the lock order is unchanged) instead of failing the whole sweep with `LockNotAvailable` after `lock_timeout`. The request is picked up by the next sweep. SQLite is unchanged.
+- `install_postgres_schema` reports `InstallReport.backdated_finishes`: finished requests that still hold a payload and whose finish time is before their own creation or decision (at most 1000, by id). 0.1.0a4 let the closing role write `closed_at` and `consumed_at`, so such a row is purgeable at once under any retention floor; the guard has written those times itself since 0.1.0a5. The installer changes nothing about them; check them before the first purge. A backdated time that still falls after the request's creation and decision cannot be told from a real one and is not listed. The 5 minute allowance is the guard's skew bound; rows written under 0.1.0a4, which bounded none of these times, can be listed for honest skew between two hosts, so read the list as candidates. A planted row with an impossible date (such as `2026-02-30`) is skipped, not an installer failure.
+
+### Known limits
+
+- Test isolation (a test-suite issue, not the library; for Phase 5). The Postgres tests create the requester and approver roles, and roles are cluster-wide, not per database. Two test runs, or a test run and a review probe, against the same Postgres server at once can collide on them. On Python 3.14 two of five full local runs failed in the installer and schema tests (3 to 4 failures each, none reproducible alone), while 3.11 passed every run. The collision is the suspected cause and was not confirmed. Run one suite at a time against a test server until the tests use their own role names.
+
+## [0.1.0a5] - 2026-10-03
+
+**Tagged but not released; use 0.1.0a6.** The `v0.1.0a5` tag exists, but the release workflow refused it because this section was filed under Unreleased, so there is no GitHub release and no published wheel. The tag stays where it is. Everything in this section ships in 0.1.0a6.
+
 
 Approvals completion: a repeated submit returns the open request instead of a second one, approvals that lapse unused expire, stored payloads can be purged, an approver may be neither the requester nor a delegate, free text with control characters is refused, and the audit append lock is bounded and keyed per schema. One operator reinstall: run `install_postgres_schema` as the owner role again (see docs/upgrading.md).
 
-#### Changed (breaking)
+### Changed (breaking)
 
 - Submit is idempotent. A partial unique index, `agent_core_approvals_one_open`, on approvals `(requested_by, action, payload_sha256)` where `status IN ('pending', 'approved')`, the same index on Postgres and SQLite, allows at most one open request (pending, or approved and not yet consumed) per requester, action and payload hash, so it holds when calls race. `submit` keeps its signature. An exact repeat (same `required_role`, same lifetime, meaning `expires_at - created_at == ttl_seconds`, and same `delegates`) returns the existing open request, with its stored payload if one was stored, and writes no audit event. Tests that submit the same payload twice from one requester now get the first request back.
 - A repeat that asks for the payload to be stored (`include_payload=True`) must find that same payload stored on the open request: otherwise it differs in `payload`. Asking for less than is stored is fine. A repeat that differs in `summary`, `required_role`, lifetime or `delegates`, or in `payload`, raises the new `ApprovalConflictError` (an `ApprovalError`) with `existing: UUID` and `differs: tuple[str, ...]`, a sorted subset of `("delegates", "lifetime", "payload", "required_role", "summary")`, or `("row",)` or `("payload",)` for an open request that cannot be read or whose stored payload fails its hash. It is audited as `approval.submit_conflict`: actor is the requester, subject is the existing request's id, and the payload has `differs` as a comma-joined string. `context` is not compared; the first submit's stays.
@@ -26,9 +57,9 @@ Approvals completion: a repeated submit returns the open request instead of a se
 - `SQLAuditLog(..., lock_timeout=timedelta(seconds=5))`: the library's own append transactions wait for the append lock at most that long, then raise the new `AuditLockTimeoutError` (an `AuditError`, sqlstate `55P03`) and write nothing. Inside a host's transaction (`connection=`) the bound is applied for the append and the host's own `lock_timeout` is put back.
 - The advisory lock key is per schema: `hashtextextended('agent_core_audit:' || schema, 0)`, computed in SQL by the library and by the insert trigger alike. The constants `audit.sql.APPEND_LOCK_KEY` and `_postgres_schema.AUDIT_APPEND_LOCK_KEY` are removed.
 - The `ApprovalQueue` protocol gains `purge_payloads` (see Added), and documents the idempotent-submit rule: a host-supplied queue must implement it. `SyncApprovalQueue` gains `purge_payloads` too.
-- The Postgres schema changes: the new column `approvals.payload_purged_at`; the unique index; a replaced approvals guard (`approved -> expired`, the purge rule, the delegate rule, the `resolved_at` bound, the text rule, `-- agent-core guard revision 5`, and the floor comment); a replaced audit insert trigger (schema-keyed lock, `-- agent-core audit trigger revision 5`); and a column grant for the approver role on `payload_json` and `payload_purged_at`. A connection refuses an older trigger or guard with a `ConfigError` that tells the operator to run `install_postgres_schema` from 0.1.0a5 again, before anything is written. SQLite files are upgraded in place on first use.
+- The Postgres schema changes: the new column `approvals.payload_purged_at`; the unique index; a replaced approvals guard (`approved -> expired`, the purge rule, the delegate rule, the `resolved_at` bound, the text rule, `-- agent-core guard revision 5`, and the floor comment); a replaced audit insert trigger (schema-keyed lock, `-- agent-core audit trigger revision 5`); and a column grant for the approver role on `payload_json` and `payload_purged_at`. A connection refuses an older trigger or guard with a `ConfigError` that tells the operator to run `install_postgres_schema` again (from 0.1.0a6, which replaces the guard and trigger written by an 0.1.0a4 or a 0.1.0a5 install), before anything is written. SQLite files are upgraded in place on first use.
 
-#### Added
+### Added
 
 - `purge_payloads(*, principal, older_than, limit=500, connection=None) -> int` on `SQLApprovalQueue`, the `ApprovalQueue` protocol and `SyncApprovalQueue`. It sets `payload_json` to NULL and stamps the new column `payload_purged_at` on requests that are consumed, rejected, cancelled or expired, have a stored payload, and whose finish time is older than `older_than` by the database's clock (the application clock on SQLite). The finish time is `consumed_at` for consumed, `resolved_at` for rejected, and `closed_at` for cancelled and expired. It works in batches of `limit`, like `expire_due`, and writes one `approval.payload_purged` audit event per purged request (payload: `approval_action`, `payload_sha256`, `request_status`) in the same transaction. `payload_sha256` is never changed. Nothing else purges a payload.
 - Only the approver role may purge: `ConfigError` on a requester-side queue. The requester role has no UPDATE on `payload_json` or `payload_purged_at`, and the connect check refuses a requester role that has it. The guard allows exactly one change to those columns: `payload_json` from non-NULL to NULL together with `payload_purged_at` from NULL to a canonical timestamp within 5 minutes of the database clock, by the approver role, on a finished request whose finish time plus the installed floor is already past. Every other change is refused: restoring a payload, clearing the mark, marking without purging, marking a request that never stored a payload, and a purge that changes anything else.
@@ -40,12 +71,12 @@ Approvals completion: a repeated submit returns the open request instead of a se
 - `agent_core_approvals_purgeable`, a partial index on finished requests that still hold a payload, by finish time: `purge_payloads` and `expire_due` read their candidates first and take the schema-wide append lock only for their writes.
 - Delegate rule (its own commit): the approver may be neither the requester nor one of the request's delegates. `RoleApproverPolicy` denies after the self-approval check, and the guard refuses a `resolved_by` that is in the request's `delegates`. `list_pending` no longer offers a request to its own delegate. A delegate may still consume. A 0.1.0a4 request already approved by one of its own delegates stays readable and consumable, because the model does not forbid it.
 
-#### Changed
+### Changed
 
 - Free text already stored with control, format or separator characters is shown with each such character replaced by U+FFFD, by `get` and `list_pending`.
 - Lock order. A deadlock reproduced in a test: a host that appends first and then touches a request's row through `connection=`, against the queue's own transaction that took the row first and then the lock, and Postgres aborted one with `40P01`. The queue's own write transactions (no `connection=`) now take the append lock before they touch the request row. With `connection=` the queue does not take the lock early, because the transaction is the host's and a refusal is audited apart from it. A host should append, or let the library do both, before it updates approval rows in its own transaction, and never the reverse.
 
-#### Security
+### Security
 
 - At most one request is open per requester, action and payload hash, and the unique index holds when calls race. A repeat with other terms is refused and audited rather than merged.
 - Control, bidirectional and zero-width characters in `summary`, `reason` and a cancel reason are refused on the way in by the library and the Postgres guard, and neutralised on the way out for text already stored. This fixes the a4 limit on control, ANSI and bidi characters in those fields.
@@ -54,7 +85,7 @@ Approvals completion: a repeated submit returns the open request instead of a se
 - Stored payloads can be purged, and only by the approver role, only after the retention floor, and only with an audit event. 0.1.0a4 had no way to purge one. Run `purge_payloads` on a schedule with `older_than` at or above the floor; project 04 keeps arguments at most 7 days.
 - An approver can no longer be one of the request's own delegates, checked by the policy and by the guard.
 
-#### Known limits
+### Known limits
 
 - `requested_by` is written by the requester role. A compromised requester role can occupy another principal's key with a request of other terms. That principal then gets `ApprovalConflictError` naming the request, may cancel it (it is theirs by `requested_by`), and may resubmit.
 - In a host's transaction (`connection=`) a queue call still takes the request's row first and the append lock second, as the host's earlier writes decide. A host that appends first and then calls the queue, against a library-owned call on the same request, can still be aborted by Postgres with `40P01`; append before you touch approval rows, or let the library do both. Reproduced only with the race window widened. A host that uses `connection=` should retry its transaction when it gets `40P01` (`psycopg.errors.DeadlockDetected`): Postgres aborts one side, nothing of it is committed, and a retry succeeds.
@@ -64,7 +95,7 @@ Approvals completion: a repeated submit returns the open request instead of a se
 - The database cannot force an audit event: with plain SQL a role can submit, decide, cancel, consume or purge without one. Only the installer's `unaudited_approvals` scan looks for approvals with no event. A reconciliation check is not built.
 - `verify()` still stops at the first record that is malformed or has a wrong hash. A verify mode that reports every problem and keeps walking is planned for 0.1.0a6.
 - The per-listing cost of requests the library hides or skips is unchanged: each costs a check on every listing, logged at most once a minute. An in-process cache of rejected rows is planned for 0.1.0a6.
-- Not in 0.1.0a5, planned for 0.1.0a6: concurrent-append coalescing, `wait_for_decision`, the `anthropic` optional extra with recording format 3 (and its live re-record), and a pgbouncer CI job. The base install still depends on `anthropic`, replay still needs it, and a transaction-mode pooler is still not tested.
+- Not in 0.1.0a5 or 0.1.0a6, planned for 0.1.0a7: concurrent-append coalescing, `wait_for_decision`, the `anthropic` optional extra with recording format 3 (and its live re-record), and a pgbouncer CI job. The base install still depends on `anthropic`, replay still needs it, and a transaction-mode pooler is still not tested.
 - Fixed in 0.1.0a5, from the 0.1.0a4 list: control and bidi characters in free text, the unbounded `resolved_at`, the unbounded append wait, and the database-wide lock key.
 
 ## [0.1.0a4] - 2026-10-03
@@ -110,7 +141,7 @@ Async storage on a connection pool, batch appends, writes inside a host's Postgr
 - Stored approval payloads are bound to the request. `resolve` refuses a request whose stored payload does not match `payload_sha256` and audits `approval.resolve_denied` with reason `payload_integrity`; the request stays pending. `get` raises `ApprovalIntegrityError` and `list_pending` omits it. `cancel`, `consume` and `expire_due` do not check a stored payload and return `payload=None`, so a requester can always withdraw. A stored payload must also pass the rules a submit applies (keys, integers only, size, secrets) when it is read, so one the requester wrote with plain SQL cannot show an approver a float, an unsafe integer or a secret, and a malformed one (`1e400`, a huge integer, deep nesting) hides only its own request. A stored run context is still read as it was written, so a rule added later never makes a request unreadable; an audit event about a stored request whose context today's rules refuse is written without it and carries `run_context_dropped`, so a decision, a refusal or the expiry sweep is never blocked by it. A request left out of a listing is logged, at most once a minute, with a count and the first id; hash mismatches are rejected first, so hiding a forged row is cheap, and a page is checked off the event loop. The Postgres guard bounds a run context at 2048 bytes and 16 external ids, and delegates at 4096 bytes. The payload is never copied into the audit log. `summary` is written by the requester and is not covered by the hash, so a UI must show `payload` when present.
 - The Postgres guard makes `payload_json` immutable after insert and refuses a value that is not a JSON object or is over 8192 bytes. The requester and approver roles have no UPDATE on it.
 - `recorded_at`, like `db_role`, is guaranteed by the database trigger, not by the chain: a table owner could edit it undetected. On SQLite the library writes it from the writer's clock, so it is not independent there.
-- Nothing purges a stored payload. Count it in retention and deletion plans. (Addressed in 0.1.0a5, see Unreleased.)
+- Nothing purges a stored payload. Count it in retention and deletion plans. (Addressed in 0.1.0a5.)
 - The audit insert trigger also bounds the text columns a writing role can fill: `action`, `actor_id` and `subject_id` by the library's own patterns and lengths, `payload` at 8192 bytes and a JSON object, `run_context` at 2048 bytes and a JSON object. The approvals guard measures a request's lifetime in 168 hours, not "7 days", which the writer's session time zone could stretch to 169 hours and make unreadable. `tests/test_untrusted_columns.py` holds the matrix: for every column the requester role can write with plain SQL, a hostile value is refused by the database or survived by every reader.
 - A stored request this library will not read (a lifetime or decision order its model refuses) no longer crashes readers: `list_pending` leaves it out and logs, `get` raises `ApprovalIntegrityError`, `resolve`, `consume` and `cancel` refuse it with an audited `malformed_row` denial, and `expire_due` skips it and logs. A request dated up to five minutes ahead is decided at its own date, not before it. `verify()` reports a record it cannot parse or hash as `AuditIntegrityError`, not a raw exception.
 
@@ -120,9 +151,9 @@ Async storage on a connection pool, batch appends, writes inside a host's Postgr
 
 Found in review and left for 0.1.0a5:
 
-- Any role that can connect can hold the single, database-wide append lock and stall every writer; the library's own append transactions have no `lock_timeout` yet. Set `idle_in_transaction_session_timeout` on the runtime roles. (Addressed in 0.1.0a5, see Unreleased.)
-- `summary` (requester) and `reason` (approver) accept control, ANSI and bidi characters, up to 500 characters. A UI or terminal that shows them must neutralize them. (Addressed in 0.1.0a5, see Unreleased.)
-- The approver role may set any canonical `resolved_at`, even one before the request's `created_at`; the library then refuses to read that request. (Addressed in 0.1.0a5, see Unreleased.)
+- Any role that can connect can hold the single, database-wide append lock and stall every writer; the library's own append transactions have no `lock_timeout` yet. Set `idle_in_transaction_session_timeout` on the runtime roles. (Addressed in 0.1.0a5.)
+- `summary` (requester) and `reason` (approver) accept control, ANSI and bidi characters, up to 500 characters. A UI or terminal that shows them must neutralize them. (Addressed in 0.1.0a5.)
+- The approver role may set any canonical `resolved_at`, even one before the request's `created_at`; the library then refuses to read that request. (Addressed in 0.1.0a5.)
 - `verify()` stops at the first record that is malformed or has a wrong hash; its message names the record but, for a malformed one, not the `db_role` column. Tampering after that record is not checked until it is dealt with.
 - The database cannot force an audit event: with plain SQL a role can submit, decide, cancel or consume without one. Only the installer's `unaudited_approvals` scan looks for approvals with no event.
 - A requester can fill the approvals table with rows this library hides or skips; each costs a small check on every listing, and is logged at most once a minute.
@@ -212,7 +243,9 @@ The first pre-release. Projects can pin it; the API may still change before 0.1.
 - Extras `bedrock`, `postgres`, `otel` and `testing`; examples for a routed call and for the control layer.
 - CI on every pull request (lint, types, tests on Python 3.11 to 3.14 with Postgres, package check, gitleaks) and a tag-driven release workflow.
 
-[Unreleased]: https://github.com/AOX-LLC/agent-core/compare/v0.1.0a4...HEAD
+[Unreleased]: https://github.com/AOX-LLC/agent-core/compare/v0.1.0a6...HEAD
+[0.1.0a6]: https://github.com/AOX-LLC/agent-core/compare/v0.1.0a5...v0.1.0a6
+[0.1.0a5]: https://github.com/AOX-LLC/agent-core/compare/v0.1.0a4...v0.1.0a5
 [0.1.0a4]: https://github.com/AOX-LLC/agent-core/compare/v0.1.0a3...v0.1.0a4
 [0.1.0a3]: https://github.com/AOX-LLC/agent-core/compare/v0.1.0a2...v0.1.0a3
 [0.1.0a2]: https://github.com/AOX-LLC/agent-core/compare/v0.1.0a1...v0.1.0a2

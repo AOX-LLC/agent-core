@@ -25,8 +25,9 @@ only its own credentials cannot step outside them with plain SQL:
 One more change is allowed, to the stored payload alone: the approver role may purge
 it (payload_json to NULL, payload_purged_at set) on a finished request (consumed,
 rejected, cancelled or expired) whose finish time is further back than the installed
-retention floor by the database's clock. The guard writes closed_at and consumed_at itself,
-from its own clock, whatever the statement carried, so a finish time cannot be backdated.
+retention floor by the database's clock. The guard writes closed_at, consumed_at, a
+rejection's resolved_at and payload_purged_at itself, from its own clock, whatever the
+statement carried, so a finish time cannot be backdated.
 Every other change is refused, as are DELETE and TRUNCATE, and no update may touch a
 request's identity, payload hash, requester, required role, lifetime, run context or
 delegates.
@@ -52,7 +53,7 @@ AUDIT_LOCK_PREFIX: Final = "agent_core_audit:"
 # Which revision of the guard function and the audit insert trigger this release writes
 # (a comment inside each). A connection refuses an older one, so a release that changes
 # them is not run against a schema it has not been installed over.
-GUARD_REVISION: Final = 5
+GUARD_REVISION: Final = 6
 AUDIT_TRIGGER_REVISION: Final = 5
 # The oldest Postgres the library is tested on and supports (16.0).
 POSTGRES_MINIMUM_VERSION_NUM: Final = 160000
@@ -65,14 +66,24 @@ OPEN_REQUEST_INDEX: Final = "agent_core_approvals_one_open"
 OPEN_REQUEST_COLUMNS: Final = ("requested_by", "action", "payload_sha256")
 OPEN_REQUEST_STATUSES: Final = ("pending", "approved")
 # What purge_payloads scans for: finished requests that still hold a payload, by finish time.
-PURGEABLE_INDEX: Final = "agent_core_approvals_purgeable"
+# On Postgres the library's scan also requires the finish time to be a canonical timestamp
+# (a planted row with another spelling is left alone), and the index carries that condition:
+# a partial index serves a query only if the query's WHERE implies the index predicate, and
+# with the condition in the query alone the planner read every due row and sorted them.
+# The index was renamed in 0.1.0a6 because 0.1.0a5's has the narrower predicate.
+PURGEABLE_INDEX: Final = "agent_core_approvals_purge_due"
+LEGACY_PURGEABLE_INDEX: Final = "agent_core_approvals_purgeable"
 FINISHED_AT_EXPRESSION: Final = (
     "CASE status WHEN 'consumed' THEN consumed_at WHEN 'rejected' THEN resolved_at "
     "ELSE closed_at END"
 )
+CANONICAL_STAMP_PATTERN: Final = r"'^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:]{8}[.][0-9]{6}Z$'"
 PURGEABLE_PREDICATE: Final = (
     "status IN ('consumed', 'rejected', 'cancelled', 'expired') "
     "AND payload_json IS NOT NULL AND payload_purged_at IS NULL"
+)
+PURGEABLE_PREDICATE_POSTGRES: Final = (
+    f"{PURGEABLE_PREDICATE} AND ({FINISHED_AT_EXPRESSION}) ~ {CANONICAL_STAMP_PATTERN}"
 )
 ROLES_TABLE: Final = "agent_core_approval_roles"
 
@@ -288,8 +299,9 @@ def approvals_tables_ddl(schema: str) -> tuple[str, ...]:
         f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS delegates TEXT NOT NULL DEFAULT '[]'",
         f"""CREATE INDEX IF NOT EXISTS agent_core_approvals_pending
         ON {table} (status, created_at, id)""",
+        f"DROP INDEX IF EXISTS {quoted_schema}.{LEGACY_PURGEABLE_INDEX}",
         f"""CREATE INDEX IF NOT EXISTS {PURGEABLE_INDEX}
-        ON {table} (({FINISHED_AT_EXPRESSION}), id) WHERE {PURGEABLE_PREDICATE}""",
+        ON {table} (({FINISHED_AT_EXPRESSION}), id) WHERE {PURGEABLE_PREDICATE_POSTGRES}""",
         f"""CREATE TABLE IF NOT EXISTS {roles} (
             singleton BOOLEAN PRIMARY KEY DEFAULT TRUE CHECK (singleton),
             requester_role TEXT NOT NULL,
@@ -391,8 +403,9 @@ DECLARE
     is_expired boolean;
     is_purge boolean;
     finished_at text;
-    -- When a request is closed or used, the database writes the time itself: a client
-    -- cannot backdate it to slip under the payload retention floor, or future-date it.
+    -- When a request is closed, rejected, used or purged, the database writes the time
+    -- itself: a client cannot backdate it to slip under the payload retention floor, or
+    -- future-date it, and a purge run longer than the 5 minute skew bound still passes.
     db_stamp text := to_char(statement_timestamp() AT TIME ZONE 'UTC',
                              'YYYY-MM-DD"T"HH24:MI:SS.US"Z"');
 BEGIN
@@ -507,8 +520,6 @@ BEGIN
         END IF;
         IF NEW.payload_purged_at IS NULL OR OLD.payload_purged_at IS NOT NULL
            OR NOT_CANONICAL(NEW.payload_purged_at)
-           OR NEW.payload_purged_at::timestamptz NOT BETWEEN db_now - interval '5 minutes'
-                                                         AND db_now + interval '5 minutes'
            OR ROW(NEW.decision, NEW.resolved_by, NEW.resolved_at, NEW.reason, NEW.consumed_at,
                   NEW.closed_at)
               IS DISTINCT FROM
@@ -516,6 +527,7 @@ BEGIN
                   OLD.closed_at) THEN
             RAISE EXCEPTION 'a purge sets payload_json to NULL and payload_purged_at only';
         END IF;
+        NEW.payload_purged_at := db_stamp;
         RETURN NEW;
     END IF;
     is_expired := OLD.expires_at::timestamptz <= db_now;
@@ -545,6 +557,12 @@ BEGIN
            OR NEW.consumed_at IS DISTINCT FROM OLD.consumed_at
            OR NEW.closed_at IS DISTINCT FROM OLD.closed_at THEN
             RAISE EXCEPTION 'a decision sets decision, resolved_by and resolved_at only';
+        END IF;
+        -- A rejection is a finish time, which the retention floor counts from: the
+        -- database writes it (never before the request was created), as for closed_at.
+        IF NEW.status = 'rejected' THEN
+            NEW.resolved_at := to_char(GREATEST(db_now, OLD.created_at::timestamptz)
+                                       AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"');
         END IF;
         RETURN NEW;
     END IF;
@@ -640,6 +658,16 @@ class InstallReport:
     before 0.1.0a3. closed_approvals lists those the run cancelled, when asked.
     closed_duplicates lists the pending requests the run cancelled, when asked, because
     another open request already held their requester, action and payload hash.
+    backdated_finishes lists finished requests that still hold a payload and whose finish
+    time is more than 5 minutes (the guard's clock skew) before their own creation or
+    decision (at most 1000, by id). 0.1.0a4 let the role that closed a request write that
+    time, so each of these is purgeable at once under any retention floor, whenever it
+    really finished; since 0.1.0a5 the database writes the time. The installer changes
+    nothing about them: check them before the first purge. Rows written under 0.1.0a4, which
+    bounded none of these times, can be listed for honest skew between the requester's and
+    the approver's hosts, so read the list as candidates. An empty list does not show that
+    nothing was backdated: a time moved back but still after the request's own history is
+    not detectable here.
     """
 
     schema: str
@@ -649,6 +677,7 @@ class InstallReport:
     unaudited_approvals: tuple[str, ...] = field(default=())
     closed_approvals: tuple[str, ...] = field(default=())
     closed_duplicates: tuple[str, ...] = field(default=())
+    backdated_finishes: tuple[str, ...] = field(default=())
 
     def __str__(self) -> str:
         lines = [
@@ -670,6 +699,13 @@ class InstallReport:
         if self.closed_duplicates:
             lines.append("Pending duplicates cancelled by this run, as asked:")
             lines += [f"  {request_id}" for request_id in self.closed_duplicates]
+        if self.backdated_finishes:
+            lines.append(
+                "Finished requests holding a payload whose finish time is more than 5 minutes "
+                "before they were created or decided (0.1.0a4 let a client write it): a purge "
+                "would take them at once, so check them first:"
+            )
+            lines += [f"  {request_id}" for request_id in self.backdated_finishes]
         return "\n".join(lines)
 
 
@@ -743,7 +779,7 @@ async def require_postgres_version(session: "Session") -> None:
     version_num = int((await session.execute("SELECT current_setting('server_version_num')"))[0][0])
     if version_num < POSTGRES_MINIMUM_VERSION_NUM:
         raise ConfigError(
-            f"This Postgres server is version {version_num // 10000}; agent-core 0.1.0a5 "
+            f"This Postgres server is version {version_num // 10000}; agent-core 0.1.0a6 "
             f"needs {POSTGRES_MINIMUM_VERSION_NUM // 10000} or later."
         )
 
@@ -785,7 +821,7 @@ async def check_connection(session: "Session", schema: str) -> str:
             f"The approvals table in {schema} is not protected by the database "
             f"({'missing or disabled: ' + ', '.join(missing) if missing else 'no role table'}): "
             "it was created by agent-core 0.1.0a2, or its guard was removed. As the owner "
-            "role, run install_postgres_schema from 0.1.0a5 with the requester and approver "
+            "role, run install_postgres_schema from 0.1.0a6 with the requester and approver "
             "roles; it upgrades the schema in place and keeps every row."
         )
     revision = await _guard_revision(session, table)
@@ -793,7 +829,7 @@ async def check_connection(session: "Session", schema: str) -> str:
         raise ConfigError(
             f"The approvals guard in {schema} is revision {revision or 'older than 5'}; this "
             f"release needs {GUARD_REVISION}. As the owner role, run install_postgres_schema "
-            "from 0.1.0a5 with the requester and approver roles: it upgrades the schema in "
+            "from 0.1.0a6 with the requester and approver roles: it upgrades the schema in "
             "place and keeps every row (see docs/upgrading.md)."
         )
     await _require_open_request_index(session, schema, table)
@@ -863,7 +899,7 @@ async def payload_retention_floor_seconds(session: "Session", schema: str) -> in
     if found is None:
         raise ConfigError(
             f"The approvals guard in {schema} carries no payload retention floor. As the owner "
-            "role, run install_postgres_schema from 0.1.0a5."
+            "role, run install_postgres_schema from 0.1.0a6."
         )
     return int(found[1])
 
@@ -897,7 +933,7 @@ async def _require_open_request_index(session: "Session", schema: str, table: st
             f"The approvals table in {schema} has no valid unique index {OPEN_REQUEST_INDEX} "
             "on (requested_by, action, payload_sha256) for pending and approved requests, so "
             "two identical submits could both be approved. As the owner role, run "
-            "install_postgres_schema from 0.1.0a5 with the requester and approver roles."
+            "install_postgres_schema from 0.1.0a6 with the requester and approver roles."
         )
 
 

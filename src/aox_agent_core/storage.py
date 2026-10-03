@@ -42,8 +42,9 @@ ResultT = TypeVar("ResultT")
 
 SQLITE_BUSY_TIMEOUT_SECONDS = 30.0
 POSTGRES_DEFAULT_PORT = 5432
-# Row-value comparisons, which approval listing uses, arrived in SQLite 3.15.
-SQLITE_MINIMUM_VERSION = (3, 15, 0)
+# UPDATE ... RETURNING, which the approval queue uses to read back the time the guard or the
+# store wrote, arrived in SQLite 3.35 (2021-03). Row-value comparisons need 3.15.
+SQLITE_MINIMUM_VERSION = (3, 35, 0)
 POSTGRES_MINIMUM_VERSION_NUM = layout.POSTGRES_MINIMUM_VERSION_NUM
 DEFAULT_MAX_CONNECTIONS = 10
 
@@ -201,8 +202,10 @@ class SQLiteDatabase(Database):
     def __init__(self, path: Path) -> None:
         if sqlite3.sqlite_version_info < SQLITE_MINIMUM_VERSION:
             raise ConfigError(
-                f"SQLite {sqlite3.sqlite_version} is too old; the library needs "
-                f"{'.'.join(map(str, SQLITE_MINIMUM_VERSION))} or later."
+                f"The SQLite library this Python is linked against is {sqlite3.sqlite_version}; "
+                f"agent-core needs {'.'.join(map(str, SQLITE_MINIMUM_VERSION))} or later "
+                "(it uses UPDATE ... RETURNING). Use a Python build that links a newer SQLite, "
+                "or use Postgres."
             )
         self.path = path
         self._connection: sqlite3.Connection | None = None
@@ -604,7 +607,7 @@ async def bring_table_up_to_date(
     if session.dialect is Dialect.POSTGRES:
         raise ConfigError(
             f"Table {table} was created by an earlier agent-core and has no {', '.join(missing)} "
-            "column. As the owner role, run install_postgres_schema from 0.1.0a5 with the "
+            "column. As the owner role, run install_postgres_schema from 0.1.0a6 with the "
             "requester and approver roles: it upgrades the schema in place and keeps every row."
         )
     for column in missing:
@@ -760,6 +763,7 @@ def install_postgres_schema(
             unaudited_approvals=tuple(unaudited),
             closed_approvals=tuple(unaudited) if close_unaudited_approvals else (),
             closed_duplicates=tuple(closed_duplicates),
+            backdated_finishes=tuple(await _backdated_finishes(session, schema)),
         )
 
     async def run() -> InstallReport:
@@ -797,6 +801,40 @@ async def _unaudited_approvals(session: Session, schema: str, approver_role: str
     (or from before 0.1.0a3) approves."""
     sql = _UNAUDITED_APPROVALS_SQL.format(**_qualified_tables(schema))
     return [row[0] for row in await session.execute(sql, (approver_role,))]
+
+
+async def _backdated_finishes(session: Session, schema: str) -> list[str]:
+    """Finished requests still holding a payload whose finish time is more than 5 minutes
+    (the guard's clock skew) before their creation or before their own decision: what a client
+    that wrote its own finish time (0.1.0a4) could leave. It finds only that: a finish time
+    moved back but still after the request's own history looks real and is not listed.
+
+    Every value is shape-checked and then checked to be a valid timestamp
+    (pg_input_is_valid, Postgres 16 and later) before it is cast, in a CASE so no cast runs on
+    a planted row with another spelling or an impossible date such as 2026-02-30: such a row
+    must not make the installer fail and roll back the upgrade. The shape pattern alone is
+    looser than the guard's. Rows that fail either check are never purged, so they are not
+    listed.
+    """
+    approvals = _qualified_tables(schema)["approvals"]
+    finished = layout.FINISHED_AT_EXPRESSION
+    shape = layout.CANONICAL_STAMP_PATTERN
+
+    def before(column: str) -> str:
+        return (
+            f"CASE WHEN ({finished}) ~ {shape} AND {column} ~ {shape} "
+            f"AND pg_input_is_valid(({finished}), 'timestamptz') "
+            f"AND pg_input_is_valid({column}, 'timestamptz') "
+            f"THEN ({finished})::timestamptz < {column}::timestamptz - interval '5 minutes' "
+            "ELSE false END"
+        )
+
+    rows = await session.execute(
+        f"SELECT id FROM {approvals} WHERE status IN ('consumed', 'rejected', 'cancelled', "
+        "'expired') AND payload_json IS NOT NULL AND payload_purged_at IS NULL "
+        f"AND ({before('created_at')} OR {before('resolved_at')}) ORDER BY id LIMIT 1000"
+    )
+    return [row[0] for row in rows]
 
 
 def _qualified_tables(schema: str) -> dict[str, str]:
