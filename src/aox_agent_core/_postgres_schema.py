@@ -213,6 +213,12 @@ _GUARD_BODY = """
 DECLARE
     requester_role text := '<requester>';
     approver_role text := '<approver>';
+    -- The shapes the library writes; rows of any other shape are refused, so
+    -- casts never depend on session settings and every row parses on read.
+    timestamp_shape text := '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}[.][0-9]{6}Z$';
+    principal_shape text := '^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$';
+    opaque_shape text := '^[A-Za-z0-9][A-Za-z0-9._:/-]{0,199}$';
+    run_context jsonb;
     as_requester boolean;
     as_approver boolean;
     db_now timestamptz := statement_timestamp();
@@ -231,6 +237,45 @@ BEGIN
     IF TG_OP = 'INSERT' THEN
         IF NOT as_requester THEN
             RAISE EXCEPTION 'only the requester role may submit approval requests';
+        END IF;
+        IF NEW.id !~ '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+           OR NEW.action !~ '^[a-z][a-z0-9_]*([.][a-z][a-z0-9_]*)*$'
+           OR length(NEW.action) > 100
+           OR length(NEW.summary) NOT BETWEEN 1 AND 500
+           OR NEW.payload_sha256 !~ '^[0-9a-f]{64}$'
+           OR NEW.requested_by !~ principal_shape
+           OR NEW.required_role !~ '^[a-z][a-z0-9_.-]{0,63}$'
+           OR NEW.created_at !~ timestamp_shape
+           OR NEW.expires_at !~ timestamp_shape THEN
+            RAISE EXCEPTION 'a new approval request has a field of the wrong shape';
+        END IF;
+        IF jsonb_typeof(NEW.delegates::jsonb) <> 'array'
+           OR jsonb_array_length(NEW.delegates::jsonb) > 16
+           OR EXISTS (
+               SELECT 1 FROM jsonb_array_elements(NEW.delegates::jsonb) AS delegate
+               WHERE jsonb_typeof(delegate) <> 'string' OR delegate #>> '{}' !~ principal_shape
+           ) THEN
+            RAISE EXCEPTION 'delegates must be at most 16 principal ids';
+        END IF;
+        IF NEW.run_context IS NOT NULL THEN
+            run_context := NEW.run_context::jsonb;
+            IF jsonb_typeof(run_context) <> 'object'
+               OR EXISTS (
+                   SELECT 1 FROM jsonb_object_keys(run_context) AS key
+                   WHERE key NOT IN ('run_id', 'external_ids')
+               )
+               OR jsonb_typeof(run_context -> 'run_id') IS DISTINCT FROM 'string'
+               OR run_context ->> 'run_id' !~ opaque_shape
+               OR jsonb_typeof(COALESCE(run_context -> 'external_ids', '{}'::jsonb)) <> 'object'
+               OR EXISTS (
+                   SELECT 1
+                   FROM jsonb_each(COALESCE(run_context -> 'external_ids', '{}'::jsonb)) AS id
+                   WHERE id.key !~ '^[a-z][a-z0-9_]{0,63}$'
+                      OR jsonb_typeof(id.value) <> 'string'
+                      OR id.value #>> '{}' !~ opaque_shape
+               ) THEN
+                RAISE EXCEPTION 'run_context must be a run id and opaque external ids';
+            END IF;
         END IF;
         IF NEW.status <> 'pending' OR NEW.decision IS NOT NULL OR NEW.resolved_by IS NOT NULL
            OR NEW.resolved_at IS NOT NULL OR NEW.consumed_at IS NOT NULL
@@ -264,7 +309,9 @@ BEGIN
         IF NEW.decision IS DISTINCT FROM
                (CASE NEW.status WHEN 'approved' THEN 'approve' ELSE 'reject' END)
            OR NEW.resolved_by IS NULL OR NEW.resolved_by = OLD.requested_by
-           OR NEW.resolved_at IS NULL
+           OR NEW.resolved_by !~ principal_shape
+           OR NEW.resolved_at IS NULL OR NEW.resolved_at !~ timestamp_shape
+           OR (NEW.reason IS NOT NULL AND length(NEW.reason) NOT BETWEEN 1 AND 500)
            OR NEW.consumed_at IS DISTINCT FROM OLD.consumed_at
            OR NEW.closed_at IS DISTINCT FROM OLD.closed_at THEN
             RAISE EXCEPTION 'a decision sets decision, resolved_by and resolved_at only';
@@ -282,7 +329,7 @@ BEGIN
         IF NEW.status = 'expired' AND NOT is_expired THEN
             RAISE EXCEPTION 'approval request % has not expired yet', OLD.id;
         END IF;
-        IF NEW.closed_at IS NULL
+        IF NEW.closed_at IS NULL OR NEW.closed_at !~ timestamp_shape
            OR ROW(NEW.decision, NEW.resolved_by, NEW.resolved_at, NEW.reason, NEW.consumed_at)
               IS DISTINCT FROM
               ROW(OLD.decision, OLD.resolved_by, OLD.resolved_at, OLD.reason, OLD.consumed_at) THEN
@@ -298,7 +345,7 @@ BEGIN
         IF is_expired THEN
             RAISE EXCEPTION 'approval request % has expired', OLD.id;
         END IF;
-        IF NEW.consumed_at IS NULL
+        IF NEW.consumed_at IS NULL OR NEW.consumed_at !~ timestamp_shape
            OR ROW(NEW.decision, NEW.resolved_by, NEW.resolved_at, NEW.reason, NEW.closed_at)
               IS DISTINCT FROM
               ROW(OLD.decision, OLD.resolved_by, OLD.resolved_at, OLD.reason, OLD.closed_at) THEN

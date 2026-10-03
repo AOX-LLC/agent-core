@@ -601,3 +601,103 @@ async def test_an_a2_schema_is_upgraded_in_place() -> None:
             ).outside_layout
             == report.outside_layout
         )
+
+
+# Row shapes: the guard refuses what the library could not read back
+
+
+def insert_sql(**overrides: str) -> str:
+    columns = {
+        "id": f"'{uuid4()}'",
+        "action": "'crm.update_contact'",
+        "summary": "'s'",
+        "payload_sha256": f"'{'a' * 64}'",
+        "requested_by": "'agent-intake'",
+        "required_role": "'ops.approver'",
+        "created_at": f"'{stamp(NOW)}'",
+        "expires_at": f"'{stamp(NOW + timedelta(hours=1))}'",
+        "status": "'pending'",
+        **overrides,
+    }
+    return (
+        f"INSERT INTO agent_core_approvals ({', '.join(columns)}) "
+        f"VALUES ({', '.join(columns.values())})"
+    )
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"created_at": f"'{NOW:%Y-%m-%d %H:%M:%S}'"},
+        {"expires_at": "'infinity'"},
+        {"id": "'not-a-uuid'"},
+        {"action": "'Not An Action'"},
+        {"summary": "''"},
+        {"payload_sha256": "'ABC'"},
+        {"requested_by": "'jane@example.com'"},
+        {"required_role": "'Ops Approver'"},
+        {"delegates": "'{\"a\": 1}'"},
+        {"delegates": "'[\"has space\"]'"},
+        {"delegates": "'[" + ", ".join(f'"svc-{n}"' for n in range(17)) + "]'"},
+        {"run_context": '\'{"run_id": "r1", "extra": 1}\''},
+        {"run_context": '\'{"run_id": "r1", "external_ids": {"Bad": "x"}}\''},
+        {"run_context": "'[1]'"},
+    ],
+    ids=[
+        "created-at-local-time",
+        "expires-at-infinity",
+        "id",
+        "action",
+        "empty-summary",
+        "payload-hash",
+        "requested-by-email",
+        "required-role",
+        "delegates-object",
+        "delegate-shape",
+        "too-many-delegates",
+        "run-context-extra-key",
+        "run-context-id-name",
+        "run-context-array",
+    ],
+)
+def test_the_guard_refuses_rows_of_the_wrong_shape(
+    pg: ControlDatabase, overrides: dict[str, str]
+) -> None:
+    assert pg.requester_raw is not None
+
+    assert refused(pg.requester_raw, insert_sql(**overrides))
+    assert not refused(pg.requester_raw, insert_sql())
+
+
+def test_a_session_time_zone_cannot_stretch_a_lifetime(pg: ControlDatabase) -> None:
+    # Without an offset, a timestamp would be read in the session's time zone.
+    assert pg.requester_raw is not None
+    local = (NOW + timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%S.%f")
+
+    assert refused(
+        pg.requester_raw,
+        "SET TimeZone = 'Pacific/Kiritimati'; " + insert_sql(expires_at=f"'{local}'"),
+    )
+
+
+@pytest.mark.parametrize(
+    "assignments",
+    [
+        "resolved_at = '2026-10-02 12:00:00'",
+        "resolved_by = 'jane@example.com', resolved_at = '{now}'",
+        "reason = '', resolved_at = '{now}'",
+    ],
+    ids=["resolved-at", "resolved-by", "empty-reason"],
+)
+def test_a_decision_of_the_wrong_shape_is_refused(pg: ControlDatabase, assignments: str) -> None:
+    assert pg.approver_raw is not None
+    request_id = planted(pg, "pending")
+    sql = (
+        "UPDATE agent_core_approvals SET status = 'approved', decision = 'approve', "
+        + ("resolved_by = 'user-17', " if "resolved_by" not in assignments else "")
+        + assignments.format(now=stamp(NOW))
+        + f" WHERE id = '{request_id}'"
+    )
+
+    assert refused(pg.approver_raw, sql)
+    assert status_of(pg, request_id) == "pending"
