@@ -4,7 +4,7 @@ agent-core is a small Python library for routed Claude model calls, structured o
 
 ## Status
 
-`v0.1.0a5`, the fifth pre-release. What works:
+`v0.1.0a6`, the sixth pre-release (`v0.1.0a5` was tagged but never released). What works:
 
 - routed Claude calls with cost-based tiers, structured outputs, cost and OpenTelemetry tracing;
 - versioned prompts (`PromptRef`) and PNG, JPEG and PDF attachments;
@@ -56,22 +56,22 @@ An attachment's type is read from its first bytes, never from its name, and is c
 
 ## Install
 
-The distribution is named `aox-agent-core`. Replace `vX.Y.Z` with a release tag. The examples use `v0.1.0a5`.
+The distribution is named `aox-agent-core`. Replace `vX.Y.Z` with a release tag. The examples use `v0.1.0a6`.
 
 ```sh
-pip install "aox-agent-core @ git+https://github.com/AOX-LLC/agent-core@v0.1.0a5"
+pip install "aox-agent-core @ git+https://github.com/AOX-LLC/agent-core@v0.1.0a6"
 ```
 
 With extras:
 
 ```sh
-pip install "aox-agent-core[postgres,otel] @ git+https://github.com/AOX-LLC/agent-core@v0.1.0a5"
+pip install "aox-agent-core[postgres,otel] @ git+https://github.com/AOX-LLC/agent-core@v0.1.0a6"
 ```
 
 With uv:
 
 ```sh
-uv add "aox-agent-core @ git+https://github.com/AOX-LLC/agent-core" --tag v0.1.0a5
+uv add "aox-agent-core @ git+https://github.com/AOX-LLC/agent-core" --tag v0.1.0a6
 ```
 
 | Extra      | Adds                                         |
@@ -196,7 +196,7 @@ Each audit record carries `db_role`, the database role that inserted it, set by 
 
 SQLite has no roles and is not a trust boundary: anyone who can write the file is fully trusted, and the library's checks are all it has. A SQLite queue acts for both sides.
 
-See [docs/upgrade-0.1.0a3.md](docs/upgrade-0.1.0a3.md) for the role layout, the transition table, setup and the upgrade from `v0.1.0a2`, which let one app role set a request to approved with plain SQL. To go from `v0.1.0a4` to `v0.1.0a5` (or from a3), see [docs/upgrading.md](docs/upgrading.md): the operator re-runs `install_postgres_schema` as the owner, and an older schema is refused until then. `examples/control_layer_demo.py` walks through the audit log and approvals, and `evals/run_triage_eval.py` runs the synthetic eval suite and prints its scorecard.
+See [docs/upgrade-0.1.0a3.md](docs/upgrade-0.1.0a3.md) for the role layout, the transition table, setup and the upgrade from `v0.1.0a2`, which let one app role set a request to approved with plain SQL. To go from `v0.1.0a4` to `v0.1.0a6` (or from a3; a5 was never released), see [docs/upgrading.md](docs/upgrading.md): the operator re-runs `install_postgres_schema` as the owner, and an older schema is refused until then. `examples/control_layer_demo.py` walks through the audit log and approvals, and `evals/run_triage_eval.py` runs the synthetic eval suite and prints its scorecard.
 
 ## Bedrock
 
