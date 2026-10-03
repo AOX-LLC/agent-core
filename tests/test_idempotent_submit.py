@@ -543,3 +543,15 @@ def test_errors_with_extra_fields_survive_pickling_and_copying() -> None:
             ("lifetime",),
         )
     assert str(pickle.loads(pickle.dumps(AuditLockTimeoutError("t")))) == "t"  # noqa: S301
+
+
+def test_a_conflict_error_keeps_its_notes_when_pickled_or_copied() -> None:
+    import copy
+    import pickle
+
+    conflict = ApprovalConflictError("m", existing=uuid4(), differs=("lifetime",))
+    conflict.add_note("while submitting request r-1")
+
+    for clone in (pickle.loads(pickle.dumps(conflict)), copy.copy(conflict)):  # noqa: S301
+        assert clone.__notes__ == ["while submitting request r-1"]
+        assert (clone.existing, clone.differs) == (conflict.existing, ("lifetime",))
