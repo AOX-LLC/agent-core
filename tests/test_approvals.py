@@ -66,12 +66,17 @@ def queue_for(database: ControlDatabase, clock: Clock | None = None) -> SplitQue
 
 
 async def submitted(
-    queue: SQLApprovalQueue | SplitQueue, requester: Principal = REQUESTER
+    queue: SQLApprovalQueue | SplitQueue,
+    requester: Principal = REQUESTER,
+    *,
+    payload: dict[str, Any] | None = None,
 ) -> ApprovalRequest:
+    """A request; give each one its own `payload` when a test needs several, since only one
+    request may be open for the same requester, action and payload."""
     return await queue.submit(
         action="crm.update_contact",
         summary="Update the sample contact's phone number",
-        payload=PAYLOAD,
+        payload=payload if payload is not None else PAYLOAD,
         requested_by=requester,
         required_role="ops.approver",
         ttl_seconds=3_600,
@@ -403,7 +408,7 @@ async def test_list_pending_filters_expired_own_and_other_role_requests(
     await queue.submit(
         action="crm.update_contact",
         summary="Needs another role",
-        payload=PAYLOAD,
+        payload={**PAYLOAD, "n": 2},
         requested_by=REQUESTER,
         required_role="finance.approver",
         ttl_seconds=3_600,
@@ -520,7 +525,7 @@ async def test_custom_policy_listing_pages_through_tied_timestamps(
 
     policy = EveryThird(set())
     queue = split_queue(control_database, policy=policy, clock=Clock())  # one created_at
-    submitted_ids = [(await submitted(queue)).id for _ in range(10)]
+    submitted_ids = [(await submitted(queue, payload={**PAYLOAD, "n": n})).id for n in range(10)]
     in_listing_order = sorted(submitted_ids, key=str)
     policy.wanted = set(in_listing_order[::3])
 
@@ -551,8 +556,8 @@ async def test_a_full_listing_reads_no_extra_page(
     control_database: ControlDatabase, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     queue = queue_for(control_database)
-    for _ in range(2):
-        await submitted(queue)
+    for n in range(2):
+        await submitted(queue, payload={**PAYLOAD, "n": n})
     transactions = 0
     # Listing is the approver's: it runs on the approver's connection.
     run = control_database.approver_database.run
@@ -574,7 +579,7 @@ async def test_list_pending_pages_with_an_after_cursor(control_database: Control
     created = []
     for minute in range(5):
         clock.now = clock.start + timedelta(minutes=minute)
-        created.append((await submitted(queue)).id)
+        created.append((await submitted(queue, payload={**PAYLOAD, "n": minute})).id)
 
     first = await queue.list_pending(APPROVER, limit=2)
     second = await queue.list_pending(APPROVER, limit=2, after=first[-1].id)
@@ -609,7 +614,7 @@ async def test_an_approver_side_role_map_overrides_what_the_requester_asked_for(
     proper = await queue.submit(
         action="crm.update_contact",
         summary="s",
-        payload=PAYLOAD,
+        payload={**PAYLOAD, "n": 2},
         requested_by=REQUESTER,
         required_role="finance.approver",
         ttl_seconds=3_600,
@@ -661,7 +666,7 @@ async def test_trusting_the_requesters_role_is_an_explicit_opt_out(
     weaker_than_needed = await queue.submit(
         action="billing.refund",
         summary="s",
-        payload=PAYLOAD,
+        payload={**PAYLOAD, "n": 2},
         requested_by=REQUESTER,
         required_role="finance.approver",
         ttl_seconds=3_600,

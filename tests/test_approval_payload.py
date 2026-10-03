@@ -159,7 +159,7 @@ async def test_one_tampered_request_does_not_hide_the_others_from_the_approver(
 ) -> None:
     queue = split_queue(control_database)
     bad = await submit(queue, include_payload=True)
-    good = await submit(queue, include_payload=True)
+    good = await submit(queue, payload={"contact_id": "c-2002"}, include_payload=True)
     tamper(control_database, bad, {"contact_id": "c-9999"})
 
     assert [r.id for r in await queue.list_pending(APPROVER)] == [good.id]
@@ -174,7 +174,8 @@ def raw_request(**columns: str) -> str:
         "id": f"'{uuid4()}'",
         "action": f"'{ACTION}'",
         "summary": "'forged'",
-        "payload_sha256": f"'{'c' * 64}'",
+        # Distinct per row: at most one request may be open for a requester, action and hash.
+        "payload_sha256": f"'{uuid4().hex * 2}'",
         "requested_by": "'agent-intake'",
         "required_role": "'ops.approver'",
         "created_at": f"'{canonical_timestamp(now)}'",
@@ -243,7 +244,7 @@ async def test_an_unknown_request_is_still_not_found(control_database: ControlDa
 def raw_with_payload(payload_text: str, *, sha: str | None = None, **columns: str) -> str:
     return raw_request(
         payload_json=f"'{payload_text}'",
-        payload_sha256=f"'{sha}'" if sha else f"'{'c' * 64}'",
+        **({"payload_sha256": f"'{sha}'"} if sha else {}),
         **columns,
     )
 
@@ -324,7 +325,7 @@ async def test_a_stored_payload_that_a_submit_would_refuse_is_not_shown(
 async def test_consume_and_cancel_return_no_payload(control_database: ControlDatabase) -> None:
     queue = split_queue(control_database)
     used = await submit(queue, include_payload=True)
-    withdrawn = await submit(queue, include_payload=True)
+    withdrawn = await submit(queue, payload={"contact_id": "c-2002"}, include_payload=True)
     await queue.resolve(used.id, decision=Decision.APPROVE, principal=APPROVER)
 
     consumed = await queue.consume(used.id, action=ACTION, payload=PAYLOAD, principal=REQUESTER)

@@ -54,7 +54,9 @@ class ApprovalStatus(StrEnum):
     A pending request becomes CANCELLED when its requester withdraws it, and
     EXPIRED when expire_due() stores its expiry. Expiry does not wait for that
     sweep: it is judged from expires_at whenever a request is read, resolved or
-    used, so a pending request past its lifetime reads as EXPIRED either way.
+    used, so a pending or approved request past its lifetime reads as EXPIRED either
+    way. An approval that lapsed unused is EXPIRED and keeps its decision (approve),
+    resolved_by and resolved_at.
     """
 
     PENDING = "pending"
@@ -85,15 +87,15 @@ class Decision(StrEnum):
     REJECT = "reject"
 
 
-# The decision each status implies. A request has resolved_by and resolved_at
-# exactly when it has a decision.
-_DECISION_FOR_STATUS: Mapping[ApprovalStatus, Decision | None] = {
-    ApprovalStatus.PENDING: None,
-    ApprovalStatus.APPROVED: Decision.APPROVE,
-    ApprovalStatus.REJECTED: Decision.REJECT,
-    ApprovalStatus.CONSUMED: Decision.APPROVE,
-    ApprovalStatus.EXPIRED: None,
-    ApprovalStatus.CANCELLED: None,
+# The decisions each status allows. A request has resolved_by and resolved_at exactly when
+# it has a decision. An approval that lapsed unused is EXPIRED and keeps its decision.
+_DECISIONS_FOR_STATUS: Mapping[ApprovalStatus, frozenset[Decision | None]] = {
+    ApprovalStatus.PENDING: frozenset({None}),
+    ApprovalStatus.APPROVED: frozenset({Decision.APPROVE}),
+    ApprovalStatus.REJECTED: frozenset({Decision.REJECT}),
+    ApprovalStatus.CONSUMED: frozenset({Decision.APPROVE}),
+    ApprovalStatus.EXPIRED: frozenset({None, Decision.APPROVE}),
+    ApprovalStatus.CANCELLED: frozenset({None}),
 }
 
 
@@ -156,7 +158,7 @@ class ApprovalRequest(FrozenModel):
 
     @model_validator(mode="after")
     def _state_is_consistent(self) -> Self:
-        if self.decision != _DECISION_FOR_STATUS[self.status]:
+        if self.decision not in _DECISIONS_FOR_STATUS[self.status]:
             raise ValueError(f"status {self.status.value} does not match decision {self.decision}")
 
         is_resolved = self.decision is not None

@@ -19,6 +19,7 @@ only its own credentials cannot step outside them with plain SQL:
     pending   rejected   approver                as approved, with decision 'reject'
     pending   cancelled  requester               closed_at set
     pending   expired    requester or approver   closed_at set, expires_at already past
+    approved  expired    requester or approver   as above: an approval that lapsed unused
     approved  consumed   requester               consumed_at set, not expired
 
 Every other change is refused, as are DELETE and TRUNCATE, and no update may
@@ -50,6 +51,11 @@ POSTGRES_MINIMUM_VERSION_NUM: Final = 160000
 # Most bytes of canonical JSON stored as an approval's payload.
 MAX_STORED_PAYLOAD_BYTES: Final = 8192
 APPROVALS_TABLE: Final = "agent_core_approvals"
+# One open request per requester, action and payload hash: pending and approved-unused
+# rows. A partial unique index, so it holds when submits race.
+OPEN_REQUEST_INDEX: Final = "agent_core_approvals_one_open"
+OPEN_REQUEST_COLUMNS: Final = ("requested_by", "action", "payload_sha256")
+OPEN_REQUEST_STATUSES: Final = ("pending", "approved")
 ROLES_TABLE: Final = "agent_core_approval_roles"
 
 AUDIT_UPDATE_DELETE_TRIGGER: Final = "agent_core_audit_no_update_delete"
@@ -243,6 +249,16 @@ def approvals_tables_ddl(schema: str) -> tuple[str, ...]:
             approver_role TEXT NOT NULL
         )""",
         f"REVOKE ALL ON {table} FROM PUBLIC",
+    )
+
+
+def open_request_index_ddl(schema: str) -> str:
+    """The unique index that allows one open request per requester, action and payload hash."""
+    table = f"{identifier(schema, what='schema')}.{APPROVALS_TABLE}"
+    statuses = ", ".join(f"'{status}'" for status in OPEN_REQUEST_STATUSES)
+    return (
+        f"CREATE UNIQUE INDEX IF NOT EXISTS {OPEN_REQUEST_INDEX} ON {table} "
+        f"({', '.join(OPEN_REQUEST_COLUMNS)}) WHERE status IN ({statuses})"
     )
 
 
@@ -455,6 +471,22 @@ BEGIN
         RETURN NEW;
     END IF;
 
+    IF OLD.status = 'approved' AND NEW.status = 'expired' THEN
+        IF NOT (as_requester OR as_approver) THEN
+            RAISE EXCEPTION 'only the requester or approver role may expire a request';
+        END IF;
+        IF NOT is_expired THEN
+            RAISE EXCEPTION 'approval request % has not expired yet', OLD.id;
+        END IF;
+        IF NEW.closed_at IS NULL OR NOT_CANONICAL(NEW.closed_at)
+           OR ROW(NEW.decision, NEW.resolved_by, NEW.resolved_at, NEW.reason, NEW.consumed_at)
+              IS DISTINCT FROM
+              ROW(OLD.decision, OLD.resolved_by, OLD.resolved_at, OLD.reason, OLD.consumed_at) THEN
+            RAISE EXCEPTION 'closing a request sets closed_at only';
+        END IF;
+        RETURN NEW;
+    END IF;
+
     IF OLD.status = 'approved' AND NEW.status = 'consumed' THEN
         IF NOT as_requester THEN
             RAISE EXCEPTION 'only the requester role may consume an approval';
@@ -506,6 +538,8 @@ class InstallReport:
     unaudited_approvals lists approved, unconsumed requests that no
     approval.resolved audit event approves: what plain SQL could have approved
     before 0.1.0a3. closed_approvals lists those the run cancelled, when asked.
+    closed_duplicates lists the pending requests the run cancelled, when asked, because
+    another open request already held their requester, action and payload hash.
     """
 
     schema: str
@@ -514,6 +548,7 @@ class InstallReport:
     outside_layout: tuple[Grant, ...] = field(default=())
     unaudited_approvals: tuple[str, ...] = field(default=())
     closed_approvals: tuple[str, ...] = field(default=())
+    closed_duplicates: tuple[str, ...] = field(default=())
 
     def __str__(self) -> str:
         lines = [
@@ -532,6 +567,9 @@ class InstallReport:
         if self.closed_approvals:
             lines.append("Cancelled by this run, as asked:")
             lines += [f"  {request_id}" for request_id in self.closed_approvals]
+        if self.closed_duplicates:
+            lines.append("Pending duplicates cancelled by this run, as asked:")
+            lines += [f"  {request_id}" for request_id in self.closed_duplicates]
         return "\n".join(lines)
 
 
@@ -658,6 +696,7 @@ async def check_connection(session: "Session", schema: str) -> str:
             "from 0.1.0a5 with the requester and approver roles: it upgrades the schema in "
             "place and keeps every row (see docs/upgrading.md)."
         )
+    await _require_open_request_index(session, schema, table)
     requester_role, approver_role = (
         await session.execute(f"SELECT requester_role, approver_role FROM {roles_table}")
     )[0]
@@ -696,6 +735,39 @@ async def _guard_revision(session: "Session", table: str) -> int | None:
     )
     found = re.search(r"-- agent-core guard revision (\d+)", rows[0][0]) if rows else None
     return int(found[1]) if found else None
+
+
+async def _require_open_request_index(session: "Session", schema: str, table: str) -> None:
+    """Raise ConfigError unless the unique open-request index is present, valid and as written."""
+    index = f"{identifier(schema, what='schema')}.{OPEN_REQUEST_INDEX}"
+    rows = await session.execute(
+        "SELECT i.indisunique AND i.indisvalid AND i.indisready, "
+        "pg_get_expr(i.indpred, i.indrelid), "
+        "ARRAY(SELECT pg_get_indexdef(i.indexrelid, k, true) "
+        "FROM generate_series(1, i.indnkeyatts) k ORDER BY k) "
+        "FROM pg_index i WHERE i.indexrelid = to_regclass(?) AND i.indrelid = to_regclass(?)",
+        (index, table),
+    )
+    predicate_ok = False
+    if rows:
+        usable, predicate, columns = rows[0]
+        predicate_ok = (
+            bool(usable)
+            and predicate is not None
+            and all(f"'{status}'" in predicate for status in OPEN_REQUEST_STATUSES)
+            and not any(
+                f"'{status}'" in predicate
+                for status in ("consumed", "rejected", "cancelled", "expired")
+            )
+            and tuple(columns) == OPEN_REQUEST_COLUMNS
+        )
+    if not predicate_ok:
+        raise ConfigError(
+            f"The approvals table in {schema} has no valid unique index {OPEN_REQUEST_INDEX} "
+            "on (requested_by, action, payload_sha256) for pending and approved requests, so "
+            "two identical submits could both be approved. As the owner role, run "
+            "install_postgres_schema from 0.1.0a5 with the requester and approver roles."
+        )
 
 
 # Every role current_user or session_user can switch to, as in the role check.

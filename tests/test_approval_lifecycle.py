@@ -1,6 +1,7 @@
 """Cancelling, expiring and reading approval requests, on SQLite and Postgres."""
 
 import asyncio
+import itertools
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -41,11 +42,15 @@ class Clock:
         return self.now
 
 
+_submitted = itertools.count(1001)
+
+
 async def submit(queue: SplitQueue, **options: Any) -> ApprovalRequest:
+    """A request with a payload of its own: only one request may be open for the same one."""
     return await queue.submit(
         action="crm.update_contact",
         summary="Update the sample contact",
-        payload={"contact_id": "c-1001"},
+        payload=options.pop("payload", {"contact_id": f"c-{next(_submitted)}"}),
         requested_by=REQUESTER,
         required_role="ops.approver",
         ttl_seconds=3_600,

@@ -45,6 +45,8 @@ ALLOWED = {
     ("pending", "expired", "requester"),
     ("pending", "expired", "approver"),
     ("approved", "consumed", "requester"),
+    ("approved", "expired", "requester"),
+    ("approved", "expired", "approver"),
 }
 IMMUTABLE = (
     "action",
@@ -98,7 +100,8 @@ def planted(database: ControlDatabase, status: str, *, expired: bool = False) ->
         "id": request_id,
         "action": "crm.update_contact",
         "summary": "Update the sample contact",
-        "payload_sha256": "a" * 64,
+        # Distinct per row: at most one request may be open for a requester, action and hash.
+        "payload_sha256": uuid4().hex * 2,
         "requested_by": "agent-intake",
         "required_role": "ops.approver",
         "created_at": stamp(created),

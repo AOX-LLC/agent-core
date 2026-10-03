@@ -42,6 +42,20 @@ class ApprovalQueue(Protocol):
         every read checks it against the hash, so an approver is shown what the
         hash binds (`ApprovalRequest.payload`). Only the requester may consume the
         approval, unless `delegates` names others.
+
+        Submitting is idempotent. At most one request is open (pending, or approved and
+        not yet consumed) for each (requested_by, action, payload hash), and an
+        implementation must hold that when calls race, as a unique index does:
+
+        - a repeat with the same required_role, lifetime (ttl_seconds) and delegates
+          returns the existing request and records no event;
+        - a repeat that matches on those three but differs in any of them raises
+          ApprovalConflictError, naming the open request and what differs;
+        - `summary`, `context` and `include_payload` are not compared: the first call's stay;
+        - an open request already past its lifetime does not count: it is closed as expired
+          and the new one is queued.
+
+        An approver may be neither the requester nor one of the delegates.
         """
         ...
 
@@ -113,8 +127,10 @@ class ApprovalQueue(Protocol):
     async def expire_due(
         self, *, principal: Principal, now: datetime | None = None, limit: int = 500
     ) -> int:
-        """Store EXPIRED on pending requests past their lifetime and return how many.
+        """Store EXPIRED on pending and approved-unused requests past their lifetime and
+        return how many.
 
-        Reads must treat such requests as expired whether or not this has run.
+        Reads must treat such requests as expired whether or not this has run. An
+        approval that lapsed unused is EXPIRED and keeps its decision.
         """
         ...

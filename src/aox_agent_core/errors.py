@@ -9,6 +9,8 @@ The hierarchy is public API: consumers catch these classes, so a class is never
 renamed or moved to a different parent without a major version.
 """
 
+from uuid import UUID
+
 
 class AgentCoreError(Exception):
     """Base class for every error raised by aox_agent_core."""
@@ -141,6 +143,21 @@ class ApprovalIntegrityError(ApprovalError):
 
     The approver must not be shown it: what is stored is not what the hash binds.
     """
+
+
+class ApprovalConflictError(ApprovalError):
+    """An open request for this requester, action and payload already exists, with other terms.
+
+    An exact repeat of a submit returns the existing request. A repeat that differs in
+    required_role, lifetime or delegates raises this instead, so a caller never holds an
+    approval granted on terms it did not ask for. `existing` is the open request's id and
+    `differs` names what differs.
+    """
+
+    def __init__(self, message: str, *, existing: UUID, differs: tuple[str, ...]) -> None:
+        super().__init__(message)
+        self.existing = existing
+        self.differs = differs
 
 
 class ApprovalPayloadRejectedError(ApprovalError):

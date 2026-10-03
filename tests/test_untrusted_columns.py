@@ -16,11 +16,12 @@ from uuid import uuid4
 import psycopg
 import pytest
 
-from aox_agent_core.approvals import ApprovalStatus, Decision
+from aox_agent_core.approvals import ApprovalStatus, Decision, Principal, PrincipalKind
+from aox_agent_core.approvals.sql import approval_payload_hash
 from aox_agent_core.audit import AuditEvent
 from aox_agent_core.audit.chain import canonical_timestamp
 from aox_agent_core.audit.sql import SQLAuditLog
-from aox_agent_core.errors import ApprovalError, AuditIntegrityError
+from aox_agent_core.errors import ApprovalConflictError, ApprovalError, AuditIntegrityError
 from databases import ControlDatabase, split_queue
 from test_approval_payload import ACTION, raw_request
 from test_approvals import APPROVER, REQUESTER
@@ -339,3 +340,65 @@ async def test_the_approver_cannot_date_a_decision_outside_the_requests_life_and
             control_database.approver_raw(decide)
         status = control_database.raw(f"SELECT status FROM {APPROVALS} WHERE id = '{row}'")
         assert status == [("pending",)]
+
+
+# The unique index on (requested_by, action, payload_sha256) for open requests.
+
+
+async def test_a_requester_that_occupies_anothers_key_is_survivable(
+    control_database: ControlDatabase,
+) -> None:
+    """requested_by is written by the requester role, so it can hold another principal's key.
+
+    The principal then meets a conflict that names the request, which it may cancel as the
+    requester it is, and its next submit goes through.
+    """
+    if control_database.requester_raw is None:
+        pytest.skip("a plain-SQL requester role exists only on Postgres")
+    victim = Principal(id="agent-billing", kind=PrincipalKind.AGENT)
+    queue = split_queue(control_database)
+    payload = {"contact_id": "c-1001"}
+    squatter = uuid4()
+    control_database.requester_raw(
+        raw_request(
+            id=f"'{squatter}'",
+            requested_by=quoted(victim.id),
+            required_role=quoted("some.other_role"),
+            payload_sha256=quoted(approval_payload_hash(ACTION, payload)),
+        )
+    )
+    terms: dict[str, Any] = {
+        "action": ACTION,
+        "summary": "mine",
+        "payload": payload,
+        "requested_by": victim,
+        "required_role": "ops.approver",
+        "ttl_seconds": 3_600,
+    }
+
+    with pytest.raises(ApprovalConflictError) as raised:
+        await queue.submit(**terms)
+    assert raised.value.existing == squatter
+    await queue.cancel(squatter, principal=victim)
+
+    mine = await queue.submit(**terms)
+    assert mine.id != squatter
+    assert (await queue.get(mine.id)).status is ApprovalStatus.PENDING
+
+
+async def test_the_index_holds_for_every_open_status_and_lets_finished_rows_go(
+    control_database: ControlDatabase,
+) -> None:
+    if control_database.requester_raw is None:
+        pytest.skip("a plain-SQL requester role exists only on Postgres")
+    sha = quoted("f" * 64)
+    first = uuid4()
+    control_database.requester_raw(raw_request(id=f"'{first}'", payload_sha256=sha))
+
+    with pytest.raises(psycopg.errors.UniqueViolation):
+        control_database.requester_raw(raw_request(payload_sha256=sha))
+    control_database.requester_raw(
+        f"UPDATE {APPROVALS} SET status = 'cancelled', closed_at = {stamp(NOW)} "
+        f"WHERE id = '{first}'"
+    )
+    control_database.requester_raw(raw_request(payload_sha256=sha))  # the key is free again

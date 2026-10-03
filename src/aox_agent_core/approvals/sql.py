@@ -40,6 +40,7 @@ from aox_agent_core.audit.types import AuditEvent, check_payload, exceeds_depth
 from aox_agent_core.context import RunContext
 from aox_agent_core.errors import (
     ApprovalAlreadyResolvedError,
+    ApprovalConflictError,
     ApprovalError,
     ApprovalExpiredError,
     ApprovalIntegrityError,
@@ -99,6 +100,18 @@ ADDED_COLUMNS: Final = {
 _PENDING_INDEX_DDL = (
     f"CREATE INDEX agent_core_approvals_pending ON {APPROVALS_TABLE} (status, created_at, id)"
 )
+
+# One open request per requester, action and payload hash (see _postgres_schema for the
+# Postgres side). SQLite builds it on first submit, once it has checked for duplicates.
+_OPEN_INDEX_DDL = (
+    f"CREATE UNIQUE INDEX {layout.OPEN_REQUEST_INDEX} ON {APPROVALS_TABLE} "
+    f"({', '.join(layout.OPEN_REQUEST_COLUMNS)}) "
+    f"WHERE status IN ({', '.join(repr(s) for s in layout.OPEN_REQUEST_STATUSES)})"
+)
+# How many times submit looks again after the open request it met closed or lapsed under it.
+SUBMIT_ATTEMPTS: Final = 3
+_OPEN_STATUSES: Final = frozenset({ApprovalStatus.PENDING, ApprovalStatus.APPROVED})
+_OPEN_STATUS_LIST: Final = ", ".join(repr(status) for status in layout.OPEN_REQUEST_STATUSES)
 
 DEFAULT_PENDING_LIMIT = 100
 # Pages read while a custom policy filters; larger than most limits, so a policy
@@ -259,6 +272,14 @@ class SQLApprovalQueue:
         event. Only requested_by may consume the approval, unless `delegates` names
         other principals allowed to: an explicit choice, shown to the approver.
 
+        One request may be open (pending, or approved and not yet used) for each requester,
+        action and payload: a database index enforces it, so it holds when calls race. An
+        exact repeat (same required_role, lifetime and delegates) returns the existing
+        request, with no new audit event; one that differs in any of those raises
+        ApprovalConflictError and is audited as approval.submit_conflict. `summary`,
+        `context` and `include_payload` are not compared: the first submit's stay. An open
+        request already past its lifetime is closed as expired, and this one is queued.
+
         With `connection`, a psycopg AsyncConnection already in a transaction, the
         request and its audit event are written in that transaction.
         """
@@ -286,24 +307,49 @@ class SQLApprovalQueue:
             await require_current_table(
                 session, APPROVALS_TABLE, RUN_CONTEXT_COLUMN, schema=self._table.schema
             )
-            await session.execute(
-                f"INSERT INTO {self._table.sql} ({_COLUMNS}) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                _row_values(request),
-            )
-            event = _event(
-                "approval.requested",
-                requested_by.id,
-                request,
-                context,
-                required_role=required_role,
-                payload_sha256=request.payload_sha256,
-            )
-            if request.delegates:
-                event = event.model_copy(
-                    update={"payload": {**event.payload, "delegates": sorted(request.delegates)}}
+            events: list[AuditEvent] = []
+            for _ in range(SUBMIT_ATTEMPTS):
+                inserted = await session.execute_count(
+                    f"INSERT INTO {self._table.sql} ({_COLUMNS}) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+                    f"ON CONFLICT ({', '.join(layout.OPEN_REQUEST_COLUMNS)}) "
+                    f"WHERE status IN ({_OPEN_STATUS_LIST}) DO NOTHING",
+                    _row_values(request),
                 )
-            return _Outcome(request=request, events=[event])
+                if inserted == 1:
+                    return _Outcome(request=request, events=[*events, _requested_event(request)])
+                existing = await _load_open(session, self._table, request, self._scrubber)
+                if existing is None:
+                    continue  # closed since the insert met it: look again
+                if await _is_due(session, self._table, existing, now):
+                    expired = await self._expire_lapsed(session, existing, requested_by.id, now)
+                    events += expired
+                    continue
+                differs = _terms_that_differ(existing, request)
+                if differs:
+                    refusal = _denied(
+                        ApprovalConflictError(
+                            f"Request {existing.id} is already open for this requester, action "
+                            f"and payload, with a different {', '.join(differs)}. Cancel it, or "
+                            "repeat the call with the same terms.",
+                            existing=existing.id,
+                            differs=differs,
+                        ),
+                        _event(
+                            "approval.submit_conflict",
+                            requested_by.id,
+                            existing,
+                            context,
+                            differs=",".join(differs),
+                        ),
+                    )
+                    refusal.events = [*events, *refusal.events]
+                    return refusal
+                return _Outcome(request=existing, events=events)
+            raise ApprovalError(
+                "Could not queue the request: the open request for this requester, action and "
+                "payload kept changing. Try again."
+            )
 
         return await self._write(insert, connection=connection)
 
@@ -325,6 +371,16 @@ class SQLApprovalQueue:
             )
         return checked
 
+    async def _expire_lapsed(
+        self, session: Session, existing: ApprovalRequest, actor_id: str, now: datetime
+    ) -> list[AuditEvent]:
+        """Store EXPIRED on an open request past its lifetime; its audit events (none if
+        another transaction closed it first)."""
+        if not await _close(session, self._table, existing, ApprovalStatus.EXPIRED, now):
+            return []
+        expired = existing.model_copy(update={"status": ApprovalStatus.EXPIRED, "closed_at": now})
+        return [_expired_event(actor_id, expired, existing.status, existing.run_context)]
+
     async def get(self, request_id: UUID, *, connection: Any = None) -> ApprovalRequest:
         """Return the request; raises ApprovalNotFoundError if there is none, and
         ApprovalIntegrityError if its stored payload does not match its hash."""
@@ -336,7 +392,7 @@ class SQLApprovalQueue:
         request = await self._run(read, write=False, connection=connection)
         if request is None:
             raise ApprovalNotFoundError(f"No approval request {request_id}.")
-        if request.status is ApprovalStatus.PENDING and request.is_expired(self._now()):
+        if request.status in _OPEN_STATUSES and request.is_expired(self._now()):
             # Reported as the sweep would store it, without writing anything.
             return request.model_copy(
                 update={"status": ApprovalStatus.EXPIRED, "closed_at": request.expires_at}
@@ -730,7 +786,8 @@ class SQLApprovalQueue:
         limit: int = 500,
         connection: Any = None,
     ) -> int:
-        """Store EXPIRED on every pending request whose lifetime is over; return how many.
+        """Store EXPIRED on every pending or approved-unused request whose lifetime is over;
+        return how many.
 
         Reads already report such requests as expired, so this only makes the
         stored state match, with one approval.expired audit event per request
@@ -764,7 +821,7 @@ class SQLApprovalQueue:
                     )
                     # The sweep belongs to no run; the event carries the request's own.
                     events.append(
-                        _event("approval.expired", principal.id, expired, request.run_context)
+                        _expired_event(principal.id, expired, request.status, request.run_context)
                     )
             # A full batch of unreadable rows must not loop: go on only if some expired.
             return _Outcome(
@@ -1026,10 +1083,11 @@ async def _close(
     status: ApprovalStatus,
     now: datetime,
 ) -> bool:
-    """Move a pending request to `status` (expired or cancelled); False if it moved meanwhile."""
+    """Move a request from its stored status to `status` (cancelled, or expired for an
+    approval that lapsed too); False if it moved meanwhile."""
     changed = await session.execute_count(
         f"UPDATE {table.sql} SET status = ?, closed_at = ? WHERE id = ? AND status = ?",
-        (status.value, canonical_timestamp(now), str(request.id), ApprovalStatus.PENDING.value),
+        (status.value, canonical_timestamp(now), str(request.id), request.status.value),
     )
     return changed == 1
 
@@ -1044,7 +1102,8 @@ _POSTGRES_STATEMENT_NOW_TEXT = (
 async def _load_due(
     session: Session, table: TableName, now: datetime, limit: int
 ) -> tuple[list[ApprovalRequest], int, list[str]]:
-    """Up to `limit` pending requests whose lifetime ended by `now`, oldest expiry first.
+    """Up to `limit` pending or approved requests whose lifetime ended by `now`, oldest
+    expiry first.
 
     Returns the requests this library can read, how many rows it read, and the ids of
     the rows it cannot read, which the sweep leaves as they are.
@@ -1055,9 +1114,9 @@ async def _load_due(
         else ""
     )
     rows = await session.execute(
-        f"SELECT {_COLUMNS} FROM {table.sql} WHERE status = ? AND expires_at <= ?"
-        f"{database_clock} ORDER BY expires_at, id LIMIT ?",
-        (ApprovalStatus.PENDING.value, canonical_timestamp(now), limit),
+        f"SELECT {_COLUMNS} FROM {table.sql} WHERE status IN ({_OPEN_STATUS_LIST}) "
+        f"AND expires_at <= ?{database_clock} ORDER BY expires_at, id LIMIT ?",
+        (canonical_timestamp(now), limit),
     )
     readable: list[ApprovalRequest] = []
     unreadable: list[str] = []
@@ -1067,6 +1126,76 @@ async def _load_due(
         except _StoredRowError:
             unreadable.append(row[0])
     return readable, len(rows), unreadable
+
+
+async def _load_open(
+    session: Session, table: TableName, request: ApprovalRequest, scrubber: Scrubber
+) -> ApprovalRequest | None:
+    """The open request (pending or approved) holding this requester, action and payload hash,
+    with its stored payload checked, or None if there is none."""
+    rows = await session.execute(
+        f"SELECT {_COLUMNS} FROM {table.sql} WHERE requested_by = ? AND action = ? "
+        f"AND payload_sha256 = ? AND status IN ({_OPEN_STATUS_LIST})",
+        (request.requested_by, request.action, request.payload_sha256),
+    )
+    if not rows:
+        return None
+    existing, payload_text = _parse_row(rows[0])
+    return _with_payload(existing, payload_text, scrubber)
+
+
+async def _is_due(
+    session: Session, table: TableName, existing: ApprovalRequest, now: datetime
+) -> bool:
+    """Whether an open request's lifetime is over: by the database's clock on Postgres, as the
+    guard judges it, so an application clock that runs ahead cannot close a live request."""
+    if session.dialect is Dialect.SQLITE:
+        return existing.is_expired(now)
+    rows = await session.execute(
+        f"SELECT 1 FROM {table.sql} WHERE id = ? AND expires_at <= {_POSTGRES_STATEMENT_NOW_TEXT}",
+        (str(existing.id),),
+    )
+    return bool(rows)
+
+
+def _terms_that_differ(existing: ApprovalRequest, asked: ApprovalRequest) -> tuple[str, ...]:
+    """What a repeat submit asks for that the open request does not have."""
+    return tuple(
+        name
+        for name, differs in (
+            ("delegates", existing.delegates != asked.delegates),
+            (
+                "lifetime",
+                existing.expires_at - existing.created_at != asked.expires_at - asked.created_at,
+            ),
+            ("required_role", existing.required_role != asked.required_role),
+        )
+        if differs
+    )
+
+
+def _requested_event(request: ApprovalRequest) -> AuditEvent:
+    event = _event(
+        "approval.requested",
+        request.requested_by,
+        request,
+        request.run_context,
+        required_role=request.required_role,
+        payload_sha256=request.payload_sha256,
+    )
+    if request.delegates:
+        event = event.model_copy(
+            update={"payload": {**event.payload, "delegates": sorted(request.delegates)}}
+        )
+    return event
+
+
+def _expired_event(
+    actor_id: str, expired: ApprovalRequest, previous: ApprovalStatus, context: RunContext | None
+) -> AuditEvent:
+    """approval.expired, saying so when an approval lapsed unused rather than a pending request."""
+    details = {"previous_status": previous.value} if previous is ApprovalStatus.APPROVED else {}
+    return _event("approval.expired", actor_id, expired, context, **details)
 
 
 def _denied(error: ApprovalError, event: AuditEvent) -> _Outcome:
@@ -1127,6 +1256,32 @@ async def _ensure_table(session: Session) -> None:
         await session.execute(
             _PENDING_INDEX_DDL.replace("CREATE INDEX", "CREATE INDEX IF NOT EXISTS", 1)
         )
+        await _ensure_open_index(session)
+
+
+async def _ensure_open_index(session: Session) -> None:
+    """Build the unique open-request index on SQLite, or refuse while duplicates stand.
+
+    Duplicates are what 0.1.0a4 allowed. They are listed, nothing is changed, and
+    get, cancel and the other calls still work, so the extras can be cancelled.
+    """
+    if await session.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = ?",
+        (layout.OPEN_REQUEST_INDEX,),
+    ):
+        return
+    groups = await session.execute(
+        f"SELECT group_concat(id, ', ') FROM {APPROVALS_TABLE} "
+        f"WHERE status IN ({_OPEN_STATUS_LIST}) "
+        f"GROUP BY {', '.join(layout.OPEN_REQUEST_COLUMNS)} HAVING count(*) > 1 LIMIT 10"
+    )
+    if groups:
+        raise ConfigError(
+            "Open approval requests share a requester, action and payload, which a unique "
+            f"index now forbids: {'; '.join(row[0] for row in groups)}. Cancel the extra "
+            "ones with cancel(), then submit again."
+        )
+    await session.execute(_OPEN_INDEX_DDL)
 
 
 async def _table_exists(session: Session, table: TableName) -> bool:
