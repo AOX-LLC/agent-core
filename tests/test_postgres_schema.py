@@ -15,6 +15,7 @@ from uuid import uuid4
 import psycopg
 import pytest
 
+from aox_agent_core.approvals import Decision, Principal, PrincipalKind
 from aox_agent_core.audit import (
     GENESIS_HASH,
     AuditEvent,
@@ -32,6 +33,7 @@ from databases import (
     ControlDatabase,
     Raw,
     postgres_database,
+    split_queue,
 )
 
 A2_SCHEMA = Path(__file__).parent / "fixtures" / "postgres" / "a2_schema.sql"
@@ -604,16 +606,53 @@ async def test_an_a2_schema_is_upgraded_in_place() -> None:
             == report.outside_layout
         )
 
-        # Asked to, a run cancels what no audit event approved: the a2 row, and the
-        # one approved above by plain SQL as the approver, outside the library.
+        # Asked to, a run cancels what no approver-side audit event approved: the a2
+        # row, even after the requester forges an event for it, and the row approved
+        # above by plain SQL outside the library. A library approval stays.
+        queue = split_queue(database)
+        proper = await queue.submit(
+            action="crm.update_contact",
+            summary="s",
+            payload={},
+            requested_by=Principal(id="agent-intake", kind=PrincipalKind.AGENT),
+            required_role="ops.approver",
+            ttl_seconds=600,
+        )
+        await queue.resolve(
+            proper.id,
+            decision=Decision.APPROVE,
+            principal=Principal(
+                id="user-17", kind=PrincipalKind.HUMAN, roles=frozenset({"ops.approver"})
+            ),
+        )
+        assert database.requester_raw is not None
+        next_seq = database.raw("SELECT max(seq) + 1 FROM agent_core_audit")[0][0]
+        database.requester_raw(
+            "INSERT INTO agent_core_audit (seq, schema_version, event_id, occurred_at, action, "
+            "actor_id, subject_id, payload, prev_hash, record_hash) VALUES "
+            f"({next_seq}, 3, '{uuid4()}', '{stamp(NOW)}', 'approval.resolved', 'user-17', "
+            f'\'{legacy_id}\', \'{{"approval_action":"crm.update_contact","decision":'
+            f"\"approve\"}}', '{'0' * 64}', '{'0' * 64}')"
+        )
+
         closing = install_postgres_schema(
             database.owner_url,
             requester_role=REQUESTER_ROLE,
             approver_role=APPROVER_ROLE,
             close_unaudited_approvals=True,
         )
+
         assert set(closing.closed_approvals) == {legacy_id, pending_id}
         assert status_of(database, legacy_id) == "cancelled"
+        assert status_of(database, str(proper.id)) == "approved"
+        assert database.raw(
+            f"SELECT reason FROM agent_core_approvals WHERE id = '{legacy_id}'"
+        ) == [
+            (
+                f"Cancelled by install_postgres_schema: approved by user-17 at {stamp(NOW)}, "
+                "with no approval.resolved audit event from the approver side.",
+            )
+        ]
         assert database.raw(
             "SELECT tgenabled FROM pg_trigger WHERE tgname = 'agent_core_approvals_guard'"
         ) == [("O",)]
@@ -748,3 +787,18 @@ def test_a_row_with_an_overlong_lifetime_can_be_neither_decided_nor_used(
     assert refused(pg.requester_raw, transition_sql(approved, "consumed", status_only=False))
     assert refused(pg.approver_raw, transition_sql(pending, "approved", status_only=False))
     assert not refused(pg.requester_raw, transition_sql(pending, "cancelled", status_only=False))
+
+
+def test_closing_is_refused_when_the_audit_log_lives_elsewhere(pg: ControlDatabase) -> None:
+    assert pg.owner_url is not None
+    request_id = planted(pg, "approved")  # approved, and no resolved event here at all
+
+    with pytest.raises(ConfigError, match="audit log may live elsewhere"):
+        install_postgres_schema(
+            pg.owner_url,
+            requester_role=REQUESTER_ROLE,
+            approver_role=APPROVER_ROLE,
+            close_unaudited_approvals=True,
+        )
+
+    assert status_of(pg, request_id) == "approved"

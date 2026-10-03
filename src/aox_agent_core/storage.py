@@ -405,8 +405,9 @@ def install_postgres_schema(
                     f"GRANT USAGE ON SCHEMA {layout.identifier(schema, what='schema')} "
                     f"TO {layout.identifier(role, what='role')}"
                 )
-        unaudited = _unaudited_approvals(session, schema)
+        unaudited = _unaudited_approvals(session, schema, approver_role)
         if close_unaudited_approvals and unaudited:
+            _refuse_closing_without_local_audit(session, schema)
             _cancel_as_owner(session, schema, unaudited)
         return InstallReport(
             schema=schema,
@@ -422,6 +423,8 @@ def install_postgres_schema(
 
 # Canonical JSON (sorted keys, no spaces) puts the decision exactly so in a
 # resolved event's payload; matching text needs no cast of rows a2 may have left.
+# Only an event the approver side wrote counts, or one from before db_role existed:
+# the requester role may append audit events too.
 _UNAUDITED_APPROVALS_SQL = """
 SELECT a.id FROM {approvals} a
 WHERE a.status = 'approved'
@@ -429,18 +432,40 @@ WHERE a.status = 'approved'
     SELECT 1 FROM {audit} e
     WHERE e.action = 'approval.resolved' AND e.subject_id = a.id
       AND e.payload LIKE '%"decision":"approve"%'
+      AND (e.db_role IS NULL OR EXISTS (
+        SELECT 1 FROM pg_roles r
+        WHERE r.rolname = e.db_role AND pg_has_role(r.oid, ?, 'MEMBER')
+      ))
   )
 ORDER BY a.id
 """
 
 
-def _unaudited_approvals(session: Session, schema: str) -> list[str]:
-    """Approved, unused requests that no approval.resolved audit event approves."""
+def _unaudited_approvals(session: Session, schema: str, approver_role: str) -> list[str]:
+    """Approved, unused requests that no approval.resolved event from the approver side
+    (or from before 0.1.0a3) approves."""
+    sql = _UNAUDITED_APPROVALS_SQL.format(**_qualified_tables(schema))
+    return [row[0] for row in session.execute(sql, (approver_role,))]
+
+
+def _qualified_tables(schema: str) -> dict[str, str]:
     quoted = layout.identifier(schema, what="schema")
-    sql = _UNAUDITED_APPROVALS_SQL.format(
-        approvals=f"{quoted}.{layout.APPROVALS_TABLE}", audit=f"{quoted}.{layout.AUDIT_TABLE}"
-    )
-    return [row[0] for row in session.execute(sql)]
+    return {
+        "approvals": f"{quoted}.{layout.APPROVALS_TABLE}",
+        "audit": f"{quoted}.{layout.AUDIT_TABLE}",
+    }
+
+
+def _refuse_closing_without_local_audit(session: Session, schema: str) -> None:
+    """Closing relies on resolved events in this schema's audit table. With none there
+    at all, the audit log lives elsewhere, and every live approval would look unaudited."""
+    audit = _qualified_tables(schema)["audit"]
+    if not session.execute(f"SELECT 1 FROM {audit} WHERE action = 'approval.resolved' LIMIT 1"):
+        raise ConfigError(
+            f"close_unaudited_approvals needs the approval.resolved events in {schema}'s "
+            "audit table, and it holds none: the audit log may live elsewhere. Nothing was "
+            "changed. Check the listed requests yourself instead."
+        )
 
 
 def _cancel_as_owner(session: Session, schema: str, request_ids: list[str]) -> None:
@@ -452,16 +477,17 @@ def _cancel_as_owner(session: Session, schema: str, request_ids: list[str]) -> N
     table = f"{layout.identifier(schema, what='schema')}.{layout.APPROVALS_TABLE}"
     session.execute(f"ALTER TABLE {table} DISABLE TRIGGER {layout.APPROVALS_GUARD_TRIGGER}")
     for request_id in request_ids:
+        # A cancelled request carries no decision, so the reason keeps who approved it.
         session.execute(
             f"UPDATE {table} SET status = 'cancelled', decision = NULL, resolved_by = NULL, "
-            "resolved_at = NULL, consumed_at = NULL, reason = ?, "
+            "resolved_at = NULL, consumed_at = NULL, "
+            "reason = left(format('Cancelled by install_postgres_schema: approved by %s at %s, "
+            "with no approval.resolved audit event from the approver side.', "
+            "coalesce(resolved_by, 'nobody recorded'), coalesce(resolved_at, 'no recorded "
+            "time')), 500), "
             "closed_at = to_char(statement_timestamp() AT TIME ZONE 'UTC', "
             "'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') WHERE id = ? AND status = 'approved'",
-            (
-                "Cancelled by install_postgres_schema: no approval.resolved audit event "
-                "approved it.",
-                request_id,
-            ),
+            (request_id,),
         )
     session.execute(f"ALTER TABLE {table} ENABLE TRIGGER {layout.APPROVALS_GUARD_TRIGGER}")
 
