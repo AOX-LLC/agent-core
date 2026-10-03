@@ -390,13 +390,16 @@ def test_the_database_records_who_wrote_each_audit_row(pg: ControlDatabase) -> N
     assert pg.requester_raw is not None
     pg.requester_raw(
         "INSERT INTO agent_core_audit (seq, schema_version, event_id, occurred_at, action, "
-        "actor_id, payload, prev_hash, record_hash, db_role) VALUES (1, 3, "
+        "actor_id, payload, prev_hash, record_hash, db_role, db_login) VALUES (1, 4, "
         f"'{uuid4()}', '{stamp(NOW)}', 'approval.resolved', 'user-17', '{{}}', '{'0' * 64}', "
-        f"'{'0' * 64}', '{APPROVER_ROLE}')"
+        f"'{'0' * 64}', '{APPROVER_ROLE}', '{APPROVER_ROLE}')"
     )
 
-    assert pg.raw("SELECT actor_id, db_role FROM agent_core_audit") == [("user-17", REQUESTER_ROLE)]
+    assert pg.raw("SELECT actor_id, db_role, db_login FROM agent_core_audit") == [
+        ("user-17", REQUESTER_ROLE, REQUESTER_ROLE)
+    ]
     assert refused(pg.superuser_raw, f"UPDATE agent_core_audit SET db_role = '{APPROVER_ROLE}'")
+    assert refused(pg.superuser_raw, f"UPDATE agent_core_audit SET db_login = '{APPROVER_ROLE}'")
 
 
 # The installer
@@ -585,7 +588,7 @@ async def test_an_a2_schema_is_upgraded_in_place() -> None:
         records = [record async for record in log.iter_records()]
         assert [(record.schema_version, record.db_role) for record in records] == [
             (2, None),
-            (3, REQUESTER_ROLE),
+            (4, REQUESTER_ROLE),
         ]
         assert (await log.verify()).seq == 2
         assert status_of(database, legacy_id) == "approved"
@@ -637,7 +640,7 @@ async def test_an_a2_schema_is_upgraded_in_place() -> None:
         database.requester_raw(
             "INSERT INTO agent_core_audit (seq, schema_version, event_id, occurred_at, action, "
             "actor_id, subject_id, payload, prev_hash, record_hash) VALUES "
-            f"({next_seq}, 3, '{uuid4()}', '{stamp(NOW)}', 'approval.resolved', 'user-17', "
+            f"({next_seq}, 4, '{uuid4()}', '{stamp(NOW)}', 'approval.resolved', 'user-17', "
             f'\'{legacy_id}\', \'{{"approval_action":"crm.update_contact","decision":'
             f"\"approve\"}}', '{head_hash}', '{'0' * 64}')"
         )
@@ -808,7 +811,7 @@ def test_closing_is_refused_when_the_audit_log_lives_elsewhere(
         pg.requester_raw(
             "INSERT INTO agent_core_audit (seq, schema_version, event_id, occurred_at, action, "
             "actor_id, subject_id, payload, prev_hash, record_hash) VALUES "
-            f"(1, 3, '{uuid4()}', '{stamp(NOW)}', 'approval.resolved', 'user-17', "
+            f"(1, 4, '{uuid4()}', '{stamp(NOW)}', 'approval.resolved', 'user-17', "
             f"'{uuid4()}', '{{}}', '{'0' * 64}', '{'0' * 64}')"
         )
 

@@ -72,7 +72,7 @@ async def test_a_record_stores_its_run_context(control_database: ControlDatabase
     await log.append(event(context=None))
 
     with_context, without = [record async for record in log.iter_records()]
-    assert appended.schema_version == AUDIT_SCHEMA_VERSION == 3
+    assert appended.schema_version == AUDIT_SCHEMA_VERSION == 4
     assert with_context.run_context == RUN
     assert without.run_context is None
     assert (await log.verify()).seq == 2

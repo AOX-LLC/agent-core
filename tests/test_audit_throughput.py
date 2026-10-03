@@ -37,7 +37,7 @@ def event(number: int, **fields: Any) -> AuditEvent:
 def raw_insert(seq: int, prev_hash: str, **columns: str) -> str:
     """An INSERT of a plausible record: only the chain link and what `columns` change varies."""
     values = {
-        "schema_version": "3",
+        "schema_version": "4",
         "event_id": f"'00000000-0000-4000-8000-{seq:012d}'",
         "occurred_at": f"'{canonical_timestamp(datetime.now(UTC))}'",
         "action": "'model.call'",

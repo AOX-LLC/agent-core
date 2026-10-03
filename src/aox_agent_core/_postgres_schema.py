@@ -54,7 +54,7 @@ AUDIT_LOCK_PREFIX: Final = "agent_core_audit:"
 # (a comment inside each). A connection refuses an older one, so a release that changes
 # them is not run against a schema it has not been installed over.
 GUARD_REVISION: Final = 6
-AUDIT_TRIGGER_REVISION: Final = 5
+AUDIT_TRIGGER_REVISION: Final = 6
 # The oldest Postgres the library is tested on and supports (16.0).
 POSTGRES_MINIMUM_VERSION_NUM: Final = 160000
 # Most bytes of canonical JSON stored as an approval's payload.
@@ -185,9 +185,11 @@ def audit_ddl(schema: str) -> tuple[str, ...]:
             prev_hash TEXT NOT NULL,
             record_hash TEXT NOT NULL,
             db_role TEXT,
-            recorded_at TEXT
+            recorded_at TEXT,
+            db_login TEXT
         )""",
         f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS db_role TEXT",
+        f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS db_login TEXT",
         f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS recorded_at TEXT",
         # Both functions pin search_path and reach the table through the trigger's
         # own schema and name, so a temporary table cannot stand in for it.
@@ -201,8 +203,9 @@ def audit_ddl(schema: str) -> tuple[str, ...]:
         FOR EACH STATEMENT EXECUTE FUNCTION {functions}.{AUDIT_TABLE}_refuse_change()""",
         # The insert trigger enforces the chain's linkage (the next seq, prev_hash equal
         # to the head's record_hash), the shape of every field it can check, and the
-        # bounds on occurred_at; it sets db_role and recorded_at from the database's own
-        # idea of who is inserting and when, whatever the insert supplied. It cannot
+        # bounds on occurred_at; it sets db_role (current_user), db_login (session_user, which
+        # SET ROLE does not change) and recorded_at from the database's own idea of who is
+        # inserting and when, whatever the insert supplied. It cannot
         # check record_hash itself, which verify() recomputes.
         f"""CREATE OR REPLACE FUNCTION {functions}.{AUDIT_TABLE}_append_at_end()
         RETURNS trigger LANGUAGE plpgsql SET search_path = pg_catalog, pg_temp AS $$
@@ -244,7 +247,7 @@ BEGIN
                 OR jsonb_typeof(NEW.run_context::jsonb) IS DISTINCT FROM 'object')) THEN
         RAISE EXCEPTION '<table> is append-only: a new record has a field of the wrong shape';
     END IF;
-    IF NEW.schema_version IS DISTINCT FROM 3
+    IF NEW.schema_version IS DISTINCT FROM 4
        OR NEW.event_id !~ '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
        OR NEW.record_hash !~ '^[0-9a-f]{64}$'
        OR NEW.occurred_at !~
@@ -258,6 +261,7 @@ BEGIN
     END IF;
     NEW.recorded_at := to_char(db_now AT TIME ZONE 'UTC', stamp);
     NEW.db_role := current_user;
+    NEW.db_login := session_user;
     RETURN NEW;
 END
 """.replace("<lock_prefix>", AUDIT_LOCK_PREFIX)

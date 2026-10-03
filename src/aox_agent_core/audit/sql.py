@@ -75,10 +75,10 @@ MAX_APPEND_BATCH = 1000
 
 COLUMNS = (
     "seq, schema_version, event_id, occurred_at, action, actor_id, subject_id, payload, "
-    "run_context, prev_hash, record_hash, db_role, recorded_at"
+    "run_context, prev_hash, record_hash, db_role, recorded_at, db_login"
 )
-# Columns added in 0.1.0a3 and 0.1.0a4, with their SQLite types.
-ADDED_COLUMNS: Final = {"db_role": "TEXT", "recorded_at": "TEXT"}
+# Columns added in 0.1.0a3, 0.1.0a4 and 0.1.0a7, with their SQLite types.
+ADDED_COLUMNS: Final = {"db_role": "TEXT", "recorded_at": "TEXT", "db_login": "TEXT"}
 
 _TABLE_DDL = f"""
 CREATE TABLE {AUDIT_TABLE} (
@@ -94,7 +94,8 @@ CREATE TABLE {AUDIT_TABLE} (
     prev_hash TEXT NOT NULL,
     record_hash TEXT NOT NULL,
     db_role TEXT,
-    recorded_at TEXT
+    recorded_at TEXT,
+    db_login TEXT
 )"""
 
 # Inserts land only right after the last record: the next seq, linked to the last
@@ -304,20 +305,21 @@ class SQLAuditLog:
                     _row_values(record),
                 )
             return stored
-        # One statement for the whole batch. The insert trigger sets db_role and
+        # One statement for the whole batch. The insert trigger sets db_role, db_login and
         # recorded_at, whatever is sent, and checks the chain link of every row.
         rows = await session.execute(
             f"INSERT INTO {self._table.sql} ({COLUMNS}) VALUES "
             + ", ".join(row_marks for _ in records)
-            + " RETURNING seq, db_role, recorded_at",
+            + " RETURNING seq, db_role, recorded_at, db_login",
             [value for record in records for value in _row_values(record)],
         )
-        written = {seq: (role, recorded) for seq, role, recorded in rows}
+        written = {seq: (role, recorded, login) for seq, role, recorded, login in rows}
         return [
             record.model_copy(
                 update={
                     "db_role": written[record.seq][0],
                     "recorded_at": datetime.fromisoformat(written[record.seq][1]),
+                    "db_login": written[record.seq][2],
                 }
             )
             for record in records
@@ -391,7 +393,7 @@ class SQLAuditLog:
                     f"The audit insert trigger on {self._table} is older than this release "
                     f"(revision {revision or 'before 5'}, this release needs "
                     f"{layout.AUDIT_TRIGGER_REVISION}). As the owner role, run "
-                    "install_postgres_schema from 0.1.0a6 with the requester and approver roles."
+                    "install_postgres_schema from 0.1.0a7 with the requester and approver roles."
                 )
         await bring_table_up_to_date(session, AUDIT_TABLE, ADDED_COLUMNS, schema=self._table.schema)
         self._protections_checked = True
@@ -650,13 +652,14 @@ def _row_values(record: AuditRecord) -> tuple[Any, ...]:
         record.record_hash,
         None,
         canonical_timestamp(record.recorded_at) if record.recorded_at is not None else None,
+        None,
     )
 
 
 def record_from_row(row: tuple[Any, ...]) -> AuditRecord:
     """Rebuild a record from a COLUMNS-ordered row; AuditIntegrityError if it is malformed."""
     seq, schema_version, event_id, occurred_at, action, actor_id, subject_id = row[:7]
-    payload, run_context, prev_hash, record_hash, db_role, recorded_at = row[7:]
+    payload, run_context, prev_hash, record_hash, db_role, recorded_at, db_login = row[7:]
     try:
         return AuditRecord.model_validate(
             {
@@ -672,6 +675,7 @@ def record_from_row(row: tuple[Any, ...]) -> AuditRecord:
                 "prev_hash": prev_hash,
                 "record_hash": record_hash,
                 "db_role": db_role,
+                "db_login": db_login,
                 "recorded_at": (
                     datetime.fromisoformat(recorded_at) if recorded_at is not None else None
                 ),
