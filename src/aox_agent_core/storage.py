@@ -11,7 +11,6 @@ audit events in the same transaction as the change they describe.
 
 import asyncio
 import os
-import re
 import sqlite3
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Iterator, Mapping, Sequence
@@ -34,8 +33,6 @@ SQLITE_BUSY_TIMEOUT_SECONDS = 30.0
 POSTGRES_DEFAULT_PORT = 5432
 # Row-value comparisons, which approval listing uses, arrived in SQLite 3.15.
 SQLITE_MINIMUM_VERSION = (3, 15, 0)
-POSTGRES_ROLE_NAME = re.compile(r"[a-z_][a-z0-9_]{0,62}")
-TABLE_NAME = re.compile(r"[a-z_][a-z0-9_]{0,62}")
 
 
 class Dialect(StrEnum):
@@ -241,7 +238,8 @@ class TableName:
 
 def table_columns(session: Session, table: str, *, schema: str | None = None) -> set[str]:
     """The column names of a table, in `schema` on Postgres; empty if there is no table."""
-    if not TABLE_NAME.fullmatch(table) or (schema is not None and not TABLE_NAME.fullmatch(schema)):
+    names = (table, schema) if schema is not None else (table,)
+    if not all(layout.IDENTIFIER.fullmatch(name) for name in names):
         raise ValueError(f"{table!r} in {schema!r} is not a plain table name.")
     if session.dialect is Dialect.SQLITE:
         # PRAGMA arguments cannot be bound, so the name is checked above.

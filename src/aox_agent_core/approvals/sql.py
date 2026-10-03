@@ -56,7 +56,7 @@ from aox_agent_core.storage import (
 
 ResultT = TypeVar("ResultT")
 
-APPROVALS_TABLE: Final = "agent_core_approvals"
+APPROVALS_TABLE: Final = layout.APPROVALS_TABLE
 RUN_CONTEXT_COLUMN: Final = "run_context"
 
 _TABLE_DDL = f"""

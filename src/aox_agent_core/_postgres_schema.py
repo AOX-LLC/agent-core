@@ -442,6 +442,9 @@ class ConnectionSide:
 # inheriting its privileges, is checked: none may be a superuser, own the table,
 # or be able to delete or truncate it.
 _CONNECTION_SQL = """
+WITH installed AS (
+    SELECT ?::text AS requester, ?::text AS approver, to_regclass(?) AS approvals
+)
 SELECT
     EXISTS (
         SELECT 1 FROM pg_roles m
@@ -451,10 +454,13 @@ SELECT
                OR has_table_privilege(m.oid, c.oid, 'DELETE')
                OR has_table_privilege(m.oid, c.oid, 'TRUNCATE'))
     ),
-    pg_has_role(current_user, ?, 'MEMBER') OR pg_has_role(session_user, ?, 'MEMBER'),
-    pg_has_role(current_user, ?, 'MEMBER') OR pg_has_role(session_user, ?, 'MEMBER'),
-    pg_has_role(?, ?, 'MEMBER') OR pg_has_role(?, ?, 'MEMBER')
-FROM pg_class c WHERE c.oid = to_regclass(?)
+    pg_has_role(current_user, i.requester, 'MEMBER')
+        OR pg_has_role(session_user, i.requester, 'MEMBER'),
+    pg_has_role(current_user, i.approver, 'MEMBER')
+        OR pg_has_role(session_user, i.approver, 'MEMBER'),
+    pg_has_role(i.requester, i.approver, 'MEMBER')
+        OR pg_has_role(i.approver, i.requester, 'MEMBER')
+FROM installed i JOIN pg_class c ON c.oid = i.approvals
 """
 
 
@@ -499,18 +505,7 @@ def check_connection(session: "Session", schema: str) -> str:
         f"SELECT requester_role, approver_role FROM {roles_table}"
     )[0]
     can_change, is_requester, is_approver, overlap = session.execute(
-        _CONNECTION_SQL,
-        (
-            requester_role,
-            requester_role,
-            approver_role,
-            approver_role,
-            requester_role,
-            approver_role,
-            approver_role,
-            requester_role,
-            table,
-        ),
+        _CONNECTION_SQL, (requester_role, approver_role, table)
     )[0]
     if overlap or requester_role == approver_role:
         raise ConfigError(

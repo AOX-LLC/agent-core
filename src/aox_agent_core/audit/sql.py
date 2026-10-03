@@ -44,7 +44,7 @@ from aox_agent_core.storage import (
     bring_table_up_to_date,
 )
 
-AUDIT_TABLE: Final = "agent_core_audit"
+AUDIT_TABLE: Final = layout.AUDIT_TABLE
 RUN_CONTEXT_COLUMN: Final = "run_context"
 UPDATE_TRIGGER: Final = "agent_core_audit_no_update"
 DELETE_TRIGGER: Final = "agent_core_audit_no_delete"
