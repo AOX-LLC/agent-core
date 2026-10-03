@@ -396,3 +396,24 @@ Carried over from the a3 to a4 upgrade:
 - **Postgres 17 in CI.** The Postgres test files passed against `postgres:17-alpine` on a developer machine. Postgres 18 and later were not tested.
 - **This upgrade on a large or busy database.** `tests/test_upgrade_from_a3.py` replays a schema dump made by 0.1.0a3 with four audit rows and one approval, upgrades it, and checks the rows, the chain and a second installer run. It has not been run on a production-sized database, or with writers active.
 - **Mixed versions.** An a3 library writing to an a4 schema has not been tested. Plan a short window with no writers: stop the a3 processes, run the installer, start a4.
+
+## A stored request the library cannot read
+
+An open request (pending, or approved and not yet used) holds its requester, action and payload hash: no second one can be queued while it stands. A row the library cannot parse, or one stored with an id that is not a UUID, cannot be used, cancelled or expired through the library, so a `submit` that meets it is refused and audited as `approval.submit_conflict`, and it keeps the key until the table owner closes it. Such a row exists only if it was written before the guard (0.1.0a2) or past it; the guard refuses to insert one.
+
+`submit` names what it found. For a row with a UUID it raises `ApprovalConflictError` with `existing` set and `reason` `malformed_row` in the audit event, and says the owner must close it. For an id that is not a UUID it raises `ApprovalIntegrityError` and the audit event has no `subject_id`. A request whose payload fails its hash is different: it can still be cancelled, which its error says.
+
+To free the key, as the table owner (the guard has to be switched off for the one statement, so this is a person's decision, and it writes no audit event: record it yourself):
+
+```sql
+BEGIN;
+ALTER TABLE public.agent_core_approvals DISABLE TRIGGER agent_core_approvals_guard;
+UPDATE public.agent_core_approvals
+   SET status = 'cancelled',
+       closed_at = to_char(now() AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"')
+ WHERE id = '<the id>' AND status IN ('pending', 'approved');
+ALTER TABLE public.agent_core_approvals ENABLE TRIGGER agent_core_approvals_guard;
+COMMIT;
+```
+
+Use your schema in place of `public`. The row stays in the table, unreadable, but no longer open.

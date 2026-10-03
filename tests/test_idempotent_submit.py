@@ -19,7 +19,7 @@ from aox_agent_core.approvals import (
 )
 from aox_agent_core.approvals.sql import approval_payload_hash
 from aox_agent_core.audit.sql import SQLAuditLog
-from aox_agent_core.errors import ApprovalConflictError, ConfigError
+from aox_agent_core.errors import ApprovalConflictError, ApprovalIntegrityError, ConfigError
 from aox_agent_core.storage import install_postgres_schema
 from databases import APPROVER_ROLE, REQUESTER_ROLE, ControlDatabase, SplitQueue, split_queue
 from test_approval_payload import ACTION, APPROVALS, raw_request
@@ -528,6 +528,95 @@ async def test_a_planted_unreadable_row_that_has_lapsed_does_not_block_either(
     assert fresh.id != planted
     stored = control_database.raw(f"SELECT status FROM {APPROVALS} WHERE id = '{planted}'")
     assert stored == [("expired",)]
+
+
+def plant(control_database: ControlDatabase, **columns: str) -> None:
+    """An open request for ask()'s requester, action and payload, written past the guard."""
+    control_database.superuser_raw(
+        "SET session_replication_role = replica; "
+        + raw_request(payload_sha256=f"'{approval_payload_hash(ACTION, PAYLOAD)}'", **columns)
+    )
+
+
+def close_as_owner(control_database: ControlDatabase, row_id: str) -> None:
+    """The owner's procedure from docs/upgrading.md for a request the library cannot read."""
+    table = APPROVALS
+    control_database.raw(f"ALTER TABLE {table} DISABLE TRIGGER agent_core_approvals_guard")
+    control_database.raw(
+        f"UPDATE {table} SET status = 'cancelled', "
+        "closed_at = to_char(now() AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') "
+        f"WHERE id = '{row_id}' AND status IN ('pending', 'approved')"
+    )
+    control_database.raw(f"ALTER TABLE {table} ENABLE TRIGGER agent_core_approvals_guard")
+
+
+async def submit_conflicts(control_database: ControlDatabase) -> list[Any]:
+    return [
+        r
+        async for r in SQLAuditLog(control_database.database).iter_records()
+        if r.action == "approval.submit_conflict"
+    ]
+
+
+async def test_an_open_row_whose_id_is_no_uuid_is_an_audited_refusal_not_a_crash(
+    control_database: ControlDatabase,
+) -> None:
+    if control_database.superuser_url is None:
+        pytest.skip("a row past the guard is planted on Postgres")
+    queue = split_queue(control_database)
+    plant(control_database, id="'req-legacy-0001'")
+
+    with pytest.raises(ApprovalIntegrityError, match=r"not a UUID.*table owner"):
+        await ask(queue)
+
+    (record,) = await submit_conflicts(control_database)
+    assert record.subject_id is None
+    assert record.payload["reason"] == "malformed_row"
+    assert record.payload["approval_action"] == ACTION
+    close_as_owner(control_database, "req-legacy-0001")
+    assert (await ask(queue)).status is ApprovalStatus.PENDING
+
+
+async def test_a_malformed_open_row_is_not_told_to_be_cancelled_since_cancel_cannot(
+    control_database: ControlDatabase,
+) -> None:
+    if control_database.superuser_url is None:
+        pytest.skip("a row past the guard is planted on Postgres")
+    queue = split_queue(control_database)
+    planted = uuid4()
+    plant(control_database, id=f"'{planted}'", delegates="'not json'")
+
+    with pytest.raises(ApprovalConflictError) as raised:
+        await ask(queue)
+
+    assert raised.value.existing == planted
+    advice = str(raised.value)
+    assert "table owner must close it" in advice
+    assert "Cancel it" not in advice
+    # The advice it replaces did not work: the library cannot cancel a row it cannot read.
+    with pytest.raises(ApprovalIntegrityError):
+        await queue.cancel(planted, principal=REQUESTER)
+    (record,) = await submit_conflicts(control_database)
+    assert (record.subject_id, record.payload["reason"]) == (str(planted), "malformed_row")
+    # What the advice sends the owner to do, as docs/upgrading.md gives it, frees the key.
+    close_as_owner(control_database, str(planted))
+    assert (await ask(queue)).id != planted
+
+
+async def test_a_payload_integrity_refusal_still_says_to_cancel_since_that_works(
+    control_database: ControlDatabase,
+) -> None:
+    if control_database.superuser_url is None:
+        pytest.skip("a row past the guard is planted on Postgres")
+    queue = split_queue(control_database)
+    planted = uuid4()
+    plant(control_database, id=f"'{planted}'", payload_json="'{\"a\": 1}'")
+
+    with pytest.raises(ApprovalConflictError, match="Cancel it, then submit again"):
+        await ask(queue)
+
+    await queue.cancel(planted, principal=REQUESTER)
+    assert (await ask(queue)).id != planted
 
 
 def test_errors_with_extra_fields_survive_pickling_and_copying() -> None:

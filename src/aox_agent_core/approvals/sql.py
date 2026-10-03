@@ -1348,6 +1348,19 @@ async def _open_row(
     return rows[0] if rows else None
 
 
+# What to do about an open request that blocks a submit and cannot be used. A payload that
+# fails its hash can still be cancelled (cancel reads no payload); a row the library cannot
+# parse cannot, and holds the key until the table owner closes it.
+_WAY_OUT: Final = {
+    "payload_integrity": "Cancel it, then submit again.",
+    "malformed_row": (
+        "The library cannot read this row, so it can be neither used nor cancelled through "
+        "it: the table owner must close it, then submit again "
+        '(docs/upgrading.md, "A stored request the library cannot read").'
+    ),
+}
+
+
 def _refused_repeat(
     error: ApprovalError,
     *,
@@ -1365,16 +1378,36 @@ def _refused_repeat(
     itself locked out has a record and an id to cancel. Events already made in this
     transaction (a lapsed request it expired) are kept.
     """
-    if not isinstance(error, ApprovalConflictError):
-        error = ApprovalConflictError(
-            f"Request {existing_id} is already open for this requester, action and payload, "
-            f"and cannot be used ({reason}). Cancel it, then submit again.",
-            existing=UUID(existing_id),
-            differs=differs,
+    try:
+        subject = UUID(existing_id)
+    except ValueError:
+        subject = None
+    if subject is None:
+        # A row stored with an id that is no UUID (before the guard, or planted past it)
+        # cannot be named by an ApprovalConflictError, nor cancelled: cancel takes a UUID.
+        error = ApprovalIntegrityError(
+            f"An open request for this requester, action and payload is stored with the id "
+            f"{existing_id[:40]!r}, which is not a UUID, so the library can neither read, "
+            "cancel nor expire it. The table owner must close it, then submit again "
+            '(docs/upgrading.md, "A stored request the library cannot read").'
         )
-    event = _missing_event(
-        "approval.submit_conflict", actor_id, UUID(existing_id), context, reason=reason
-    )
+        event = AuditEvent(
+            action="approval.submit_conflict",
+            actor_id=actor_id,
+            payload={"reason": reason},
+            context=context,
+        )
+    else:
+        if not isinstance(error, ApprovalConflictError):
+            error = ApprovalConflictError(
+                f"Request {subject} is already open for this requester, action and payload, "
+                f"and cannot be used ({reason}). {_WAY_OUT[reason]}",
+                existing=subject,
+                differs=differs,
+            )
+        event = _missing_event(
+            "approval.submit_conflict", actor_id, subject, context, reason=reason
+        )
     # The open request has this submit's action (it is part of the key), so the event says
     # which action was refused as the other approval.* events do.
     event = event.model_copy(
