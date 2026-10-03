@@ -920,7 +920,7 @@ def test_the_installer_lists_finished_requests_whose_finish_time_a_client_backda
     assert again.backdated_finishes == report.backdated_finishes
 
 
-async def test_an_approvals_guard_of_revision_5_is_refused_until_the_installer_is_run_again(
+async def test_an_approvals_guard_of_revision_6_is_refused_until_the_installer_is_run_again(
     control_database: ControlDatabase,
 ) -> None:
     if control_database.superuser_url is None:
@@ -929,13 +929,13 @@ async def test_an_approvals_guard_of_revision_5_is_refused_until_the_installer_i
     definition = control_database.superuser_raw(
         f"SELECT pg_get_functiondef('{schema}.agent_core_approvals_guard()'::regprocedure)"
     )[0][0]
-    assert "-- agent-core guard revision 6" in definition
+    assert "-- agent-core guard revision 7" in definition
     control_database.superuser_raw(
-        definition.replace("-- agent-core guard revision 6", "-- agent-core guard revision 5")
+        definition.replace("-- agent-core guard revision 7", "-- agent-core guard revision 6")
     )
 
     queue = split_queue(control_database)
-    with pytest.raises(ConfigError, match=r"revision 5; this release needs 6"):
+    with pytest.raises(ConfigError, match=r"revision 6; this release needs 7"):
         await queue.submit(
             action="crm.update_contact",
             summary="s",
@@ -944,7 +944,7 @@ async def test_an_approvals_guard_of_revision_5_is_refused_until_the_installer_i
             required_role="ops.approver",
             ttl_seconds=60,
         )
-    with pytest.raises(ConfigError, match=r"revision 5; this release needs 6"):
+    with pytest.raises(ConfigError, match=r"revision 6; this release needs 7"):
         await queue.approver.purge_payloads(
             principal=Principal(id="svc-retention", kind=PrincipalKind.SERVICE),
             older_than=timedelta(days=2),

@@ -53,7 +53,7 @@ AUDIT_LOCK_PREFIX: Final = "agent_core_audit:"
 # Which revision of the guard function and the audit insert trigger this release writes
 # (a comment inside each). A connection refuses an older one, so a release that changes
 # them is not run against a schema it has not been installed over.
-GUARD_REVISION: Final = 6
+GUARD_REVISION: Final = 7
 AUDIT_TRIGGER_REVISION: Final = 6
 # The oldest Postgres the library is tested on and supports (16.0).
 POSTGRES_MINIMUM_VERSION_NUM: Final = 160000
@@ -86,6 +86,15 @@ PURGEABLE_PREDICATE_POSTGRES: Final = (
     f"{PURGEABLE_PREDICATE} AND ({FINISHED_AT_EXPRESSION}) ~ {CANONICAL_STAMP_PATTERN}"
 )
 ROLES_TABLE: Final = "agent_core_approval_roles"
+# Login binding (0.1.0a7): an owner-managed table maps each approver login (session_user) to
+# the one principal id it may record as resolved_by. Rows are never deleted, so a login or a
+# principal is never reused; a mapping ends by setting removed_at.
+LOGINS_TABLE: Final = "agent_core_approver_logins"
+LOGINS_TRIGGER: Final = "agent_core_approver_logins_guard"
+LOGINS_TRUNCATE_TRIGGER: Final = "agent_core_approver_logins_no_truncate"
+LOGINS_TRIGGERS: Final = frozenset({LOGINS_TRIGGER, LOGINS_TRUNCATE_TRIGGER})
+BOUND_PRINCIPAL_FUNCTION: Final = "agent_core_bound_principal"
+BINDING_MARKER: Final = "-- agent-core login binding"
 
 AUDIT_UPDATE_DELETE_TRIGGER: Final = "agent_core_audit_no_update_delete"
 AUDIT_TRUNCATE_TRIGGER: Final = "agent_core_audit_no_truncate"
@@ -315,6 +324,60 @@ def approvals_tables_ddl(schema: str) -> tuple[str, ...]:
     )
 
 
+def logins_ddl(schema: str, approver_role: str) -> tuple[str, ...]:
+    """The login mapping table, its guard, the lookup function and their grants.
+
+    Always installed, so an owner can map logins before turning binding on. Nothing on the
+    table is granted to the requester or approver role: the guard reads it through
+    agent_core_bound_principal(), which runs as the owner (SECURITY DEFINER) and returns
+    only the connecting login's own principal. session_user is unchanged inside it.
+    """
+    quoted_schema = identifier(schema, what="schema")
+    table = f"{quoted_schema}.{LOGINS_TABLE}"
+    function = f"{quoted_schema}.{BOUND_PRINCIPAL_FUNCTION}"
+    approver = identifier(approver_role, what="role")
+    return (
+        f"""CREATE TABLE IF NOT EXISTS {table} (
+            login TEXT PRIMARY KEY CHECK (login <> ''),
+            principal TEXT NOT NULL UNIQUE
+                CHECK (principal ~ '^[A-Za-z0-9][A-Za-z0-9._:-]{{0,127}}$'),
+            mapped_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+            removed_at TIMESTAMPTZ
+        )""",
+        f"""CREATE OR REPLACE FUNCTION {quoted_schema}.{LOGINS_TABLE}_guard()
+        RETURNS trigger LANGUAGE plpgsql SET search_path = pg_catalog, pg_temp AS $$
+        BEGIN
+            IF TG_OP IN ('DELETE', 'TRUNCATE') THEN
+                RAISE EXCEPTION 'login mappings are never deleted; set removed_at to end one';
+            END IF;
+            IF TG_OP = 'INSERT' THEN
+                NEW.mapped_at := now();
+                NEW.removed_at := NULL;
+                RETURN NEW;
+            END IF;
+            IF OLD.removed_at IS NOT NULL OR NEW.removed_at IS NULL
+               OR ROW(NEW.login, NEW.principal, NEW.mapped_at)
+                  IS DISTINCT FROM ROW(OLD.login, OLD.principal, OLD.mapped_at) THEN
+                RAISE EXCEPTION 'a login mapping changes only by being removed, once';
+            END IF;
+            NEW.removed_at := now();
+            RETURN NEW;
+        END $$""",
+        f"""CREATE OR REPLACE TRIGGER {LOGINS_TRIGGER}
+        BEFORE INSERT OR UPDATE OR DELETE ON {table}
+        FOR EACH ROW EXECUTE FUNCTION {quoted_schema}.{LOGINS_TABLE}_guard()""",
+        f"""CREATE OR REPLACE TRIGGER {LOGINS_TRUNCATE_TRIGGER} BEFORE TRUNCATE ON {table}
+        FOR EACH STATEMENT EXECUTE FUNCTION {quoted_schema}.{LOGINS_TABLE}_guard()""",
+        f"REVOKE ALL ON {table} FROM PUBLIC",
+        f"""CREATE OR REPLACE FUNCTION {function}() RETURNS text
+        LANGUAGE sql STABLE SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $$
+            SELECT principal FROM {table} WHERE login = session_user::text AND removed_at IS NULL
+        $$""",
+        f"REVOKE ALL ON FUNCTION {function}() FROM PUBLIC",
+        f"GRANT EXECUTE ON FUNCTION {function}() TO {approver}",
+    )
+
+
 def open_request_index_ddl(schema: str) -> str:
     """The unique index that allows one open request per requester, action and payload hash."""
     table = f"{identifier(schema, what='schema')}.{APPROVALS_TABLE}"
@@ -330,6 +393,8 @@ def approvals_guard_ddl(
     requester_role: str,
     approver_role: str,
     payload_retention_floor_seconds: int = DEFAULT_PAYLOAD_RETENTION_FLOOR_SECONDS,
+    *,
+    bind_logins: bool = False,
 ) -> tuple[str, ...]:
     """The guard function and its triggers.
 
@@ -350,6 +415,9 @@ def approvals_guard_ddl(
         .replace("<unsafe_text>", UNSAFE_TEXT_PATTERN)
         .replace("<revision>", str(GUARD_REVISION))
         .replace("<retention_floor>", str(int(payload_retention_floor_seconds)))
+        .replace("<binding>", "on" if bind_logins else "off")
+        .replace("<bind_logins>", "true" if bind_logins else "false")
+        .replace("<bound_principal>", f"{quoted_schema}.{BOUND_PRINCIPAL_FUNCTION}")
     )
     return (
         f"""CREATE OR REPLACE FUNCTION {quoted_schema}.{APPROVALS_TABLE}_guard()
@@ -389,7 +457,11 @@ def _with_timestamp_checks(body: str) -> str:
 _GUARD_BODY = """
 -- agent-core guard revision <revision>
 -- agent-core payload retention floor <retention_floor> seconds
+-- agent-core login binding <binding>
 DECLARE
+    -- Login binding: with it on, a decision's resolved_by must be the principal the owner
+    -- mapped to session_user (the login that authenticated, which SET ROLE does not change).
+    bind_logins boolean := <bind_logins>;
     requester_role text := '<requester>';
     approver_role text := '<approver>';
     -- The shapes the library writes; rows of any other shape are refused, so
@@ -547,6 +619,9 @@ BEGIN
         IF is_expired OR is_overlong THEN
             RAISE EXCEPTION 'approval request % has expired or has no valid lifetime', OLD.id;
         END IF;
+        IF bind_logins AND NEW.resolved_by IS DISTINCT FROM <bound_principal>() THEN
+            RAISE EXCEPTION 'resolved_by must be the principal mapped to the deciding login';
+        END IF;
         IF NEW.decision IS DISTINCT FROM
                (CASE NEW.status WHEN 'approved' THEN 'approve' ELSE 'reject' END)
            OR NEW.resolved_by IS NULL OR NEW.resolved_by = OLD.requested_by
@@ -672,6 +747,10 @@ class InstallReport:
     the approver's hosts, so read the list as candidates. An empty list does not show that
     nothing was backdated: a time moved back but still after the request's own history is
     not detectable here.
+
+    login_binding is whether the guard now binds resolved_by to the deciding login.
+    unmapped_logins lists login roles that are members of the approver role and have no
+    active mapping: with binding on, none of them can decide a request.
     """
 
     schema: str
@@ -682,6 +761,8 @@ class InstallReport:
     closed_approvals: tuple[str, ...] = field(default=())
     closed_duplicates: tuple[str, ...] = field(default=())
     backdated_finishes: tuple[str, ...] = field(default=())
+    login_binding: bool = False
+    unmapped_logins: tuple[str, ...] = field(default=())
 
     def __str__(self) -> str:
         lines = [
@@ -710,6 +791,11 @@ class InstallReport:
                 "would take them at once, so check them first:"
             )
             lines += [f"  {request_id}" for request_id in self.backdated_finishes]
+        if self.login_binding:
+            lines.append("Login binding is on: resolved_by must be the deciding login's principal.")
+            if self.unmapped_logins:
+                lines.append("Approver logins with no mapping (they cannot decide requests):")
+                lines += [f"  {login}" for login in self.unmapped_logins]
         return "\n".join(lines)
 
 
@@ -783,7 +869,7 @@ async def require_postgres_version(session: "Session") -> None:
     version_num = int((await session.execute("SELECT current_setting('server_version_num')"))[0][0])
     if version_num < POSTGRES_MINIMUM_VERSION_NUM:
         raise ConfigError(
-            f"This Postgres server is version {version_num // 10000}; agent-core 0.1.0a6 "
+            f"This Postgres server is version {version_num // 10000}; agent-core 0.1.0a7 "
             f"needs {POSTGRES_MINIMUM_VERSION_NUM // 10000} or later."
         )
 
@@ -825,7 +911,7 @@ async def check_connection(session: "Session", schema: str) -> str:
             f"The approvals table in {schema} is not protected by the database "
             f"({'missing or disabled: ' + ', '.join(missing) if missing else 'no role table'}): "
             "it was created by agent-core 0.1.0a2, or its guard was removed. As the owner "
-            "role, run install_postgres_schema from 0.1.0a6 with the requester and approver "
+            "role, run install_postgres_schema from 0.1.0a7 with the requester and approver "
             "roles; it upgrades the schema in place and keeps every row."
         )
     revision = await _guard_revision(session, table)
@@ -833,7 +919,7 @@ async def check_connection(session: "Session", schema: str) -> str:
         raise ConfigError(
             f"The approvals guard in {schema} is revision {revision or 'older than 5'}; this "
             f"release needs {GUARD_REVISION}. As the owner role, run install_postgres_schema "
-            "from 0.1.0a6 with the requester and approver roles: it upgrades the schema in "
+            "from 0.1.0a7 with the requester and approver roles: it upgrades the schema in "
             "place and keeps every row (see docs/upgrading.md)."
         )
     await _require_open_request_index(session, schema, table)
@@ -863,6 +949,10 @@ async def check_connection(session: "Session", schema: str) -> str:
     await _check_layout(session, table, requester_role, approver_role)
     await _check_connecting_roles(session, table, as_requester=bool(is_requester))
     await refuse_requester_create(session, requester_role, schema)
+    if await login_binding_enabled(session, schema):
+        await _require_login_mapping(
+            session, schema, requester_role, approver_role, as_approver=bool(is_approver)
+        )
     return ConnectionSide.REQUESTER if is_requester else ConnectionSide.APPROVER
 
 
@@ -894,6 +984,85 @@ async def audit_trigger_revision(session: "Session", table: str) -> int | None:
     return int(found[1]) if found else None
 
 
+async def login_binding_enabled(session: "Session", schema: str) -> bool | None:
+    """Whether the installed guard binds resolved_by to the deciding login; None if no guard."""
+    table = f"{identifier(schema, what='schema')}.{APPROVALS_TABLE}"
+    source = await _guard_source(session, table)
+    found = re.search(rf"{re.escape(BINDING_MARKER)} (on|off)\b", source)
+    return None if found is None else found[1] == "on"
+
+
+async def bound_principal(session: "Session", schema: str) -> str | None:
+    """The principal the owner mapped to the connecting login (session_user), or None."""
+    function = f"{identifier(schema, what='schema')}.{BOUND_PRINCIPAL_FUNCTION}"
+    principal = (await session.execute(f"SELECT {function}()"))[0][0]
+    return None if principal is None else str(principal)
+
+
+async def _require_login_mapping(
+    session: "Session",
+    schema: str,
+    requester_role: str,
+    approver_role: str,
+    *,
+    as_approver: bool,
+) -> None:
+    """With binding on, refuse a setup whose mapping is missing, open to writes, or unmapped.
+
+    The table and its guard must exist and be enabled; neither installed role, nor any role
+    the connection can switch to, may write the table (only the owner maps logins); and an
+    approver-side connection must have an active mapping for its own login.
+    """
+    quoted_schema = identifier(schema, what="schema")
+    table = f"{quoted_schema}.{LOGINS_TABLE}"
+    function = f"{quoted_schema}.{BOUND_PRINCIPAL_FUNCTION}"
+    present = (
+        await session.execute(
+            "SELECT to_regclass(?) IS NOT NULL, to_regprocedure(?) IS NOT NULL",
+            (table, f"{function}()"),
+        )
+    )[0]
+    triggers = {
+        row[0]
+        for row in await session.execute(
+            "SELECT tgname FROM pg_trigger "
+            "WHERE tgrelid = to_regclass(?) AND NOT tgisinternal AND tgenabled <> 'D'",
+            (table,),
+        )
+    }
+    if not all(present) or not triggers >= LOGINS_TRIGGERS:
+        raise ConfigError(
+            f"Login binding is on in {schema}, but its login mapping is missing or unprotected "
+            f"({LOGINS_TABLE}, {BOUND_PRINCIPAL_FUNCTION}() and the table's triggers). As the "
+            "owner role, run install_postgres_schema from 0.1.0a7, then map each approver "
+            "login with bind_approver_login."
+        )
+    roles = [requester_role, approver_role] + [
+        row[0] for row in await session.execute(_CONNECTING_ROLES)
+    ]
+    for role in roles:
+        writable = (
+            await session.execute(
+                "SELECT " + " OR ".join(f"has_table_privilege(?, ?, '{p}')" for p in _WRITES),
+                tuple(value for _ in _WRITES for value in (role, table)),
+            )
+        )[0][0]
+        if writable:
+            raise ConfigError(
+                f"{role} can write the login mapping table in {schema}. Only the owner role may "
+                "map logins; revoke that grant."
+            )
+    if as_approver and await bound_principal(session, schema) is None:
+        login = (await session.execute("SELECT session_user::text"))[0][0]
+        raise ConfigError(
+            f"Login binding is on in {schema}, and the login {login} has no principal mapped. "
+            "As the owner role, map it with bind_approver_login before it decides requests."
+        )
+
+
+_WRITES: Final = ("INSERT", "UPDATE", "DELETE", "TRUNCATE")
+
+
 async def payload_retention_floor_seconds(session: "Session", schema: str) -> int:
     """The shortest retention, in seconds, the installed guard allows a purge."""
     table = f"{identifier(schema, what='schema')}.{APPROVALS_TABLE}"
@@ -903,7 +1072,7 @@ async def payload_retention_floor_seconds(session: "Session", schema: str) -> in
     if found is None:
         raise ConfigError(
             f"The approvals guard in {schema} carries no payload retention floor. As the owner "
-            "role, run install_postgres_schema from 0.1.0a6."
+            "role, run install_postgres_schema from 0.1.0a7."
         )
     return int(found[1])
 
@@ -937,7 +1106,7 @@ async def _require_open_request_index(session: "Session", schema: str, table: st
             f"The approvals table in {schema} has no valid unique index {OPEN_REQUEST_INDEX} "
             "on (requested_by, action, payload_sha256) for pending and approved requests, so "
             "two identical submits could both be approved. As the owner role, run "
-            "install_postgres_schema from 0.1.0a6 with the requester and approver roles."
+            "install_postgres_schema from 0.1.0a7 with the requester and approver roles."
         )
 
 

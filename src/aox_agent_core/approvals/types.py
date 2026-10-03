@@ -206,6 +206,7 @@ class DenialReason(StrEnum):
     MISSING_ROLE = "missing_role"
     SELF_APPROVAL = "self_approval"
     DELEGATE_APPROVAL = "delegate_approval"
+    LOGIN_BINDING = "login_binding"
     NOT_PENDING = "not_pending"
     NOT_REQUESTER = "not_requester"
     UNKNOWN_ACTION = "unknown_action"

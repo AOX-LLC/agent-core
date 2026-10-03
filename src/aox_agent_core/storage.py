@@ -15,6 +15,7 @@ audit events in the same transaction as the change they describe.
 
 import asyncio
 import os
+import re
 import sqlite3
 import threading
 import weakref
@@ -607,7 +608,7 @@ async def bring_table_up_to_date(
     if session.dialect is Dialect.POSTGRES:
         raise ConfigError(
             f"Table {table} was created by an earlier agent-core and has no {', '.join(missing)} "
-            "column. As the owner role, run install_postgres_schema from 0.1.0a6 with the "
+            "column. As the owner role, run install_postgres_schema from 0.1.0a7 with the "
             "requester and approver roles: it upgrades the schema in place and keeps every row."
         )
     for column in missing:
@@ -644,6 +645,7 @@ def install_postgres_schema(
     close_unaudited_approvals: bool = False,
     close_duplicates: bool = False,
     payload_retention_floor: timedelta = timedelta(hours=24),
+    bind_resolved_by: bool | None = None,
 ) -> InstallReport:
     """Create or upgrade the audit and approval tables in `schema`, as the owner role.
 
@@ -667,6 +669,15 @@ def install_postgres_schema(
     SQLApprovalQueue.purge_payloads: a stored payload may be purged only from a finished
     request whose finish time is further back than this by the database's clock. It is
     written into the guard, so running the installer again with another value changes it.
+
+    `bind_resolved_by` turns login binding on or off. With it on, the guard refuses a
+    decision whose resolved_by is not the principal the owner mapped (bind_approver_login)
+    to the deciding login, judged by session_user, which SET ROLE does not change. None, the
+    default, keeps what the guard has (off in a new install), so running the installer again
+    never switches binding off by accident; only an explicit False does. It is off by
+    default because a host whose approvers share one login cannot use it. The mapping table
+    is installed either way, so logins can be mapped before binding is turned on; the
+    report lists the approver role's login members that have no mapping yet.
 
     The schema allows one open (pending or approved) request per requester, action and
     payload hash, by a unique index. A database that already holds duplicates (what
@@ -705,11 +716,17 @@ def install_postgres_schema(
         # Checked before the guard is written: a run with other role names must not
         # get as far as rewriting it with them.
         await _record_roles(session, schema, requester_role, approver_role)
+        for statement in layout.logins_ddl(schema, approver_role):
+            await session.execute(statement)
+        binding = bind_resolved_by
+        if binding is None:
+            binding = bool(await layout.login_binding_enabled(session, schema))
         for statement in layout.approvals_guard_ddl(
             schema,
             requester_role,
             approver_role,
             payload_retention_floor_seconds=int(payload_retention_floor.total_seconds()),
+            bind_logins=binding,
         ):
             await session.execute(statement)
         for role, role_layout in (
@@ -764,6 +781,8 @@ def install_postgres_schema(
             closed_approvals=tuple(unaudited) if close_unaudited_approvals else (),
             closed_duplicates=tuple(closed_duplicates),
             backdated_finishes=tuple(await _backdated_finishes(session, schema)),
+            login_binding=binding,
+            unmapped_logins=tuple(await _unmapped_logins(session, schema, approver_role)),
         )
 
     async def run() -> InstallReport:
@@ -1082,6 +1101,127 @@ async def _record_roles(
         )
 
 
+_UNMAPPED_LOGINS = """
+SELECT r.rolname FROM pg_roles r
+WHERE r.rolcanlogin AND NOT r.rolsuper AND pg_has_role(r.oid, ?, 'MEMBER') AND r.rolname <> ?
+  AND NOT EXISTS (SELECT 1 FROM {table} m WHERE m.login = r.rolname AND m.removed_at IS NULL)
+ORDER BY r.rolname
+"""
+
+
+async def _unmapped_logins(session: Session, schema: str, approver_role: str) -> list[str]:
+    """Login roles that are members of the approver role and have no active mapping."""
+    table = f"{layout.identifier(schema, what='schema')}.{layout.LOGINS_TABLE}"
+    rows = await session.execute(
+        _UNMAPPED_LOGINS.format(table=table), (approver_role, approver_role)
+    )
+    return [row[0] for row in rows]
+
+
+def bind_approver_login(
+    owner_url: str | SecretStr, *, login: str, principal: str, schema: str = "public"
+) -> None:
+    """Map an approver login to the one principal id it may record as resolved_by.
+
+    Run as the owner role, never by the application. One login per principal and one
+    principal per login, both ways, for ever: a mapping is ended with unbind_approver_login
+    and neither the login nor the principal can be mapped again afterwards, so a later
+    holder of the name cannot inherit the old one's decisions. The login must be a login
+    role that is a member of the approver role and not of the requester role, and not a
+    superuser. Raises ConfigError otherwise, or when the login or principal is already
+    mapped (active or removed). The mapping matters only while the guard binds
+    (install_postgres_schema(bind_resolved_by=True)).
+    """
+    if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}", principal) is None:
+        raise ConfigError(f"{principal!r} is not a principal id.")
+    _owner_url(owner_url)
+
+    async def bind(session: Session) -> None:
+        requester_role, approver_role = await _installed_roles(session, schema)
+        rows = await session.execute(
+            "SELECT r.rolcanlogin, r.rolsuper, pg_has_role(r.oid, ?, 'MEMBER'), "
+            "pg_has_role(r.oid, ?, 'MEMBER') FROM pg_roles r WHERE r.rolname = ?",
+            (approver_role, requester_role, login),
+        )
+        if not rows:
+            raise ConfigError(f"There is no role {login!r}.")
+        can_login, is_super, is_approver, is_requester = rows[0]
+        if not can_login or is_super or not is_approver or is_requester:
+            raise ConfigError(
+                f"{login!r} must be a login role, not a superuser, a member of the approver "
+                f"role {approver_role} and not of the requester role {requester_role}."
+            )
+        table = f"{layout.identifier(schema, what='schema')}.{layout.LOGINS_TABLE}"
+        taken = await session.execute(
+            f"SELECT login, principal, removed_at IS NOT NULL FROM {table} "
+            "WHERE login = ? OR principal = ?",
+            (login, principal),
+        )
+        if taken:
+            what = "removed" if taken[0][2] else "mapped"
+            raise ConfigError(
+                f"The login {login!r} or the principal {principal!r} is already {what} in "
+                f"{layout.LOGINS_TABLE}. A login or a principal is never mapped twice, even "
+                "after a mapping is removed; use a new principal id for a new login."
+            )
+        await session.execute(
+            f"INSERT INTO {table} (login, principal) VALUES (?, ?)", (login, principal)
+        )
+
+    _run_as_owner(owner_url, bind)
+
+
+def unbind_approver_login(
+    owner_url: str | SecretStr, *, login: str, schema: str = "public"
+) -> None:
+    """End a login's mapping. Its login and principal can never be mapped again.
+
+    Run as the owner role. The row stays, with removed_at set. Raises ConfigError if the
+    login has no active mapping.
+    """
+    _owner_url(owner_url)
+
+    async def unbind(session: Session) -> None:
+        table = f"{layout.identifier(schema, what='schema')}.{layout.LOGINS_TABLE}"
+        updated = await session.execute(
+            f"UPDATE {table} SET removed_at = now() WHERE login = ? AND removed_at IS NULL "
+            "RETURNING login",
+            (login,),
+        )
+        if not updated:
+            raise ConfigError(f"The login {login!r} has no active mapping in {table}.")
+
+    _run_as_owner(owner_url, unbind)
+
+
+def _owner_url(owner_url: str | SecretStr) -> None:
+    raw = owner_url.get_secret_value() if isinstance(owner_url, SecretStr) else owner_url
+    if urlsplit(raw).scheme not in {"postgresql", "postgres"}:
+        raise ConfigError("This needs a postgresql:// URL.")
+
+
+async def _installed_roles(session: Session, schema: str) -> tuple[str, str]:
+    roles = f"{layout.identifier(schema, what='schema')}.{layout.ROLES_TABLE}"
+    try:
+        rows = await session.execute(f"SELECT requester_role, approver_role FROM {roles}")
+    except Exception as error:
+        raise ConfigError(
+            f"The approvals schema is not installed in {schema}; run install_postgres_schema."
+        ) from error
+    return rows[0][0], rows[0][1]
+
+
+def _run_as_owner(owner_url: str | SecretStr, work: Callable[[Session], Awaitable[None]]) -> None:
+    async def run() -> None:
+        async with PostgresDatabase(
+            owner_url if isinstance(owner_url, SecretStr) else SecretStr(owner_url),
+            max_connections=1,
+        ) as database:
+            await database.run(work, write=True)
+
+    run_blocking(run)
+
+
 __all__ = [
     "ConnectionSource",
     "Database",
@@ -1091,7 +1231,9 @@ __all__ = [
     "PostgresDatabase",
     "SQLiteDatabase",
     "Session",
+    "bind_approver_login",
     "driver_errors",
     "install_postgres_schema",
     "open_database",
+    "unbind_approver_login",
 ]

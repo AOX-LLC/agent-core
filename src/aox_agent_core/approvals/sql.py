@@ -146,6 +146,7 @@ _DENIAL_ERRORS: Final[Mapping[DenialReason, type[ApprovalError]]] = {
     DenialReason.MISSING_ROLE: NotAuthorizedToResolveError,
     DenialReason.SELF_APPROVAL: NotAuthorizedToResolveError,
     DenialReason.DELEGATE_APPROVAL: NotAuthorizedToResolveError,
+    DenialReason.LOGIN_BINDING: NotAuthorizedToResolveError,
     DenialReason.NOT_PENDING: ApprovalAlreadyResolvedError,
     DenialReason.UNKNOWN_ACTION: NotAuthorizedToResolveError,
     DenialReason.ROLE_MISMATCH: NotAuthorizedToResolveError,
@@ -203,6 +204,7 @@ class SQLApprovalQueue:
         self._clock = clock if clock is not None else _utc_now
         self._schema = self._table.schema or layout.DEFAULT_SCHEMA
         self._side: ApprovalSide | None = None
+        self._binds_logins = False
         self._last_hidden_warning = float("-inf")
 
     async def side(self, *, connection: Any = None) -> ApprovalSide:
@@ -233,6 +235,7 @@ class SQLApprovalQueue:
                 self._side = ApprovalSide.BOTH
             else:
                 side = ApprovalSide(await layout.check_connection(session, self._schema))
+                self._binds_logins = bool(await layout.login_binding_enabled(session, self._schema))
                 # An installer that predates this release leaves columns out.
                 await bring_table_up_to_date(
                     session, APPROVALS_TABLE, ADDED_COLUMNS, schema=self._table.schema
@@ -599,6 +602,25 @@ class SQLApprovalQueue:
                     ),
                 )
 
+            if self._binds_logins:
+                # The guard enforces this; asking first gives the refusal a name and an audit
+                # event instead of a driver error. The mapping is read inside this transaction.
+                bound = await layout.bound_principal(session, self._schema)
+                if bound != principal.id:
+                    return _denied(
+                        NotAuthorizedToResolveError(
+                            f"Request {request_id} cannot be resolved: this login may record "
+                            "only the principal the owner mapped to it."
+                        ),
+                        _event(
+                            "approval.resolve_denied",
+                            principal.id,
+                            request,
+                            event_context,
+                            decision=decision.value,
+                            reason=DenialReason.LOGIN_BINDING.value,
+                        ),
+                    )
             # A request may be dated up to five minutes ahead (the guard allows it, for clock
             # skew); a decision is never dated before its request.
             decided_at = max(now, request.created_at)
