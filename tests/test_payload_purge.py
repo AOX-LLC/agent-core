@@ -388,3 +388,71 @@ def test_the_installer_replaces_the_purge_index_an_a5_install_left_behind(
         "AND indexname LIKE 'agent_core_approvals_pur%'"
     )
     assert names == [(layout.PURGEABLE_INDEX,)]
+
+
+def approver_with_short_lock_timeout(control_database: ControlDatabase) -> Any:
+    from aox_agent_core.approvals import RoleApproverPolicy
+    from aox_agent_core.approvals.sql import SQLApprovalQueue
+    from databases import TEST_ACTION_ROLES
+
+    log = SQLAuditLog(
+        control_database.approver_database,
+        schema=control_database.schema,
+        lock_timeout=timedelta(milliseconds=300),
+    )
+    return SQLApprovalQueue(
+        control_database.approver_database,
+        audit_log=log,
+        schema=control_database.schema,
+        policy=RoleApproverPolicy(roles_by_action=TEST_ACTION_ROLES),
+    )
+
+
+async def test_the_expiry_sweep_skips_a_request_another_transaction_holds(
+    control_database: ControlDatabase,
+) -> None:
+    if control_database.owner_url is None:
+        pytest.skip("row locks held by another transaction are Postgres")
+    import psycopg
+
+    queue = split_queue(control_database)
+    held, free = await make(queue, 1, ttl_seconds=1), await make(queue, 2, ttl_seconds=1)
+    await asyncio.sleep(1.3)
+    sweeper = approver_with_short_lock_timeout(control_database)
+
+    with psycopg.connect(control_database.url) as holder:
+        holder.execute(f"SELECT 1 FROM {APPROVALS} WHERE id = '{held.id}' FOR UPDATE")
+        # The other request expires; the held one is left for the next sweep, not an error.
+        assert await sweeper.expire_due(principal=SWEEPER) == 1
+        statuses = control_database.raw(
+            f"SELECT id, status FROM {APPROVALS} WHERE id IN ('{held.id}', '{free.id}')"
+        )
+        assert dict(statuses) == {str(held.id): "pending", str(free.id): "expired"}
+
+    assert await sweeper.expire_due(principal=SWEEPER) == 1
+    assert (await queue.get(held.id)).status is ApprovalStatus.EXPIRED
+
+
+async def test_the_purge_skips_a_request_another_transaction_holds(
+    control_database: ControlDatabase,
+) -> None:
+    if control_database.owner_url is None:
+        pytest.skip("row locks held by another transaction are Postgres")
+    import psycopg
+
+    queue = split_queue(control_database)
+    held, free = await make(queue, 1), await make(queue, 2)
+    for request in (held, free):
+        await queue.cancel(request.id, principal=REQUESTER)
+        age(control_database, request.id, timedelta(days=3))
+    purger = approver_with_short_lock_timeout(control_database)
+
+    with psycopg.connect(control_database.url) as holder:
+        holder.execute(f"SELECT 1 FROM {APPROVALS} WHERE id = '{held.id}' FOR UPDATE")
+        purged = await purger.purge_payloads(principal=SWEEPER, older_than=timedelta(days=2))
+        assert purged == 1
+        assert (await queue.get(held.id)).payload is not None
+        assert (await queue.get(free.id)).payload is None
+
+    assert await purger.purge_payloads(principal=SWEEPER, older_than=timedelta(days=2)) == 1
+    assert (await queue.get(held.id)).payload is None

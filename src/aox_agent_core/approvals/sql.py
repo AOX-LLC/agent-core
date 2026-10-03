@@ -837,7 +837,9 @@ class SQLApprovalQueue:
         stored state match, with one approval.expired audit event per request
         naming `principal` as the actor. Either side may run it. It works in
         batches of `limit`, each its own transaction. On Postgres a request
-        counts as due only once the database's clock agrees, as the guard does.
+        counts as due only once the database's clock agrees, as the guard does. A request
+        another transaction is holding (on Postgres) is skipped, not waited for: the next
+        sweep takes it.
         """
         if limit < 1:
             raise ValueError(f"limit must be at least 1, got {limit}")
@@ -862,7 +864,7 @@ class SQLApprovalQueue:
             events = []
             for request in due:
                 closed_at = await _close(
-                    session, self._table, request, ApprovalStatus.EXPIRED, moment
+                    session, self._table, request, ApprovalStatus.EXPIRED, moment, skip_locked=True
                 )
                 if closed_at is not None:
                     expired = request.model_copy(
@@ -910,7 +912,9 @@ class SQLApprovalQueue:
         be shorter than the retention floor the installer wrote into the guard
         (install_postgres_schema(payload_retention_floor=...), 24 hours by default),
         else ValueError, and the guard refuses anything shorter whatever the library
-        says. Nothing else purges a payload: count it in your retention plan.
+        says. A request another transaction is holding (on Postgres) is skipped, not waited
+        for: the next run takes it. Nothing else purges a payload: count it in your
+        retention plan.
         """
         if older_than <= timedelta(0):
             raise ValueError("older_than must be positive")
@@ -944,12 +948,18 @@ class SQLApprovalQueue:
             if candidates:
                 await self._lock_after_reading(session, connection)
             events = []
+            skipping, markers = _skipping_locked_rows(self._table, session)
             for request in candidates:
                 changed = await session.execute_count(
                     f"UPDATE {self._table.sql} SET payload_json = NULL, payload_purged_at = ? "
                     "WHERE id = ? AND status = ? AND payload_json IS NOT NULL "
-                    "AND payload_purged_at IS NULL",
-                    (canonical_timestamp(moment), str(request.id), request.status.value),
+                    f"AND payload_purged_at IS NULL{skipping}",
+                    (
+                        canonical_timestamp(moment),
+                        str(request.id),
+                        request.status.value,
+                        *(str(request.id) for _ in markers),
+                    ),
                 )
                 if changed == 1:
                     events.append(
@@ -1233,20 +1243,43 @@ def _cancel_refusal(
     return None
 
 
+def _skipping_locked_rows(table: TableName, session: Session) -> tuple[str, tuple[str, ...]]:
+    """The extra condition that makes an UPDATE of one request skip it, not wait, while another
+    transaction holds its row (Postgres; SQLite has no row locks), and the id markers it takes.
+
+    The lock is still taken by the UPDATE, after the audit append lock the sweeps take first,
+    so the lock order is unchanged. A skipped request is counted as not changed.
+    """
+    if session.dialect is not Dialect.POSTGRES:
+        return "", ()
+    return f" AND id IN (SELECT id FROM {table.sql} WHERE id = ? FOR UPDATE SKIP LOCKED)", ("id",)
+
+
 async def _close(
     session: Session,
     table: TableName,
     request: ApprovalRequest,
     status: ApprovalStatus,
     now: datetime,
+    *,
+    skip_locked: bool = False,
 ) -> datetime | None:
     """Move a request from its stored status to `status` (cancelled, or expired for an
     approval that lapsed too). Returns the closed_at that was stored, which on Postgres is
-    the database's own stamp and not `now`; None if the request moved meanwhile."""
+    the database's own stamp and not `now`; None if the request moved meanwhile, or, with
+    `skip_locked` (a sweep), another transaction holds its row."""
+    skipping, markers = _skipping_locked_rows(table, session) if skip_locked else ("", ())
+    parameters: tuple[str, ...] = (
+        status.value,
+        canonical_timestamp(now),
+        str(request.id),
+        request.status.value,
+        *(str(request.id) for _ in markers),
+    )
     rows = await session.execute(
-        f"UPDATE {table.sql} SET status = ?, closed_at = ? WHERE id = ? AND status = ? "
-        "RETURNING closed_at",
-        (status.value, canonical_timestamp(now), str(request.id), request.status.value),
+        f"UPDATE {table.sql} SET status = ?, closed_at = ? WHERE id = ? AND status = ?"
+        f"{skipping} RETURNING closed_at",
+        parameters,
     )
     return datetime.fromisoformat(rows[0][0]) if rows else None
 

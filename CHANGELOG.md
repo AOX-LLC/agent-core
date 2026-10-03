@@ -29,6 +29,7 @@ Fix release for 0.1.0a5. **0.1.0a5 was tagged but never released** (see below): 
 - The `approval.submit_conflict` audit event records `approval_action` in its payload, as the other `approval.*` events do.
 - A `submit` that meets an open request stored with an id that is not a UUID no longer crashes with a `ValueError`. It raises `ApprovalIntegrityError` naming the id (cut to 40 characters), and audits `approval.submit_conflict` with no `subject_id`.
 - The refusal for an open request the library cannot parse (`malformed_row`) no longer says "Cancel it, then submit again": `cancel` cannot read such a row, so that advice failed. It says the table owner must close it, and docs/upgrading.md gives the procedure ("A stored request the library cannot read"). A request whose stored payload fails its hash can be cancelled, and still says so. The row keeps its key until the owner acts: the library cannot close what it cannot read.
+- `expire_due` and `purge_payloads` skip a request another transaction holds (`FOR UPDATE SKIP LOCKED`, taken by the UPDATE after the audit append lock, so the lock order is unchanged) instead of failing the whole sweep with `LockNotAvailable` after `lock_timeout`. The request is picked up by the next sweep. SQLite is unchanged.
 
 ## [0.1.0a5] - 2026-10-03
 
