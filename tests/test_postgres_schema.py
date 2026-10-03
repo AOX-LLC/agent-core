@@ -35,6 +35,7 @@ from databases import (
     postgres_database,
     split_queue,
 )
+from test_approval_payload import raw_request
 
 A2_SCHEMA = Path(__file__).parent / "fixtures" / "postgres" / "a2_schema.sql"
 STATES = ("pending", "approved", "rejected", "consumed", "cancelled", "expired")
@@ -819,3 +820,68 @@ def test_closing_is_refused_when_the_audit_log_lives_elsewhere(
         )
 
     assert status_of(pg, request_id) == "approved"
+
+
+def test_the_installer_lists_finished_requests_whose_finish_time_a_client_backdated(
+    control_database: ControlDatabase,
+) -> None:
+    """0.1.0a4 let the closing role write closed_at and consumed_at: such a row is purgeable
+    at once under any floor. The report names them, only those still holding a payload."""
+    if control_database.owner_url is None or control_database.superuser_url is None:
+        pytest.skip("the installer is Postgres only")
+    now = datetime.now(UTC)
+
+    def stamp(moment: datetime) -> str:
+        return "'" + moment.strftime("%Y-%m-%dT%H:%M:%S.%fZ") + "'"
+
+    def plant(**columns: str) -> str:
+        row_id = str(uuid4())
+        control_database.superuser_raw(
+            "SET session_replication_role = replica; "
+            + raw_request(
+                **{
+                    "id": f"'{row_id}'",
+                    "created_at": stamp(now - timedelta(days=2)),
+                    "expires_at": stamp(now - timedelta(days=1)),
+                    "payload_json": "'{\"a\": 1}'",
+                    **columns,
+                }
+            )
+        )
+        return row_id
+
+    decided = {
+        "decision": "'approve'",
+        "resolved_by": "'user-17'",
+        "resolved_at": stamp(now - timedelta(days=1, hours=12)),
+    }
+    cancelled_before_created = plant(status="'cancelled'", closed_at=stamp(now - timedelta(days=9)))
+    consumed_before_approved = plant(
+        status="'consumed'", consumed_at=stamp(now - timedelta(days=1, hours=20)), **decided
+    )
+    honest = plant(status="'cancelled'", closed_at=stamp(now - timedelta(hours=3)))
+    purged = plant(
+        status="'cancelled'",
+        closed_at=stamp(now - timedelta(days=9)),
+        payload_json="NULL",
+        payload_purged_at=stamp(now),
+    )
+    still_open = plant(status="'pending'")
+
+    report = install_postgres_schema(
+        control_database.owner_url,
+        requester_role=REQUESTER_ROLE,
+        approver_role=APPROVER_ROLE,
+        schema=control_database.schema,
+    )
+
+    assert set(report.backdated_finishes) == {cancelled_before_created, consumed_before_approved}
+    assert {honest, purged, still_open}.isdisjoint(report.backdated_finishes)
+    assert cancelled_before_created in str(report)
+    again = install_postgres_schema(
+        control_database.owner_url,
+        requester_role=REQUESTER_ROLE,
+        approver_role=APPROVER_ROLE,
+        schema=control_database.schema,
+    )
+    assert again.backdated_finishes == report.backdated_finishes

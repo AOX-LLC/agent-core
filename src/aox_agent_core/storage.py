@@ -763,6 +763,7 @@ def install_postgres_schema(
             unaudited_approvals=tuple(unaudited),
             closed_approvals=tuple(unaudited) if close_unaudited_approvals else (),
             closed_duplicates=tuple(closed_duplicates),
+            backdated_finishes=tuple(await _backdated_finishes(session, schema)),
         )
 
     async def run() -> InstallReport:
@@ -800,6 +801,23 @@ async def _unaudited_approvals(session: Session, schema: str, approver_role: str
     (or from before 0.1.0a3) approves."""
     sql = _UNAUDITED_APPROVALS_SQL.format(**_qualified_tables(schema))
     return [row[0] for row in await session.execute(sql, (approver_role,))]
+
+
+async def _backdated_finishes(session: Session, schema: str) -> list[str]:
+    """Finished requests still holding a payload, whose finish time is before their creation
+    or before their own decision: what a client that wrote its own finish time (0.1.0a4)
+    could leave. Canonical timestamps compare as text. Rows with another spelling are never
+    purged, so they are not listed."""
+    approvals = _qualified_tables(schema)["approvals"]
+    finished = layout.FINISHED_AT_EXPRESSION
+    shape = layout.CANONICAL_STAMP_PATTERN
+    rows = await session.execute(
+        f"SELECT id FROM {approvals} WHERE status IN ('consumed', 'rejected', 'cancelled', "
+        "'expired') AND payload_json IS NOT NULL AND payload_purged_at IS NULL "
+        f"AND ({finished}) ~ {shape} AND (({finished}) < created_at "
+        f"OR (resolved_at ~ {shape} AND ({finished}) < resolved_at)) ORDER BY id LIMIT 1000"
+    )
+    return [row[0] for row in rows]
 
 
 def _qualified_tables(schema: str) -> dict[str, str]:
