@@ -5,8 +5,10 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 from uuid import UUID
 
+import psycopg
 import pytest
 
+from aox_agent_core import _postgres_schema as layout
 from aox_agent_core.approvals import (
     ApprovalRequest,
     ApprovalStatus,
@@ -14,10 +16,11 @@ from aox_agent_core.approvals import (
     Principal,
     PrincipalKind,
 )
+from aox_agent_core.approvals.sql import purgeable_select
 from aox_agent_core.audit.chain import canonical_timestamp
 from aox_agent_core.audit.sql import SQLAuditLog
 from aox_agent_core.errors import ConfigError
-from aox_agent_core.storage import install_postgres_schema
+from aox_agent_core.storage import Dialect, TableName, install_postgres_schema
 from databases import APPROVER_ROLE, REQUESTER_ROLE, ControlDatabase, SplitQueue, split_queue
 from test_approval_payload import ACTION, APPROVALS
 from test_approvals import APPROVER, REQUESTER
@@ -291,3 +294,97 @@ async def test_a_purge_whose_run_outlasts_the_five_minute_bound_still_completes(
     else:
         # No guard on SQLite: each batch stamps its own reading of the application clock.
         assert len(set(purged_at)) == 3
+
+
+BACKLOG = 40_000
+
+
+def test_the_purge_scan_reads_a_large_due_backlog_through_its_index(
+    control_database: ControlDatabase,
+) -> None:
+    """The library's own scan, not a copy of it, on a backlog far larger than one batch.
+
+    The scan filters on a canonical finish time as well, and the index carries that
+    condition; without it the planner read every due row and sorted them for each batch.
+    """
+    if control_database.superuser_url is None:
+        pytest.skip("the plan is read on Postgres")
+    table = TableName("agent_core_approvals", control_database.schema)
+    columns = (
+        "id, action, summary, payload_sha256, requested_by, required_role, created_at, "
+        "expires_at, status, delegates, payload_json, payload_purged_at, closed_at"
+    )
+    stamp = (
+        "to_char(timestamp '2026-01-01' + g * interval '1 second', "
+        '\'YYYY-MM-DD"T"HH24:MI:SS.US"Z"\')'
+    )
+    created = "'2025-12-31T00:00:00.000000Z'"
+    expires = "'2025-12-31T01:00:00.000000Z'"
+
+    def rows(prefix: str, count: int, closed: str, payload: str, purged: str) -> str:
+        return (
+            f"INSERT INTO {table.sql} ({columns}) SELECT '{prefix}' || g, 'ops.update', 's', "
+            f"md5('{prefix}' || g) || md5(g::text || '{prefix}'), 'agent-intake', 'ops.approver', "
+            f"{created}, {expires}, 'cancelled', '[]', {payload}, {purged}, {closed} "
+            f"FROM generate_series(1, {count}) g"
+        )
+
+    payload = "'{\"a\": 1}'"
+    with psycopg.connect(control_database.superuser_url, autocommit=True) as connection:
+        connection.execute("SET session_replication_role = replica")
+        connection.execute(rows("due", BACKLOG, stamp, payload, "NULL"))
+        connection.execute(rows("odd", BACKLOG // 4, "'finished-' || g", payload, "NULL"))
+        connection.execute(
+            rows("new", BACKLOG // 4, "'2099-01-01T00:00:00.000000Z'", payload, "NULL")
+        )
+        connection.execute(
+            rows(
+                "gone",
+                BACKLOG // 2,
+                "'2026-01-01T00:00:00.000000Z'",
+                "NULL",
+                "'2026-02-01T00:00:00.000000Z'",
+            )
+        )
+        connection.execute(f"ANALYZE {table.sql}")
+        scan = purgeable_select(table, Dialect.POSTGRES).replace("?", "%s")
+        plan = [
+            line
+            for (line,) in connection.execute(
+                "EXPLAIN (ANALYZE, COSTS OFF) " + scan, (86_400.0, 500)
+            ).fetchall()
+        ]
+        found = connection.execute(scan, (86_400.0, 500)).fetchall()
+
+    shown = "\n".join(plan)
+    assert f"Index Scan using {layout.PURGEABLE_INDEX}" in shown, shown
+    assert "Sort" not in shown, shown
+    assert "Bitmap" not in shown, shown
+    assert len(found) == 500
+
+
+def test_the_installer_replaces_the_purge_index_an_a5_install_left_behind(
+    control_database: ControlDatabase,
+) -> None:
+    if control_database.owner_url is None or control_database.superuser_url is None:
+        pytest.skip("indexes are read on Postgres")
+    table = f"{control_database.schema}.agent_core_approvals"
+    control_database.raw(f"DROP INDEX {control_database.schema}.{layout.PURGEABLE_INDEX}")
+    control_database.raw(
+        f"CREATE INDEX {layout.LEGACY_PURGEABLE_INDEX} ON {table} "
+        f"(({layout.FINISHED_AT_EXPRESSION}), id) WHERE {layout.PURGEABLE_PREDICATE}"
+    )
+
+    install_postgres_schema(
+        control_database.owner_url,
+        requester_role=REQUESTER_ROLE,
+        approver_role=APPROVER_ROLE,
+        schema=control_database.schema,
+    )
+
+    names = control_database.raw(
+        "SELECT indexname FROM pg_indexes WHERE tablename = 'agent_core_approvals' "
+        f"AND schemaname = '{control_database.schema}' "
+        "AND indexname LIKE 'agent_core_approvals_pur%'"
+    )
+    assert names == [(layout.PURGEABLE_INDEX,)]

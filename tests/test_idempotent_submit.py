@@ -529,20 +529,6 @@ async def test_a_planted_unreadable_row_that_has_lapsed_does_not_block_either(
     assert stored == [("expired",)]
 
 
-def test_the_purge_scan_has_an_index_to_use(control_database: ControlDatabase) -> None:
-    if control_database.superuser_url is None:
-        pytest.skip("the plan is read on Postgres")
-    where = layout.PURGEABLE_PREDICATE
-    finished = layout.FINISHED_AT_EXPRESSION
-    with psycopg.connect(control_database.superuser_url) as connection:
-        connection.execute("SET enable_seqscan = off")  # a table this small would not use it
-        plan = connection.execute(
-            f"EXPLAIN SELECT id FROM {APPROVALS} WHERE {where} "
-            f"AND ({finished}) <= '2030-01-01T00:00:00.000000Z' ORDER BY ({finished}), id LIMIT 500"
-        ).fetchall()
-    assert layout.PURGEABLE_INDEX in str(plan)
-
-
 def test_errors_with_extra_fields_survive_pickling_and_copying() -> None:
     import copy
     import pickle

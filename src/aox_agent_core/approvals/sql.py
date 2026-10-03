@@ -133,7 +133,6 @@ PAYLOAD_COLUMN: Final = "payload_json"
 _FINISHED_STATUSES: Final = ("consumed", "rejected", "cancelled", "expired")
 # When a finished request finished: consumed, decided (rejected) or closed (cancelled, expired).
 _FINISHED_AT: Final = layout.FINISHED_AT_EXPRESSION
-_CANONICAL_STAMP: Final = r"'^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:]{8}[.][0-9]{6}Z$'"
 # Seconds an independent audit write waits for the append lock before falling back.
 DENIAL_LOCK_TIMEOUT: Final = "2s"
 # Seconds an independent audit write waits for a pooled connection before falling back.
@@ -1279,6 +1278,29 @@ async def _load_due(
     return readable, len(rows), unreadable
 
 
+def purgeable_select(table: TableName, dialect: Dialect) -> str:
+    """The scan `purge_payloads` reads its candidates with, with `?` for its parameters:
+    on Postgres the retention in seconds and the limit, on SQLite the cutoff and the limit.
+
+    The WHERE clause implies the purge index's predicate, so the index serves the scan.
+    """
+    statuses = ", ".join(f"'{status}'" for status in _FINISHED_STATUSES)
+    if dialect is Dialect.POSTGRES:
+        cutoff = (
+            "to_char((statement_timestamp() - make_interval(secs => ?)) AT TIME ZONE 'UTC', "
+            '\'YYYY-MM-DD"T"HH24:MI:SS.US"Z"\')'
+        )
+        shaped = f" AND ({_FINISHED_AT}) ~ {layout.CANONICAL_STAMP_PATTERN}"
+    else:
+        cutoff = "?"
+        shaped = ""
+    return (
+        f"SELECT {_COLUMNS} FROM {table.sql} WHERE status IN ({statuses}) "
+        "AND payload_json IS NOT NULL AND payload_purged_at IS NULL"
+        f"{shaped} AND ({_FINISHED_AT}) <= {cutoff} ORDER BY ({_FINISHED_AT}), id LIMIT ?"
+    )
+
+
 async def _load_purgeable(
     session: Session, table: TableName, now: datetime, older_than: timedelta, limit: int
 ) -> tuple[list[ApprovalRequest], int, list[str]]:
@@ -1288,24 +1310,12 @@ async def _load_purgeable(
     Returns the requests this library can read, how many rows it read, and the ids of the
     rows it cannot read, which a purge leaves as they are.
     """
-    statuses = ", ".join(f"'{status}'" for status in _FINISHED_STATUSES)
-    if session.dialect is Dialect.POSTGRES:
-        cutoff = (
-            "to_char((statement_timestamp() - make_interval(secs => ?)) AT TIME ZONE 'UTC', "
-            '\'YYYY-MM-DD"T"HH24:MI:SS.US"Z"\')'
-        )
-        parameters: tuple[Any, ...] = (older_than.total_seconds(), limit)
-        shaped = f" AND ({_FINISHED_AT}) ~ {_CANONICAL_STAMP}"
-    else:
-        cutoff = "?"
-        parameters = (canonical_timestamp(now - older_than), limit)
-        shaped = ""
-    rows = await session.execute(
-        f"SELECT {_COLUMNS} FROM {table.sql} WHERE status IN ({statuses}) "
-        "AND payload_json IS NOT NULL AND payload_purged_at IS NULL"
-        f"{shaped} AND ({_FINISHED_AT}) <= {cutoff} ORDER BY ({_FINISHED_AT}), id LIMIT ?",
-        parameters,
+    parameters: tuple[Any, ...] = (
+        (older_than.total_seconds(), limit)
+        if session.dialect is Dialect.POSTGRES
+        else (canonical_timestamp(now - older_than), limit)
     )
+    rows = await session.execute(purgeable_select(table, session.dialect), parameters)
     readable: list[ApprovalRequest] = []
     unreadable: list[str] = []
     for row in rows:
@@ -1481,6 +1491,7 @@ async def _ensure_table(session: Session) -> None:
             _PENDING_INDEX_DDL.replace("CREATE INDEX", "CREATE INDEX IF NOT EXISTS", 1)
         )
         await _ensure_open_index(session)
+        await session.execute(f"DROP INDEX IF EXISTS {layout.LEGACY_PURGEABLE_INDEX}")
         await session.execute(
             f"CREATE INDEX IF NOT EXISTS {layout.PURGEABLE_INDEX} ON {APPROVALS_TABLE} "
             f"(({layout.FINISHED_AT_EXPRESSION}), id) WHERE {layout.PURGEABLE_PREDICATE}"

@@ -66,14 +66,24 @@ OPEN_REQUEST_INDEX: Final = "agent_core_approvals_one_open"
 OPEN_REQUEST_COLUMNS: Final = ("requested_by", "action", "payload_sha256")
 OPEN_REQUEST_STATUSES: Final = ("pending", "approved")
 # What purge_payloads scans for: finished requests that still hold a payload, by finish time.
-PURGEABLE_INDEX: Final = "agent_core_approvals_purgeable"
+# On Postgres the library's scan also requires the finish time to be a canonical timestamp
+# (a planted row with another spelling is left alone), and the index carries that condition:
+# a partial index serves a query only if the query's WHERE implies the index predicate, and
+# with the condition in the query alone the planner read every due row and sorted them.
+# The index was renamed in 0.1.0a6 because 0.1.0a5's has the narrower predicate.
+PURGEABLE_INDEX: Final = "agent_core_approvals_purge_due"
+LEGACY_PURGEABLE_INDEX: Final = "agent_core_approvals_purgeable"
 FINISHED_AT_EXPRESSION: Final = (
     "CASE status WHEN 'consumed' THEN consumed_at WHEN 'rejected' THEN resolved_at "
     "ELSE closed_at END"
 )
+CANONICAL_STAMP_PATTERN: Final = r"'^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:]{8}[.][0-9]{6}Z$'"
 PURGEABLE_PREDICATE: Final = (
     "status IN ('consumed', 'rejected', 'cancelled', 'expired') "
     "AND payload_json IS NOT NULL AND payload_purged_at IS NULL"
+)
+PURGEABLE_PREDICATE_POSTGRES: Final = (
+    f"{PURGEABLE_PREDICATE} AND ({FINISHED_AT_EXPRESSION}) ~ {CANONICAL_STAMP_PATTERN}"
 )
 ROLES_TABLE: Final = "agent_core_approval_roles"
 
@@ -289,8 +299,9 @@ def approvals_tables_ddl(schema: str) -> tuple[str, ...]:
         f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS delegates TEXT NOT NULL DEFAULT '[]'",
         f"""CREATE INDEX IF NOT EXISTS agent_core_approvals_pending
         ON {table} (status, created_at, id)""",
+        f"DROP INDEX IF EXISTS {quoted_schema}.{LEGACY_PURGEABLE_INDEX}",
         f"""CREATE INDEX IF NOT EXISTS {PURGEABLE_INDEX}
-        ON {table} (({FINISHED_AT_EXPRESSION}), id) WHERE {PURGEABLE_PREDICATE}""",
+        ON {table} (({FINISHED_AT_EXPRESSION}), id) WHERE {PURGEABLE_PREDICATE_POSTGRES}""",
         f"""CREATE TABLE IF NOT EXISTS {roles} (
             singleton BOOLEAN PRIMARY KEY DEFAULT TRUE CHECK (singleton),
             requester_role TEXT NOT NULL,
