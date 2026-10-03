@@ -1,8 +1,8 @@
 # Compatibility with project 03
 
-Project 03 (the ops kit) drafted the interfaces it wants from agent-core. This page maps each of those names to what release 0.1.0a6 ships, and says which parts the ops kit keeps in its own adapter.
+Project 03 (the ops kit) drafted the interfaces it wants from agent-core. This page maps each of those names to what release 0.1.0a7 ships, and says which parts the ops kit keeps in its own adapter.
 
-Every signature below was checked against the source of 0.1.0a4 and against the 0.1.0a5 and 0.1.0a6 change sets. 0.1.0a5 was tagged but never released, so there is no wheel for it: the behaviour described as new in 0.1.0a5 below ships in 0.1.0a6. Where a name differs, the ops kit's factory holds a thin shim. Section "What project 03 must change for 0.1.0a4 to 0.1.0a6" lists what its own backends need to match this release. [upgrading.md](upgrading.md) has the step-by-step upgrades from 0.1.0a4 to 0.1.0a6 and from 0.1.0a3 to 0.1.0a4.
+Every signature below was checked against the source of 0.1.0a4 and against the 0.1.0a5, 0.1.0a6 and 0.1.0a7 change sets. 0.1.0a5 was tagged but never released, so there is no wheel for it: the behaviour described as new in 0.1.0a5 below ships in 0.1.0a6. 0.1.0a7 follows 0.1.0a6. Where a name differs, the ops kit's factory holds a thin shim. Sections "What project 03 must change for 0.1.0a6 to 0.1.0a7" and "What project 03 must change for 0.1.0a4 to 0.1.0a6" list what its own backends need to match this release. [upgrading.md](upgrading.md) has the step-by-step upgrades from 0.1.0a6 to 0.1.0a7, from 0.1.0a4 to 0.1.0a6 and from 0.1.0a3 to 0.1.0a4.
 
 ## Name mapping
 
@@ -303,7 +303,7 @@ class ApprovalQueue(Protocol):
 - `decision` takes `Decision.APPROVE` or `Decision.REJECT`.
 - `actor` becomes a `Principal`. `note` becomes `reason`.
 - `edited_subject` has no equivalent. See item 8 below.
-- `RoleApproverPolicy(roles_by_action={...})` on the approver side decides which role each action needs. A request for an unlisted action, or whose stored `required_role` differs from the listed role, is refused (`unknown_action`, `role_mismatch`) and audited. The approver must also be a human who holds that role and is neither the requester nor one of the request's delegates. A delegate is refused with `DenialReason.DELEGATE_APPROVAL` (`"delegate_approval"`, mapped to `NotAuthorizedToResolveError`, audited as `approval.resolve_denied` with that reason), after the self-approval check; the Postgres guard refuses a `resolved_by` in the request's delegates too.
+- `RoleApproverPolicy(roles_by_action={...})` on the approver side decides which role each action needs. A request for an unlisted action, or whose stored `required_role` differs from the listed role, is refused (`unknown_action`, `role_mismatch`) and audited. The approver must also be a human who holds that role and is neither the requester nor one of the request's delegates. A delegate is refused with `DenialReason.DELEGATE_APPROVAL` (`"delegate_approval"`, mapped to `NotAuthorizedToResolveError`, audited as `approval.resolve_denied` with that reason), after the self-approval check; the Postgres guard refuses a `resolved_by` in the request's delegates too. 0.1.0a7 adds `DenialReason.LOGIN_BINDING` (`"login_binding"`), also mapped to `NotAuthorizedToResolveError` and audited as `approval.resolve_denied`: with the opt-in login binding on, `principal.id` must be the principal mapped to the deciding database login (see [upgrading.md](upgrading.md)). With binding off, which is the default, it never occurs.
 - The default `RoleApproverPolicy()`, with no map, refuses every request. `RoleApproverPolicy(trust_requester_role=True)` takes the requester's `required_role` as given; it is for local development only, never where the requester may be compromised.
 - `reason` may not contain control, format or line and paragraph separator characters: `ValueError`, and the guard refuses the listed subset on a decision. The approver's `resolved_at` must be at or after the request's `created_at` and within 5 minutes of the database clock, so an application clock more than 5 minutes off the database's is refused at `resolve`.
 - Errors: `ApprovalAlreadyResolvedError` (close to 03's not-pending), `ApprovalExpiredError`, `NotAuthorizedToResolveError`, `ApprovalNotFoundError`.
@@ -349,6 +349,27 @@ class ApprovalQueue(Protocol):
 
 - `principal` must be the requester or one of the request's delegates. Otherwise it raises `NotTheRequesterError`, audited as `approval.consume_denied` with reason `not_requester`.
 - It also raises `ApprovalPayloadMismatchError`, `ApprovalNotGrantedError`, `ApprovalAlreadyResolvedError` or `ApprovalExpiredError`.
+
+`wait_for_decision` is new in 0.1.0a7. It is a free function, not a protocol method, so a host-supplied queue needs nothing added.
+
+```python
+from aox_agent_core.approvals import wait_for_decision
+
+
+async def wait_for_decision(
+    queue: ApprovalQueue,
+    request_id: UUID,
+    *,
+    timeout: timedelta,
+    poll_interval: timedelta = timedelta(seconds=1),
+    max_poll_interval: timedelta = timedelta(seconds=30),
+) -> ApprovalRequest: ...
+```
+
+- It only calls `queue.get`: once at once, then at a pause that starts at `poll_interval`, roughly doubles with jitter (x0.75 to x1.25), and is capped at `max_poll_interval` and at the time left.
+- It returns as soon as the status is not `PENDING`. The caller decides what approved, rejected, cancelled, expired and consumed mean, and an approved request still has to be consumed.
+- It raises `ApprovalWaitTimeoutError` (an `ApprovalError`, with `.request_id` and `.last`) on timeout, `ValueError` for a non-positive `timeout` or `poll_interval` or a `max_poll_interval` below `poll_interval`, and whatever `get` raises.
+- It takes no `connection=` and holds nothing between reads. `SyncApprovalQueue.wait_for_decision(request_id, *, timeout, poll_interval, max_poll_interval)` blocks the caller.
 
 On Postgres, a queue also has a side: `await queue.side()` returns `ApprovalSide.REQUESTER` or `ApprovalSide.APPROVER` (`BOTH` on SQLite). A call from the wrong side raises `ConfigError`. See [upgrade-0.1.0a3.md](upgrade-0.1.0a3.md).
 
@@ -414,6 +435,7 @@ class AuditEvent:
 
 class AuditRecord:  # set by the store, outside the hash
     db_role: str | None = None
+    db_login: str | None = None
     recorded_at: AwareDatetime | None = None
 ```
 
@@ -436,17 +458,18 @@ record = await audit.append(
 - Payload numbers must be integers. Write decimals as strings, for example `"0.0123"`.
 - At most 8192 bytes of payload.
 - Keys that end in a secret word (token, secret, password, and so on) are refused. Strings are scanned for secrets.
-- Records carry audit schema version 3. Version 2 records in an upgraded chain keep version 2 and still verify.
+- Records carry audit schema version 4 (0.1.0a7; `AUDIT_SCHEMA_VERSION == 4`). Records at versions 2 and 3 in an upgraded chain keep their version and still verify.
 - `AuditRecord.db_role` is new: the database role that inserted the row. On Postgres the database's insert trigger sets it, whatever was sent, and it is fixed afterwards. It is outside the hash. It is `None` on SQLite. Both roles may append audit rows and `actor_id` is supplied by the library, so `db_role` shows who really wrote a record.
 - `AuditRecord.recorded_at` is new: when the database wrote the row. On Postgres the insert trigger sets it, whatever was sent. It is outside the hash, so the trigger, not the chain, guarantees it: an owner could edit it undetected. On SQLite the library writes it from the writer's clock, so it is not independent there. It is `None` on records written before 0.1.0a4.
-- The hash is unchanged: `occurred_at` is in it, `recorded_at` is not, the schema version stays 3, and old records verify as before.
+- `AuditRecord.db_login` is new in 0.1.0a7: `str | None`, the login that wrote the row. On Postgres the insert trigger sets it to `session_user`, whatever was sent, and it is outside the hash, like `db_role`. `SET ROLE` changes `db_role` but never `db_login`, so a row written after a role switch names the real login. It is `None` on SQLite and on records written before 0.1.0a7. A host log that builds `AuditRecord` needs no change: the field is optional.
+- The hash is unchanged: `occurred_at` is in it, `recorded_at` and `db_login` are not, and old records verify as before.
 - `SQLAuditLog(database, *, scrubber=None, schema=None, lock_timeout=timedelta(seconds=5))` and `SQLApprovalQueue(..., schema=None)` take a Postgres schema.
 - `lock_timeout` (0.1.0a5 change set): the library's own append transactions wait for the append lock at most that long, then raise `AuditLockTimeoutError` (an `AuditError`, sqlstate `55P03`) and write nothing. In a host's transaction (`connection=`) the bound is applied for the append and the host's own `lock_timeout` is put back. The lock key is per schema (`hashtextextended('agent_core_audit:' || schema, 0)`), computed in SQL by the library and the insert trigger. `SQLAuditLog.lock_in(session)` takes the lock now, for a caller that will append later in the same transaction.
 - Lock order: a host that appends first and then touches a request's row through `connection=` can deadlock (`40P01`) against a queue transaction that took the row first. The queue's own write transactions now take the append lock before the row. A host should append, or let the library do both, before it updates approval rows in its own transaction, and should retry its transaction on `40P01` (`psycopg.errors.DeadlockDetected`), since the order cannot be fixed from inside the library when `connection=` is used.
 - Payload text (audit payloads and stored approval payloads) may not contain NUL in any key or string (`ValueError`; `AuditEvent` construction fails with `ValidationError`).
-- The insert trigger carries `-- agent-core audit trigger revision 5` and the approvals guard `-- agent-core guard revision 6`. A connection refuses an older guard or trigger with a `ConfigError` that says to run `install_postgres_schema` from 0.1.0a6. The guard stamps `closed_at`, `consumed_at`, a rejection's `resolved_at` and `payload_purged_at` from the database clock, whatever the statement carried.
+- The insert trigger carries `-- agent-core audit trigger revision 6` and the approvals guard `-- agent-core guard revision 7`. A connection refuses an older guard or trigger with a `ConfigError` that says to run `install_postgres_schema` from 0.1.0a7. The guard stamps `closed_at`, `consumed_at`, a rejection's `resolved_at` and `payload_purged_at` from the database clock, whatever the statement carried.
 - `aox-agent-core audit verify URL --schema NAME` checks a Postgres schema.
-- The protocol also has `iter_records`, `head` and `verify`. The log is hash-chained.
+- The protocol also has `iter_records`, `head` and `verify`. The log is hash-chained. `SQLAuditLog.verify_report` (0.1.0a7) lists every problem in a chain instead of raising at the first; it is a method of `SQLAuditLog`, not of the protocol, so a host log needs nothing.
 
 ### Core
 
@@ -500,7 +523,17 @@ def replay_key(
 | 9. Image preprocessing | Yes | Nothing, by design. agent-core sends the bytes it is given. |
 | 10. "Honest nulls" | Yes | Nothing. |
 | 11. Atomic record mode, lister of missing or stale fixtures | Partly | Each recording is written atomically: a temp file, then a rename, one file per exchange. `aox-agent-core cassettes check DIR` reports unreadable files (including format 1), misplaced files, key mismatches (tampering) and secret-bearing files. `StaleRecordingError` fires at replay. In 03: all-or-nothing recording of a whole run, and listing missing or stale fixtures before a run. Build the lister from `replay_key`, `PromptKey.for_call`, `DirectoryRecordingStore.prompt_path` and `PromptKey.stale_parts`. |
-| 12. Tag timing | Yes | Pin `v0.1.0a6`. Alpha 5 was tagged but never released. Alpha 4 lacks idempotent submit, `ApprovalConflictError`, `purge_payloads`, `approved -> expired`, the delegate rule and `lock_timeout`. Alpha 3 lacks `append_many`, async storage, `connection=`, `include_payload` and `recorded_at`. Alpha 2 also lacks the role-separated approvals, `cancel` and `expire_due`. Install with `aox-agent-core @ git+https://github.com/AOX-LLC/agent-core@v0.1.0a6`. Name shims stay in 03's factory. |
+| 12. Tag timing | Yes | Pin `v0.1.0a7`. Alpha 5 was tagged but never released. Alpha 6 lacks the audit `db_login`, the opt-in login binding of `resolved_by`, `wait_for_decision` and `verify_report`. Alpha 4 lacks idempotent submit, `ApprovalConflictError`, `purge_payloads`, `approved -> expired`, the delegate rule and `lock_timeout`. Alpha 3 lacks `append_many`, async storage, `connection=`, `include_payload` and `recorded_at`. Alpha 2 also lacks the role-separated approvals, `cancel` and `expire_due`. Install with `aox-agent-core @ git+https://github.com/AOX-LLC/agent-core@v0.1.0a7`. Name shims stay in 03's factory. |
+
+## What project 03 must change for 0.1.0a6 to 0.1.0a7
+
+Almost nothing. The `ApprovalQueue` and `AuditLog` protocols are unchanged.
+
+- Pin `v0.1.0a7`.
+- If it builds `AuditRecord` itself, `db_login` is a new optional field (`str | None`, default `None`). Set it only if the store can tell you the login. `AUDIT_SCHEMA_VERSION` is 4; records at 2 and 3 still verify.
+- If it maps `DenialReason` values to its own errors, map `LOGIN_BINDING` to `NotAuthorizedToResolveError`. Only agent-core's own queue produces it, and only with login binding on.
+- If it uses agent-core's installer, re-run it as the owner from 0.1.0a7: an a7 queue refuses an a6 schema (guard revision 7, trigger revision 6). Login binding is off unless the operator turns it on; see [upgrading.md](upgrading.md).
+- A host with its own queue needs no new method: `wait_for_decision` is a free function over `get`, and `verify_report` belongs to `SQLAuditLog` only.
 
 ## What project 03 must change for 0.1.0a4 to 0.1.0a6
 
