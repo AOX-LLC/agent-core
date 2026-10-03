@@ -1,7 +1,7 @@
 """purge_payloads: finished requests lose their stored payload, never their hash."""
 
 import asyncio
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from typing import Any
 from uuid import UUID
 
@@ -250,3 +250,44 @@ async def test_a_library_transaction_does_not_wait_unbounded_for_a_row_either(
         with pytest.raises(psycopg.errors.LockNotAvailable):
             await approver.resolve(request.id, decision=Decision.APPROVE, principal=APPROVER)
         assert time.monotonic() - started < 3
+
+
+class SlowRunClock:
+    """The queue's clock as a purge run sees it when the run began six minutes ago.
+
+    Each reading is a second after the last. A run over a large backlog reads the clock
+    at its start and writes minutes later; the database's own clock has moved on.
+    """
+
+    def __init__(self) -> None:
+        self.reading = datetime.now(UTC) - timedelta(minutes=6)
+
+    def __call__(self) -> datetime:
+        self.reading += timedelta(seconds=1)
+        return self.reading
+
+
+async def test_a_purge_whose_run_outlasts_the_five_minute_bound_still_completes(
+    control_database: ControlDatabase,
+) -> None:
+    clock = SlowRunClock()
+    queue = split_queue(control_database, clock=clock)
+    requests = [await make(queue, number, ttl_seconds=3_600) for number in range(3)]
+    for request in requests:
+        await queue.cancel(request.id, principal=REQUESTER)
+        age(control_database, request.id, timedelta(days=3))
+
+    purged = await queue.approver.purge_payloads(
+        principal=SWEEPER, older_than=timedelta(days=2), limit=1
+    )
+
+    assert purged == 3
+    stamps = control_database.raw(f"SELECT payload_purged_at FROM {APPROVALS}")
+    purged_at = [datetime.fromisoformat(value) for (value,) in stamps]
+    assert len(purged_at) == 3
+    if control_database.backend == "postgres":
+        # The guard wrote them, by the database's clock, not the run's.
+        assert all(abs(datetime.now(UTC) - moment) < timedelta(minutes=1) for moment in purged_at)
+    else:
+        # No guard on SQLite: each batch stamps its own reading of the application clock.
+        assert len(set(purged_at)) == 3

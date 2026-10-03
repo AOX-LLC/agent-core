@@ -608,9 +608,10 @@ class SQLApprovalQueue:
                 },
                 context={STORED_RECORD: True},
             )
-            changed = await session.execute_count(
+            # RETURNING: on Postgres the guard writes a rejection's resolved_at itself.
+            decided_rows = await session.execute(
                 f"UPDATE {self._table.sql} SET status = ?, decision = ?, resolved_by = ?, "
-                "resolved_at = ?, reason = ? WHERE id = ? AND status = ?",
+                "resolved_at = ?, reason = ? WHERE id = ? AND status = ? RETURNING resolved_at",
                 (
                     status.value,
                     decision.value,
@@ -621,7 +622,7 @@ class SQLApprovalQueue:
                     ApprovalStatus.PENDING.value,
                 ),
             )
-            if changed != 1:
+            if len(decided_rows) != 1:
                 return _denied(
                     ApprovalAlreadyResolvedError(f"Request {request_id} was resolved meanwhile."),
                     _event(
@@ -633,6 +634,9 @@ class SQLApprovalQueue:
                         reason=DenialReason.NOT_PENDING.value,
                     ),
                 )
+            resolved = resolved.model_copy(
+                update={"resolved_at": datetime.fromisoformat(decided_rows[0][0])}
+            )
             event = _event(
                 "approval.resolved", principal.id, resolved, event_context, decision=decision.value
             )
@@ -904,9 +908,11 @@ class SQLApprovalQueue:
             raise ValueError("older_than must be positive")
         if limit < 1:
             raise ValueError(f"limit must be at least 1, got {limit}")
-        moment = self._now()
 
         async def sweep(session: Session) -> _Outcome:
+            # Read per batch: a run over a large backlog outlasts any one reading of the
+            # clock (the SQLite cutoff and stamp), and Postgres stamps the time itself.
+            moment = self._now()
             await self._require_side(session, "purge payloads", ApprovalSide.APPROVER)
             if not await _table_exists(session, self._table):
                 return _Outcome()

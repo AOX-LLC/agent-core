@@ -12,6 +12,12 @@ Pre-releases are spelled the PEP 440 way, so tags look like `v0.1.0a1`.
 
 Fix release for 0.1.0a5. **0.1.0a5 was tagged but never released** (see below): upgrade from 0.1.0a4 straight to 0.1.0a6. Details are added below as each fix lands.
 
+### Changed (breaking)
+
+- The guard writes `payload_purged_at` itself, from the database's clock, whatever the purge statement carried (it still requires a canonical timestamp there), as it does for `closed_at` and `consumed_at`. In 0.1.0a5 the guard required the supplied value to be within 5 minutes of its clock, and `purge_payloads` took one reading of the application clock at the start of the run, so a run that went on for more than 5 minutes (a large backlog, `limit` batches) was refused partway. `purge_payloads` now reads the application clock per batch (which only SQLite stores).
+- A rejection's `resolved_at` is its finish time, which the retention floor counts from, so the guard writes it too: the database's clock, never before the request's `created_at`. Before, the approver role chose it, within 5 minutes of the database clock, which was enough to slip under a short installed floor. An approval's `resolved_at` is not a finish time and is unchanged. `resolve` returns the stored value.
+- The approvals guard is revision 6 (`-- agent-core guard revision 6`). A connection refuses revision 5, so run `install_postgres_schema` from 0.1.0a6 as the owner role before the first 0.1.0a6 process connects (see docs/upgrading.md).
+
 ## [0.1.0a5] - 2026-10-03
 
 **Tagged but not released; use 0.1.0a6.** The `v0.1.0a5` tag exists, but the release workflow refused it because this section was filed under Unreleased, so there is no GitHub release and no published wheel. The tag stays where it is. Everything in this section ships in 0.1.0a6.
