@@ -6,7 +6,7 @@ from pathlib import Path
 import pytest
 from pydantic import BaseModel, ValidationError
 
-from aox_agent_core import AgentClient, Mode, Tier
+from aox_agent_core import AgentClient, Mode, PromptRef, Tier
 from aox_agent_core.errors import EvalError
 from aox_agent_core.evals import (
     EvalCase,
@@ -129,6 +129,38 @@ async def test_model_call_target_returns_json_output_and_cost() -> None:
 
     assert produced.output == {"queue": "billing", "urgent": True}
     assert produced.cost_usd == Decimal("0.002")
+
+
+async def test_a_prompted_target_sends_each_case_as_the_prompts_inputs() -> None:
+    provider = ScriptedProvider(response('{"queue": "billing", "urgent": true}'))
+    client = AgentClient(make_config(), provider=provider)
+    prompt = PromptRef(id="tickets.triage", version=1, template="Triage: ${ticket}")
+    target = model_call_target(client, prompt=prompt, output=Triage, tier=Tier.SMALL)
+
+    produced = await target(EvalCase(id="a", input={"ticket": "charged twice"}))
+
+    assert produced.output == {"queue": "billing", "urgent": True}
+    assert provider.requests[0].messages[0].content == "Triage: charged twice"
+    (prompt_key,) = provider.prompt_keys
+    assert prompt_key is not None
+    assert prompt_key.inputs == {"ticket": "charged twice"}
+
+
+async def test_a_prompted_target_refuses_a_string_input() -> None:
+    client = AgentClient(make_config(), provider=ScriptedProvider())
+    prompt = PromptRef(id="tickets.triage", version=1, template="Triage: ${ticket}")
+    target = model_call_target(client, prompt=prompt, tier=Tier.SMALL)
+
+    with pytest.raises(TypeError, match="object of prompt inputs"):
+        await target(EvalCase(id="a", input="charged twice"))
+
+
+def test_a_prompted_target_refuses_a_system_prompt() -> None:
+    client = AgentClient(make_config(), provider=ScriptedProvider())
+    prompt = PromptRef(id="tickets.triage", version=1, template="Triage: ${ticket}")
+
+    with pytest.raises(ValueError, match="own system prompt"):
+        model_call_target(client, prompt=prompt, system="be brief")
 
 
 async def test_scorecard_writers(tmp_path: Path) -> None:

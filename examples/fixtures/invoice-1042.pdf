@@ -1,0 +1,61 @@
+%PDF-1.4
+1 0 obj
+<< /Type /Catalog /Pages 2 0 R >>
+endobj
+2 0 obj
+<< /Type /Pages /Kids [3 0 R] /Count 1 >>
+endobj
+3 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R /Resources << /Font << /F1 5 0 R /F2 6 0 R >> >> >>
+endobj
+4 0 obj
+<< /Length 1225 >>
+stream
+BT /F2 20 Tf 72 740 Td (INVOICE) Tj ET
+BT /F1 11 Tf 72 712 Td (Northwind Paper Supply (fictional)) Tj ET
+BT /F1 11 Tf 72 696 Td (12 Example Road, Sampletown) Tj ET
+BT /F1 11 Tf 380 712 Td (Invoice number: INV-1042) Tj ET
+BT /F1 11 Tf 380 696 Td (Issue date: 2026-09-01) Tj ET
+BT /F1 11 Tf 380 680 Td (Due date: 2026-10-01) Tj ET
+BT /F1 11 Tf 72 650 Td (Bill to: Contoso Analytics (fictional)) Tj ET
+BT /F2 11 Tf 72 610 Td (Description) Tj ET
+BT /F2 11 Tf 330 610 Td (Qty) Tj ET
+BT /F2 11 Tf 400 610 Td (Unit) Tj ET
+BT /F2 11 Tf 480 610 Td (Amount) Tj ET
+BT /F1 11 Tf 72 590 Td (Copy paper, A4, 500 sheets) Tj ET
+BT /F1 11 Tf 330 590 Td (20) Tj ET
+BT /F1 11 Tf 400 590 Td (6.50) Tj ET
+BT /F1 11 Tf 480 590 Td (130.00) Tj ET
+BT /F1 11 Tf 72 572 Td (Toner cartridge, black) Tj ET
+BT /F1 11 Tf 330 572 Td (2) Tj ET
+BT /F1 11 Tf 400 572 Td (48.00) Tj ET
+BT /F1 11 Tf 480 572 Td (96.00) Tj ET
+BT /F1 11 Tf 400 540 Td (Subtotal) Tj ET
+BT /F1 11 Tf 480 540 Td (226.00) Tj ET
+BT /F1 11 Tf 400 524 Td (Tax 8%) Tj ET
+BT /F1 11 Tf 480 524 Td (18.08) Tj ET
+BT /F2 11 Tf 400 506 Td (Total USD) Tj ET
+BT /F2 11 Tf 480 506 Td (244.08) Tj ET
+BT /F1 9 Tf 72 460 Td (Synthetic document for the aox-agent-core example. Not a real invoice.) Tj ET
+endstream
+endobj
+5 0 obj
+<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>
+endobj
+6 0 obj
+<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica-Bold >>
+endobj
+xref
+0 7
+0000000000 65535 f 
+0000000009 00000 n 
+0000000058 00000 n 
+0000000115 00000 n 
+0000000251 00000 n 
+0000001528 00000 n 
+0000001598 00000 n 
+trailer
+<< /Size 7 /Root 1 0 R >>
+startxref
+1673
+%%EOF

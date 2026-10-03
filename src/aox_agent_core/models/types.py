@@ -7,12 +7,13 @@ those can reach a recording.
 
 from decimal import Decimal
 from enum import StrEnum
-from typing import Annotated, Generic, TypeVar
+from typing import Annotated, Generic, Self, TypeVar
 
-from pydantic import Field, JsonValue
+from pydantic import Field, JsonValue, model_validator
 
 from aox_agent_core._model import FrozenModel
 from aox_agent_core.config import Effort, Mode, Provider, Tier
+from aox_agent_core.models.attachments import Attachment
 
 OutputT = TypeVar("OutputT")
 
@@ -27,10 +28,17 @@ class Role(StrEnum):
 
 
 class Message(FrozenModel):
-    """One conversation turn."""
+    """One conversation turn. Attachments are sent before the text of a user turn."""
 
     role: Role
     content: Annotated[str, Field(min_length=1)]
+    attachments: tuple[Attachment, ...] = ()
+
+    @model_validator(mode="after")
+    def _only_user_turns_carry_attachments(self) -> Self:
+        if self.attachments and self.role is not Role.USER:
+            raise ValueError("only user messages can carry attachments")
+        return self
 
 
 class Usage(FrozenModel):
@@ -69,6 +77,11 @@ class ProviderResponse(FrozenModel):
     text: str
     stop_reason: str
     usage: Usage
+    # Set only by replay: the provider and model the recorded request named, which
+    # had a price when it was recorded. Never written to a recording. They take
+    # part in equality, so a replayed response is not == the one in its file.
+    recorded_provider: Provider | None = Field(default=None, exclude=True, repr=False)
+    recorded_model: str | None = Field(default=None, exclude=True, repr=False)
 
 
 class CallResult(FrozenModel, Generic[OutputT]):
@@ -86,3 +99,6 @@ class CallResult(FrozenModel, Generic[OutputT]):
     stop_reason: str
     trace_id: str | None = None
     attempts: Annotated[int, Field(ge=1)] = 1
+    # The prompt key of the last attempt for a PromptRef call, else its request hash.
+    replay_key: str = ""
+    prompt_id: str | None = None

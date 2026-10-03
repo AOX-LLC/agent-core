@@ -21,9 +21,10 @@ from functools import partial
 from typing import Any, Final
 from uuid import UUID, uuid4
 
-from pydantic import ValidationError
+from pydantic import JsonValue, ValidationError
 
 from aox_agent_core._canonical import canonical_json
+from aox_agent_core._validation import STORED_RECORD
 from aox_agent_core.audit.chain import canonical_timestamp, compute_record_hash
 from aox_agent_core.audit.types import (
     GENESIS_HASH,
@@ -34,9 +35,10 @@ from aox_agent_core.audit.types import (
 )
 from aox_agent_core.errors import AuditIntegrityError, AuditPayloadRejectedError, ConfigError
 from aox_agent_core.replay.scrub import PatternScrubber, Scrubber
-from aox_agent_core.storage import Database, Dialect, Session
+from aox_agent_core.storage import Database, Dialect, Session, require_current_table
 
 AUDIT_TABLE: Final = "agent_core_audit"
+RUN_CONTEXT_COLUMN: Final = "run_context"
 UPDATE_TRIGGER: Final = "agent_core_audit_no_update"
 DELETE_TRIGGER: Final = "agent_core_audit_no_delete"
 UPDATE_DELETE_TRIGGER: Final = "agent_core_audit_no_update_delete"
@@ -52,7 +54,7 @@ READ_BATCH_SIZE = 500
 
 COLUMNS = (
     "seq, schema_version, event_id, occurred_at, action, actor_id, subject_id, payload, "
-    "prev_hash, record_hash"
+    "run_context, prev_hash, record_hash"
 )
 
 _TABLE_DDL = f"""
@@ -65,6 +67,7 @@ CREATE TABLE {AUDIT_TABLE} (
     actor_id TEXT NOT NULL,
     subject_id TEXT,
     payload TEXT NOT NULL,
+    run_context TEXT,
     prev_hash TEXT NOT NULL,
     record_hash TEXT NOT NULL
 )"""
@@ -150,10 +153,13 @@ class SQLAuditLog:
             raise AuditPayloadRejectedError(
                 "The event was changed after it was built and is no longer valid."
             ) from error
-        findings = self._scrubber.find_secrets(revalidated.payload)
+        scanned: dict[str, JsonValue] = {"payload": revalidated.payload}
+        if revalidated.context is not None:
+            scanned["context"] = revalidated.context.as_json()
+        findings = self._scrubber.find_secrets(scanned)
         if findings:
             located = ", ".join(f"{finding.rule} at {finding.path}" for finding in findings)
-            raise AuditPayloadRejectedError(f"The audit payload contains {located}.")
+            raise AuditPayloadRejectedError(f"The audit event contains {located}.")
         return revalidated
 
     def append_in(self, session: Session, event: AuditEvent) -> AuditRecord:
@@ -174,11 +180,12 @@ class SQLAuditLog:
             actor_id=event.actor_id,
             subject_id=event.subject_id,
             payload=event.payload,
+            run_context=event.context,
             prev_hash=head.record_hash,
         )
         record = AuditRecord(**unsealed.model_dump(), record_hash=compute_record_hash(unsealed))
         session.execute(
-            f"INSERT INTO {AUDIT_TABLE} ({COLUMNS}) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            f"INSERT INTO {AUDIT_TABLE} ({COLUMNS}) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             _row_values(record),
         )
         return record
@@ -243,6 +250,7 @@ class SQLAuditLog:
         else:
             _check_postgres_role(session)
             _require_triggers(session, _postgres_triggers(session), POSTGRES_TRIGGERS)
+        require_current_table(session, AUDIT_TABLE, RUN_CONTEXT_COLUMN)
         self._protections_checked = True
 
 
@@ -384,6 +392,7 @@ def _rows_after(session: Session, after_seq: int, limit: int | None) -> list[tup
     # limit is formatted in, not bound, and int() keeps that safe.
     if not _table_is_readable(session):
         return []
+    require_current_table(session, AUDIT_TABLE, RUN_CONTEXT_COLUMN)
     limit_clause = f" LIMIT {int(limit)}" if limit is not None else ""
     return session.execute(
         f"SELECT {COLUMNS} FROM {AUDIT_TABLE} WHERE seq > ? ORDER BY seq{limit_clause}",
@@ -401,6 +410,11 @@ def _row_values(record: AuditRecord) -> tuple[Any, ...]:
         record.actor_id,
         record.subject_id,
         canonical_json(record.payload).decode("utf-8"),
+        (
+            canonical_json(record.run_context.as_json()).decode("utf-8")
+            if record.run_context is not None
+            else None
+        ),
         record.prev_hash,
         record.record_hash,
     )
@@ -409,19 +423,23 @@ def _row_values(record: AuditRecord) -> tuple[Any, ...]:
 def record_from_row(row: tuple[Any, ...]) -> AuditRecord:
     """Rebuild a record from a COLUMNS-ordered row; AuditIntegrityError if it is malformed."""
     seq, schema_version, event_id, occurred_at, action, actor_id, subject_id = row[:7]
-    payload, prev_hash, record_hash = row[7:]
+    payload, run_context, prev_hash, record_hash = row[7:]
     try:
-        return AuditRecord(
-            seq=seq,
-            schema_version=schema_version,
-            event_id=UUID(event_id),
-            occurred_at=datetime.fromisoformat(occurred_at),
-            action=action,
-            actor_id=actor_id,
-            subject_id=subject_id,
-            payload=json.loads(payload),
-            prev_hash=prev_hash,
-            record_hash=record_hash,
+        return AuditRecord.model_validate(
+            {
+                "seq": seq,
+                "schema_version": schema_version,
+                "event_id": UUID(event_id),
+                "occurred_at": datetime.fromisoformat(occurred_at),
+                "action": action,
+                "actor_id": actor_id,
+                "subject_id": subject_id,
+                "payload": json.loads(payload),
+                "run_context": json.loads(run_context) if run_context is not None else None,
+                "prev_hash": prev_hash,
+                "record_hash": record_hash,
+            },
+            context={STORED_RECORD: True},
         )
     except (ValueError, TypeError, ValidationError) as error:
         raise AuditIntegrityError(f"Record {seq} is malformed and cannot be checked.") from error

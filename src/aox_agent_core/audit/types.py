@@ -9,8 +9,10 @@ from pydantic import AwareDatetime, Field, JsonValue, field_validator
 
 from aox_agent_core._canonical import canonical_json
 from aox_agent_core._model import ActionName, FrozenModel, PrincipalId, Sha256Hex, SubjectId
+from aox_agent_core.context import RunContext
 
-AUDIT_SCHEMA_VERSION: Final = 1
+# 2 added run_context to every record and to its hash (agent-core 0.1.0a2).
+AUDIT_SCHEMA_VERSION: Final = 2
 GENESIS_HASH: Final = "0" * 64
 MAX_PAYLOAD_BYTES = 8_192
 MAX_SAFE_INTEGER: Final = 2**53 - 1
@@ -45,12 +47,16 @@ class AuditEvent(FrozenModel):
 
     Forbidden keys, floats and oversized payloads fail validation here; the
     audit log re-validates on append and also scans payload strings for secrets.
+
+    `context` names the run the event belongs to; it is stored and hashed with
+    the record.
     """
 
     action: ActionName
     actor_id: PrincipalId
     subject_id: SubjectId | None = None
     payload: dict[str, JsonValue] = Field(default_factory=dict)
+    context: RunContext | None = None
 
     @field_validator("payload")
     @classmethod
@@ -88,7 +94,7 @@ class UnsealedAuditRecord(FrozenModel):
     Postgres jsonb, so verify() hashes exactly the bytes append() hashed.
     """
 
-    schema_version: Literal[1] = AUDIT_SCHEMA_VERSION
+    schema_version: Literal[2] = AUDIT_SCHEMA_VERSION
     seq: Annotated[int, Field(ge=1)]
     event_id: UUID
     occurred_at: AwareDatetime
@@ -96,6 +102,7 @@ class UnsealedAuditRecord(FrozenModel):
     actor_id: PrincipalId
     subject_id: SubjectId | None
     payload: dict[str, JsonValue]
+    run_context: RunContext | None
     prev_hash: Sha256Hex
 
 
@@ -118,13 +125,14 @@ def _forbidden_keys(value: JsonValue) -> set[str]:
     if not isinstance(value, dict):
         return set()
 
-    forbidden = {key for key in value if _is_forbidden_key(key)}
+    forbidden = {key for key in value if is_secret_shaped_key(key)}
     for nested in value.values():
         forbidden |= _forbidden_keys(nested)
     return forbidden
 
 
-def _is_forbidden_key(key: str) -> bool:
+def is_secret_shaped_key(key: str) -> bool:
+    """True when a key, lowercased and stripped to letters and digits, ends in a secret word."""
     normalized = re.sub(r"[^a-z0-9]", "", key.lower())
     return normalized.endswith(FORBIDDEN_KEY_SUFFIXES)
 

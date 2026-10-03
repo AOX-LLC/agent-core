@@ -1,0 +1,73 @@
+{
+  "format_version": 2,
+  "prompt": {
+    "attachments": [],
+    "attempt": 1,
+    "inputs": {
+      "ticket": "Subject: CSV export has wrong column order\n\nThe exported CSV lists the date column after the amount. It is a minor annoyance, nothing is broken."
+    },
+    "output_schema": "TicketTriage",
+    "prompt_id": "tickets.triage",
+    "schema_sha256": "517a6165b8bf8c17c7feb180ac2b3e8dc391d4cf0d06d8e9511ec8072653c751",
+    "system_sha256": "033aa057582250a044377f1425343ae80edc9c578697357903cb59138caeac31",
+    "template_sha256": "40eb4cd7a1c84d0987401d0d04ada5d937d80c40b0690f311ec835ee3619368b",
+    "tier": "small",
+    "version": 1
+  },
+  "replay_hash": "11ba30a561e28d8178ed853aafc7df7ab05e5900c9cde47698105aba9e9d1271",
+  "request": {
+    "effort": null,
+    "max_tokens": 16000,
+    "messages": [
+      {
+        "attachments": [],
+        "content": "Triage this support ticket.\n\nSubject: CSV export has wrong column order\n\nThe exported CSV lists the date column after the amount. It is a minor annoyance, nothing is broken.",
+        "role": "user"
+      }
+    ],
+    "model": "claude-haiku-4-5-20251001",
+    "output_schema": {
+      "additionalProperties": false,
+      "properties": {
+        "queue": {
+          "enum": [
+            "billing",
+            "technical",
+            "account"
+          ],
+          "title": "Queue",
+          "type": "string"
+        },
+        "summary": {
+          "title": "Summary",
+          "type": "string"
+        },
+        "urgent": {
+          "title": "Urgent",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "queue",
+        "urgent",
+        "summary"
+      ],
+      "title": "TicketTriage",
+      "type": "object"
+    },
+    "provider": "anthropic",
+    "system": "You triage support tickets for a fictional software company."
+  },
+  "response": {
+    "model": "claude-haiku-4-5-20251001",
+    "stop_reason": "end_turn",
+    "text": "{\"queue\": \"technical\", \"urgent\": false, \"summary\": \"CSV export column order is incorrect - date appears after amount column instead of in expected position\"}",
+    "usage": {
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 0,
+      "input_tokens": 305,
+      "output_tokens": 36
+    }
+  },
+  "sequence": 0
+}

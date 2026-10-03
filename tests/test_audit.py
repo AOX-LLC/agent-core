@@ -310,10 +310,12 @@ async def test_verify_walks_in_batches_off_the_event_loop(
     [
         f"INSERT OR REPLACE INTO {audit_sql.AUDIT_TABLE} ({audit_sql.COLUMNS}) "
         "SELECT seq, schema_version, event_id, occurred_at, 'model.forged', actor_id, "
-        f"subject_id, payload, prev_hash, record_hash FROM {audit_sql.AUDIT_TABLE} WHERE seq = 2",
+        "subject_id, payload, run_context, prev_hash, record_hash "
+        f"FROM {audit_sql.AUDIT_TABLE} WHERE seq = 2",
         f"INSERT INTO {audit_sql.AUDIT_TABLE} ({audit_sql.COLUMNS}) "
         "SELECT 10, schema_version, 'forged-event', occurred_at, action, actor_id, "
-        f"subject_id, payload, prev_hash, record_hash FROM {audit_sql.AUDIT_TABLE} WHERE seq = 3",
+        "subject_id, payload, run_context, prev_hash, record_hash "
+        f"FROM {audit_sql.AUDIT_TABLE} WHERE seq = 3",
     ],
     ids=["insert-or-replace", "insert-out-of-order"],
 )
@@ -377,7 +379,8 @@ async def test_insert_or_replace_on_an_existing_event_id_is_refused(tmp_path: Pa
         database.raw(
             f"INSERT OR REPLACE INTO {audit_sql.AUDIT_TABLE} ({audit_sql.COLUMNS}) "
             "SELECT 4, schema_version, event_id, occurred_at, action, actor_id, subject_id, "
-            f"payload, prev_hash, record_hash FROM {audit_sql.AUDIT_TABLE} WHERE seq = 2"
+            "payload, run_context, prev_hash, record_hash "
+            f"FROM {audit_sql.AUDIT_TABLE} WHERE seq = 2"
         )
 
     assert (await log.verify()).seq == 3
@@ -393,7 +396,8 @@ async def test_a_temporary_table_cannot_stand_in_for_the_audit_table(
     forge_after_gap = (
         f"INSERT INTO public.{audit_sql.AUDIT_TABLE} ({audit_sql.COLUMNS}) "
         "SELECT 1001, schema_version, 'forged-event', occurred_at, action, actor_id, "
-        f"subject_id, payload, prev_hash, record_hash FROM public.{audit_sql.AUDIT_TABLE} "
+        "subject_id, payload, run_context, prev_hash, record_hash "
+        f"FROM public.{audit_sql.AUDIT_TABLE} "
         "WHERE seq = 3"
     )
 

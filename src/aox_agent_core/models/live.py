@@ -1,5 +1,7 @@
 """Dispatching live calls to the provider each tier names."""
 
+from typing import TYPE_CHECKING
+
 from pydantic import SecretStr
 
 from aox_agent_core.config import AgentCoreConfig, Provider
@@ -7,6 +9,9 @@ from aox_agent_core.models.anthropic_provider import AnthropicProvider, refuse_s
 from aox_agent_core.models.bedrock_provider import BedrockProvider
 from aox_agent_core.models.provider import ModelProvider, close_provider
 from aox_agent_core.models.types import ProviderRequest, ProviderResponse
+
+if TYPE_CHECKING:
+    from aox_agent_core.replay.keys import PromptKey
 
 
 class LiveProviders:
@@ -22,7 +27,10 @@ class LiveProviders:
         self._api_key = api_key
         self._providers: dict[Provider, ModelProvider] = {}
 
-    async def complete(self, request: ProviderRequest) -> ProviderResponse:
+    async def complete(
+        self, request: ProviderRequest, *, prompt_key: "PromptKey | None" = None
+    ) -> ProviderResponse:
+        # Live providers send the request as it is; the prompt key is for recording.
         return await self._provider_for(request.provider).complete(request)
 
     async def aclose(self) -> None:

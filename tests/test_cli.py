@@ -9,12 +9,17 @@ from typing import Any
 
 import pytest
 
-from aox_agent_core import Message, Provider, Role
+from aox_agent_core import Message, PromptRef, Provider, Role, Tier
 from aox_agent_core.audit import AuditEvent, SQLAuditLog
 from aox_agent_core.cli import main
 from aox_agent_core.config import SecretAction
 from aox_agent_core.models import ProviderRequest
-from aox_agent_core.replay import DirectoryCassetteStore, PatternScrubber, RecordingProvider
+from aox_agent_core.replay import (
+    DirectoryRecordingStore,
+    PatternScrubber,
+    PromptKey,
+    RecordingProvider,
+)
 from aox_agent_core.storage import open_database
 from support import ScriptedProvider, response
 
@@ -25,6 +30,11 @@ EXAMPLE_CASSETTES = Path(__file__).parents[1] / "examples" / "replays"
 def cassettes(tmp_path: Path) -> Path:
     shutil.copytree(EXAMPLE_CASSETTES, tmp_path, dirs_exist_ok=True)
     return tmp_path
+
+
+def only_recording(directory: Path) -> Path:
+    (path,) = directory.rglob("*.json")
+    return path
 
 
 def edit(path: Path, change: Callable[[dict[str, Any]], None]) -> None:
@@ -38,14 +48,39 @@ def test_example_cassettes_pass(cassettes: Path, capsys: pytest.CaptureFixture[s
     assert "valid" in capsys.readouterr().out
 
 
-def test_tampered_request_is_reported(cassettes: Path, capsys: pytest.CaptureFixture[str]) -> None:
-    def change_prompt(document: dict[str, Any]) -> None:
-        document["entries"][0]["request"]["max_tokens"] += 1
+def test_tampered_prompt_inputs_are_reported(
+    cassettes: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    def change_inputs(document: dict[str, Any]) -> None:
+        document["prompt"]["inputs"]["currency"] = "EUR"
 
-    edit(cassettes / "routed-call.json", change_prompt)
+    edit(only_recording(cassettes), change_inputs)
 
     assert main(["cassettes", "check", str(cassettes)]) == 1
-    assert "request_hash does not match" in capsys.readouterr().out
+    assert "key does not match its recorded call" in capsys.readouterr().out
+
+
+async def test_tampered_unprompted_request_is_reported(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    store = DirectoryRecordingStore(tmp_path, scrubber=PatternScrubber())
+    recorder = RecordingProvider(ScriptedProvider(response("ok")), store, "plain")
+    await recorder.complete(
+        ProviderRequest(
+            provider=Provider.ANTHROPIC,
+            model="claude-haiku-4-5-20251001",
+            messages=(Message(role=Role.USER, content="hello"),),
+            max_tokens=100,
+        )
+    )
+
+    def change_request(document: dict[str, Any]) -> None:
+        document["request"]["max_tokens"] += 1
+
+    edit(only_recording(tmp_path), change_request)
+
+    assert main(["cassettes", "check", str(tmp_path)]) == 1
+    assert "key does not match its recorded call" in capsys.readouterr().out
 
 
 def test_secret_is_reported_without_its_value(
@@ -54,9 +89,9 @@ def test_secret_is_reported_without_its_value(
     fake_key = "sk-ant-" + "z" * 24
 
     def plant_secret(document: dict[str, Any]) -> None:
-        document["entries"][0]["response"]["text"] = f"key {fake_key}"
+        document["response"]["text"] = f"key {fake_key}"
 
-    edit(cassettes / "routed-call.json", plant_secret)
+    edit(only_recording(cassettes), plant_secret)
 
     assert main(["cassettes", "check", str(cassettes)]) == 1
     output = capsys.readouterr().out
@@ -64,16 +99,23 @@ def test_secret_is_reported_without_its_value(
     assert fake_key not in output
 
 
-def test_gap_in_sequence_numbers_is_reported(
+def test_a_misplaced_recording_is_reported(
     cassettes: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    def skip_sequence(document: dict[str, Any]) -> None:
-        document["entries"][0]["sequence"] = 1
-
-    edit(cassettes / "routed-call.json", skip_sequence)
+    recording = only_recording(cassettes)
+    recording.rename(recording.with_name("renamed.0.json"))
 
     assert main(["cassettes", "check", str(cassettes)]) == 1
-    assert "sequence numbers [1]" in capsys.readouterr().out
+    assert "misplaced; this recording belongs at" in capsys.readouterr().out
+
+
+def test_a_format_1_cassette_is_reported(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    (tmp_path / "old.json").write_text(json.dumps({"format_version": 1, "entries": []}))
+
+    assert main(["cassettes", "check", str(tmp_path)]) == 1
+    assert "is a format 1 cassette from agent-core 0.1.0a1" in capsys.readouterr().out
 
 
 def test_invalid_file_and_empty_directory(
@@ -83,14 +125,14 @@ def test_invalid_file_and_empty_directory(
     (tmp_path / "broken.json").write_text("{}")
 
     assert main(["cassettes", "check", str(tmp_path)]) == 1
-    assert "not a valid cassette (name: Field required)" in capsys.readouterr().out
+    assert "not a valid recording (replay_hash: Field required)" in capsys.readouterr().out
 
 
 async def test_redacted_cassette_passes_the_check(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     fake_key = "sk-ant-" + "r" * 24
-    redacting = DirectoryCassetteStore(
+    redacting = DirectoryRecordingStore(
         tmp_path, scrubber=PatternScrubber(), on_secret=SecretAction.REDACT
     )
     recorder = RecordingProvider(ScriptedProvider(response("ok")), redacting, "redacted")
@@ -104,7 +146,39 @@ async def test_redacted_cassette_passes_the_check(
     )
 
     assert main(["cassettes", "check", str(tmp_path)]) == 0
-    assert fake_key not in (tmp_path / "redacted.json").read_text()
+    assert fake_key not in only_recording(tmp_path).read_text()
+
+
+async def test_redacted_prompted_recording_passes_the_check(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    fake_key = "sk-ant-" + "p" * 24
+    redacting = DirectoryRecordingStore(
+        tmp_path, scrubber=PatternScrubber(), on_secret=SecretAction.REDACT
+    )
+    recorder = RecordingProvider(ScriptedProvider(response("ok")), redacting, "redacted")
+    prompt = PromptRef(id="notes.summarize", version=1, template="Summarize ${note}")
+    key = PromptKey.for_call(
+        prompt,
+        tier=Tier.SMALL,
+        output_schema=None,
+        output_json_schema=None,
+        inputs={"note": f"key {fake_key}"},
+        attachments=(),
+        attempt=1,
+    )
+    await recorder.complete(
+        ProviderRequest(
+            provider=Provider.ANTHROPIC,
+            model="claude-haiku-4-5-20251001",
+            messages=(Message(role=Role.USER, content=f"Summarize key {fake_key}"),),
+            max_tokens=10,
+        ),
+        prompt_key=key,
+    )
+
+    assert main(["cassettes", "check", str(tmp_path)]) == 0, capsys.readouterr().out
+    assert only_recording(tmp_path).stem == key.key
 
 
 def test_unreadable_file_is_a_problem_not_a_crash(

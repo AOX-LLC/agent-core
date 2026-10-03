@@ -6,6 +6,7 @@ from typing import Any
 
 from aox_agent_core.config import AgentCoreConfig, load_config
 from aox_agent_core.models.types import ProviderRequest, ProviderResponse, Usage
+from aox_agent_core.replay.keys import PromptKey
 
 SMALL_MODEL = "claude-haiku-4-5-20251001"
 FIXTURES = Path(__file__).parent / "fixtures"
@@ -34,9 +35,13 @@ class ScriptedProvider:
         self._responses = list(responses)
         self.requests: list[ProviderRequest] = []
         self.loops: list[asyncio.AbstractEventLoop] = []
+        self.prompt_keys: list[PromptKey | None] = []
 
-    async def complete(self, request: ProviderRequest) -> ProviderResponse:
+    async def complete(
+        self, request: ProviderRequest, *, prompt_key: PromptKey | None = None
+    ) -> ProviderResponse:
         self.requests.append(request)
+        self.prompt_keys.append(prompt_key)
         self.loops.append(asyncio.get_running_loop())
         if not self._responses:
             raise AssertionError("the test scripted no more responses")

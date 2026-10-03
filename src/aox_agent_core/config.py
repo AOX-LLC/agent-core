@@ -115,6 +115,11 @@ class RoutingConfig(FrozenModel):
     DROP_ONE_TIER retries the estimate one tier lower and raises only if that is
     still over budget or there is no lower tier. A retry or escalation that could
     take the total over budget raises BudgetExceededError instead of being sent.
+
+    A PDF's pages are counted from its bytes, which is best effort: a PDF built
+    to hide its pages can be under-counted. Set count_pdf_pages to false when
+    PDFs come from untrusted users, and every PDF is budgeted at the API's
+    100-page limit.
     """
 
     tiers: Mapping[Tier, TierConfig]
@@ -123,6 +128,7 @@ class RoutingConfig(FrozenModel):
     budget_usd_per_call: Annotated[Decimal, Field(gt=0)] | None = None
     on_budget_exceeded: BudgetAction = BudgetAction.RAISE
     escalate_on_structured_failure: bool = False
+    count_pdf_pages: bool = True
 
     @model_validator(mode="after")
     def _every_tier_is_defined(self) -> Self:
@@ -254,13 +260,13 @@ class AgentCoreConfig(FrozenModel):
     @model_validator(mode="after")
     def _every_tier_is_priced(self) -> Self:
         for tier, tier_config in self.routing.tiers.items():
-            if not self._has_price(tier_config.provider, tier_config.model):
+            if not self.has_price(tier_config.provider, tier_config.model):
                 raise ValueError(
                     f"tier {tier.value!r} uses {tier_config.provider.value} model "
                     f"{tier_config.model!r}, which has no entry under pricing"
                 )
         for tier, model in self.bedrock.tier_models.items():
-            if not self._has_price(Provider.BEDROCK, model):
+            if not self.has_price(Provider.BEDROCK, model):
                 raise ValueError(
                     f"bedrock.tier_models.{tier.value} is {model!r}, which has no entry "
                     "under pricing.bedrock"
@@ -269,11 +275,11 @@ class AgentCoreConfig(FrozenModel):
 
     def price_for(self, provider: Provider, model: str) -> ModelPrice:
         """Return the configured price of a model."""
-        if not self._has_price(provider, model):
+        if not self.has_price(provider, model):
             raise ConfigError(f"No price configured for {provider.value} model {model!r}.")
         return self.pricing[provider].models[model]
 
-    def _has_price(self, provider: Provider, model: str) -> bool:
+    def has_price(self, provider: Provider, model: str) -> bool:
         provider_pricing = self.pricing.get(provider)
         return provider_pricing is not None and model in provider_pricing.models
 

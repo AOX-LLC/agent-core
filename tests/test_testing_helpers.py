@@ -44,10 +44,10 @@ def test_use_cassette_fixture_replays_in_a_consumer_project(
         from aox_agent_core.errors import ReplayMissError
 
         sys.path.insert(0, {str(examples)!r})
-        from routed_call import triage
+        from routed_call import extract_invoice
 
         def test_recorded_call_replays(use_cassette):
-            assert triage(use_cassette("routed-call")).output.queue == "billing"
+            assert extract_invoice(use_cassette("routed-call")).output.total == "244.08"
 
         def test_unrecorded_prompt_misses(use_cassette):
             with pytest.raises(ReplayMissError):

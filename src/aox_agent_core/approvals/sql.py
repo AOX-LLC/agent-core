@@ -6,6 +6,7 @@ and denied attempt writes an audit event; when the queue and its audit log share
 a Database, in the same transaction as the change.
 """
 
+import json
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
@@ -14,7 +15,8 @@ from uuid import UUID, uuid4
 
 from pydantic import JsonValue
 
-from aox_agent_core._canonical import sha256_of
+from aox_agent_core._canonical import canonical_json, sha256_of
+from aox_agent_core._validation import STORED_RECORD
 from aox_agent_core.approvals.policy import ApproverPolicy, RoleApproverPolicy
 from aox_agent_core.approvals.types import (
     TTL_SECONDS_MAX,
@@ -29,6 +31,7 @@ from aox_agent_core.audit.chain import canonical_timestamp
 from aox_agent_core.audit.log import AuditLog
 from aox_agent_core.audit.sql import SQLAuditLog
 from aox_agent_core.audit.types import AuditEvent
+from aox_agent_core.context import RunContext
 from aox_agent_core.errors import (
     ApprovalAlreadyResolvedError,
     ApprovalError,
@@ -38,11 +41,12 @@ from aox_agent_core.errors import (
     ApprovalPayloadMismatchError,
     NotAuthorizedToResolveError,
 )
-from aox_agent_core.storage import Database, Dialect, Session
+from aox_agent_core.storage import Database, Dialect, Session, require_current_table
 
 ResultT = TypeVar("ResultT")
 
 APPROVALS_TABLE: Final = "agent_core_approvals"
+RUN_CONTEXT_COLUMN: Final = "run_context"
 
 _TABLE_DDL = f"""
 CREATE TABLE {APPROVALS_TABLE} (
@@ -59,7 +63,8 @@ CREATE TABLE {APPROVALS_TABLE} (
     resolved_by TEXT,
     resolved_at TEXT,
     consumed_at TEXT,
-    reason TEXT
+    reason TEXT,
+    run_context TEXT
 )"""
 
 _PENDING_INDEX_DDL = (
@@ -79,7 +84,7 @@ PENDING_PAGE_SIZE = 500
 
 _COLUMNS = (
     "id, action, summary, payload_sha256, requested_by, required_role, created_at, "
-    "expires_at, status, decision, resolved_by, resolved_at, consumed_at, reason"
+    "expires_at, status, decision, resolved_by, resolved_at, consumed_at, reason, run_context"
 )
 
 _DENIAL_ERRORS: Final[Mapping[DenialReason, type[ApprovalError]]] = {
@@ -148,10 +153,12 @@ class SQLApprovalQueue:
         requested_by: Principal,
         required_role: str,
         ttl_seconds: int,
+        context: RunContext | None = None,
     ) -> ApprovalRequest:
         """Queue a request that expires after ttl_seconds (at most TTL_SECONDS_MAX).
 
-        The payload's hash is stored; the payload itself is not.
+        The payload's hash is stored; the payload itself is not. `context`, the
+        run asking, is stored on the request and its audit event.
         """
         if not 0 < ttl_seconds <= TTL_SECONDS_MAX:
             raise ValueError(f"ttl_seconds must be 1 to {TTL_SECONDS_MAX}, got {ttl_seconds}")
@@ -165,19 +172,22 @@ class SQLApprovalQueue:
             required_role=required_role,
             created_at=now,
             expires_at=now + timedelta(seconds=ttl_seconds),
+            run_context=context,
         )
 
         def insert(session: Session) -> _Outcome:
             _ensure_table(session)
+            require_current_table(session, APPROVALS_TABLE, RUN_CONTEXT_COLUMN)
             session.execute(
                 f"INSERT INTO {APPROVALS_TABLE} ({_COLUMNS}) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 _row_values(request),
             )
             event = _event(
                 "approval.requested",
                 requested_by.id,
                 request,
+                context,
                 required_role=required_role,
                 payload_sha256=request.payload_sha256,
             )
@@ -257,13 +267,15 @@ class SQLApprovalQueue:
         decision: Decision,
         principal: Principal,
         reason: str | None = None,
+        context: RunContext | None = None,
     ) -> ApprovalRequest:
         """Approve or reject a pending request, once.
 
         Raises NotAuthorizedToResolveError if the ApproverPolicy denies it,
         ApprovalAlreadyResolvedError if it is no longer pending,
         ApprovalExpiredError if it has expired, and ApprovalNotFoundError if it
-        does not exist. Each of those is audited first.
+        does not exist. Each of those is audited first, with `context` or, without
+        one, the request's own.
         """
 
         def decide(session: Session) -> _Outcome:
@@ -271,8 +283,9 @@ class SQLApprovalQueue:
             if request is None:
                 return _denied(
                     ApprovalNotFoundError(f"No approval request {request_id}."),
-                    _missing_event("approval.resolve_denied", principal.id, request_id),
+                    _missing_event("approval.resolve_denied", principal.id, request_id, context),
                 )
+            event_context = context if context is not None else request.run_context
             now = self._now()
             verdict = self._policy.evaluate(principal, request, now=now)
             if not verdict.allowed:
@@ -289,6 +302,7 @@ class SQLApprovalQueue:
                         "approval.resolve_denied",
                         principal.id,
                         request,
+                        event_context,
                         decision=decision.value,
                         reason=denial,
                     ),
@@ -327,11 +341,14 @@ class SQLApprovalQueue:
                         "approval.resolve_denied",
                         principal.id,
                         request,
+                        event_context,
                         decision=decision.value,
                         reason=DenialReason.NOT_PENDING.value,
                     ),
                 )
-            event = _event("approval.resolved", principal.id, resolved, decision=decision.value)
+            event = _event(
+                "approval.resolved", principal.id, resolved, event_context, decision=decision.value
+            )
             return _Outcome(request=resolved, events=[event])
 
         return await self._write(decide)
@@ -343,10 +360,12 @@ class SQLApprovalQueue:
         action: str,
         payload: Mapping[str, JsonValue],
         principal: Principal,
+        context: RunContext | None = None,
     ) -> ApprovalRequest:
         """Call right before acting. Atomically moves an approved request to CONSUMED.
 
-        `principal` is whoever is about to act; the audit event names them. One
+        `principal` is whoever is about to act; the audit event names them, with
+        `context` or, without one, the request's own. One
         approval authorizes one run. Raises ApprovalPayloadMismatchError if the
         action or payload differ from what was approved, ApprovalNotGrantedError if
         the request is pending or was rejected, ApprovalAlreadyResolvedError if it
@@ -359,14 +378,22 @@ class SQLApprovalQueue:
             if request is None:
                 return _denied(
                     ApprovalNotFoundError(f"No approval request {request_id}."),
-                    _missing_event("approval.consume_denied", principal.id, request_id),
+                    _missing_event("approval.consume_denied", principal.id, request_id, context),
                 )
+            event_context = context if context is not None else request.run_context
             now = self._now()
             refusal = _consume_refusal(request, presented_hash, now)
             if refusal is not None:
                 error, reason = refusal
                 return _denied(
-                    error, _event("approval.consume_denied", principal.id, request, reason=reason)
+                    error,
+                    _event(
+                        "approval.consume_denied",
+                        principal.id,
+                        request,
+                        event_context,
+                        reason=reason,
+                    ),
                 )
 
             consumed = ApprovalRequest.model_validate(
@@ -385,9 +412,15 @@ class SQLApprovalQueue:
             if changed != 1:
                 return _denied(
                     ApprovalAlreadyResolvedError(f"Request {request_id} was used meanwhile."),
-                    _event("approval.consume_denied", principal.id, request, reason="not_open"),
+                    _event(
+                        "approval.consume_denied",
+                        principal.id,
+                        request,
+                        event_context,
+                        reason="not_open",
+                    ),
                 )
-            event = _event("approval.consumed", principal.id, consumed)
+            event = _event("approval.consumed", principal.id, consumed, event_context)
             return _Outcome(request=consumed, events=[event])
 
         return await self._write(use)
@@ -461,21 +494,31 @@ def _denied(error: ApprovalError, event: AuditEvent) -> _Outcome:
     return _Outcome(error=error, events=[event])
 
 
-def _event(action: str, actor_id: str, request: ApprovalRequest, **details: str) -> AuditEvent:
+def _event(
+    action: str,
+    actor_id: str,
+    request: ApprovalRequest,
+    context: RunContext | None,
+    **details: str,
+) -> AuditEvent:
     return AuditEvent(
         action=action,
         actor_id=actor_id,
         subject_id=str(request.id),
         payload={"approval_action": request.action, **details},
+        context=context,
     )
 
 
-def _missing_event(action: str, actor_id: str | None, request_id: UUID) -> AuditEvent:
+def _missing_event(
+    action: str, actor_id: str | None, request_id: UUID, context: RunContext | None
+) -> AuditEvent:
     return AuditEvent(
         action=action,
         actor_id=actor_id or "unknown",
         subject_id=str(request_id),
         payload={"reason": "not_found"},
+        context=context,
     )
 
 
@@ -487,15 +530,22 @@ def _ensure_table(session: Session) -> None:
 
 
 def _table_exists(session: Session) -> bool:
+    """Whether the table exists; ConfigError if it is a 0.1.0a1 table without run_context."""
     # Reads before the first submit see "no table", which means "no requests".
     if session.dialect is Dialect.SQLITE:
-        return bool(
+        exists = bool(
             session.execute(
                 "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
                 (APPROVALS_TABLE,),
             )
         )
-    return bool(session.execute("SELECT to_regclass(?) IS NOT NULL", (APPROVALS_TABLE,))[0][0])
+    else:
+        exists = bool(
+            session.execute("SELECT to_regclass(?) IS NOT NULL", (APPROVALS_TABLE,))[0][0]
+        )
+    if exists:
+        require_current_table(session, APPROVALS_TABLE, RUN_CONTEXT_COLUMN)
+    return exists
 
 
 def _load(session: Session, request_id: UUID) -> ApprovalRequest | None:
@@ -562,15 +612,21 @@ def _row_values(request: ApprovalRequest) -> tuple[Any, ...]:
         timestamp(request.resolved_at),
         timestamp(request.consumed_at),
         request.reason,
+        (
+            canonical_json(request.run_context.as_json()).decode("utf-8")
+            if request.run_context is not None
+            else None
+        ),
     )
 
 
 def _request_from_row(row: tuple[Any, ...]) -> ApprovalRequest:
     # NULL columns are dropped so the model's defaults apply.
     names = [name.strip() for name in _COLUMNS.split(",")]
-    return ApprovalRequest.model_validate(
-        {name: value for name, value in zip(names, row, strict=True) if value is not None}
-    )
+    fields = {name: value for name, value in zip(names, row, strict=True) if value is not None}
+    if RUN_CONTEXT_COLUMN in fields:
+        fields[RUN_CONTEXT_COLUMN] = json.loads(fields[RUN_CONTEXT_COLUMN])
+    return ApprovalRequest.model_validate(fields, context={STORED_RECORD: True})
 
 
 def _utc_now() -> datetime:

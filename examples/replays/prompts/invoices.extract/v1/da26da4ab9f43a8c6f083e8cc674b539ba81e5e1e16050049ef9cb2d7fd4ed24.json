@@ -1,0 +1,90 @@
+{
+  "format_version": 2,
+  "prompt": {
+    "attachments": [
+      {
+        "media_type": "application/pdf",
+        "sha256": "efdcafc8b649fbde0247bc461ae75de776b244ed4672726946d3ba5670d86d02",
+        "size_bytes": 1877
+      }
+    ],
+    "attempt": 1,
+    "inputs": {
+      "currency": "USD"
+    },
+    "output_schema": "InvoiceFields",
+    "prompt_id": "invoices.extract",
+    "schema_sha256": "dea4a6b50b2b60b4e9d513cdc2021befcbe6f8c32dd0d1c394ec7bb099d01e19",
+    "system_sha256": "49ba9f9f3a36e13deefdfeb5085d799373674f5413f36cdd74b9c281353137ca",
+    "template_sha256": "fc60ae0c75d0fd50fb70bd008c7f5783ad1f82deb37b5ac801be524583fecdc7",
+    "tier": "small",
+    "version": 1
+  },
+  "replay_hash": "da26da4ab9f43a8c6f083e8cc674b539ba81e5e1e16050049ef9cb2d7fd4ed24",
+  "request": {
+    "effort": null,
+    "max_tokens": 16000,
+    "messages": [
+      {
+        "attachments": [
+          {
+            "media_type": "application/pdf",
+            "sha256": "efdcafc8b649fbde0247bc461ae75de776b244ed4672726946d3ba5670d86d02",
+            "size_bytes": 1877
+          }
+        ],
+        "content": "Read the attached invoice and extract its fields. Write dates as YYYY-MM-DD and amounts as plain decimals in USD.",
+        "role": "user"
+      }
+    ],
+    "model": "claude-haiku-4-5-20251001",
+    "output_schema": {
+      "additionalProperties": false,
+      "properties": {
+        "due_date": {
+          "title": "Due Date",
+          "type": "string"
+        },
+        "invoice_number": {
+          "title": "Invoice Number",
+          "type": "string"
+        },
+        "issue_date": {
+          "title": "Issue Date",
+          "type": "string"
+        },
+        "total": {
+          "title": "Total",
+          "type": "string"
+        },
+        "vendor": {
+          "title": "Vendor",
+          "type": "string"
+        }
+      },
+      "required": [
+        "vendor",
+        "invoice_number",
+        "issue_date",
+        "due_date",
+        "total"
+      ],
+      "title": "InvoiceFields",
+      "type": "object"
+    },
+    "provider": "anthropic",
+    "system": "You extract fields from supplier invoices for a fictional accounts team."
+  },
+  "response": {
+    "model": "claude-haiku-4-5-20251001",
+    "stop_reason": "end_turn",
+    "text": "{\"vendor\": \"Northwind Paper Supply\", \"invoice_number\": \"INV-1042\", \"issue_date\": \"2026-09-01\", \"due_date\": \"2026-10-01\", \"total\": \"244.08\"}",
+    "usage": {
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 0,
+      "input_tokens": 2069,
+      "output_tokens": 59
+    }
+  },
+  "sequence": 0
+}

@@ -32,6 +32,7 @@ POSTGRES_DEFAULT_PORT = 5432
 # Row-value comparisons, which approval listing uses, arrived in SQLite 3.15.
 SQLITE_MINIMUM_VERSION = (3, 15, 0)
 POSTGRES_ROLE_NAME = re.compile(r"[a-z_][a-z0-9_]{0,62}")
+TABLE_NAME = re.compile(r"[a-z_][a-z0-9_]{0,62}")
 
 
 class Dialect(StrEnum):
@@ -200,6 +201,38 @@ def open_database(url: str | SecretStr) -> Database:
     if scheme in {"postgresql", "postgres"}:
         return PostgresDatabase(secret_url)
     raise ConfigError(f"Unsupported database URL scheme {scheme!r}; use sqlite or postgresql.")
+
+
+def table_columns(session: Session, table: str) -> set[str]:
+    """The column names of a table in the session's database; empty if there is no table."""
+    if not TABLE_NAME.fullmatch(table):
+        raise ValueError(f"{table!r} is not a plain table name.")
+    if session.dialect is Dialect.SQLITE:
+        # PRAGMA arguments cannot be bound, so the name is checked above.
+        return {row[1] for row in session.execute(f"PRAGMA table_info({table})")}
+    return {
+        row[0]
+        for row in session.execute(
+            "SELECT attname FROM pg_attribute "
+            "WHERE attrelid = to_regclass(?) AND attnum > 0 AND NOT attisdropped",
+            (table,),
+        )
+    }
+
+
+def require_current_table(session: Session, table: str, column: str) -> None:
+    """Raise ConfigError if `table` exists but predates `column`, added in 0.1.0a2.
+
+    The library never alters an existing table, so a table made by 0.1.0a1 is
+    refused rather than migrated in place.
+    """
+    columns = table_columns(session, table)
+    if columns and column not in columns:
+        raise ConfigError(
+            f"Table {table} was created by agent-core 0.1.0a1 and has no {column} column; "
+            "this version does not change existing tables. Keep that database, and check "
+            "its records with 0.1.0a1, then point this version at a new database."
+        )
 
 
 def driver_errors() -> tuple[type[Exception], ...]:

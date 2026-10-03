@@ -7,6 +7,7 @@ from uuid import UUID
 from pydantic import JsonValue
 
 from aox_agent_core.approvals.types import ApprovalRequest, Decision, Principal
+from aox_agent_core.context import RunContext
 
 
 class ApprovalQueue(Protocol):
@@ -14,6 +15,10 @@ class ApprovalQueue(Protocol):
 
     Every submission, resolution and denied attempt writes an audit event; when
     the queue and the audit log share a database, in the same transaction.
+
+    `context` names the run making each call. submit() stores it on the request;
+    resolve() and consume() put theirs on their audit events, or the request's
+    own when they are given none.
     """
 
     async def submit(
@@ -25,6 +30,7 @@ class ApprovalQueue(Protocol):
         requested_by: Principal,
         required_role: str,
         ttl_seconds: int,
+        context: RunContext | None = None,
     ) -> ApprovalRequest:
         """Queue a request that expires after ttl_seconds (at most TTL_SECONDS_MAX).
 
@@ -50,6 +56,7 @@ class ApprovalQueue(Protocol):
         decision: Decision,
         principal: Principal,
         reason: str | None = None,
+        context: RunContext | None = None,
     ) -> ApprovalRequest:
         """Approve or reject a pending request, once.
 
@@ -66,6 +73,7 @@ class ApprovalQueue(Protocol):
         action: str,
         payload: Mapping[str, JsonValue],
         principal: Principal,
+        context: RunContext | None = None,
     ) -> ApprovalRequest:
         """Call right before acting, as `principal`, the one about to act.
 

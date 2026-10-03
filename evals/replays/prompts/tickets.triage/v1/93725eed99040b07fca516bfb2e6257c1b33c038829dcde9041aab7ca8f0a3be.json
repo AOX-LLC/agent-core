@@ -1,0 +1,73 @@
+{
+  "format_version": 2,
+  "prompt": {
+    "attachments": [],
+    "attempt": 1,
+    "inputs": {
+      "ticket": "Subject: Need a copy of last quarter's invoice\n\nCould you send a PDF of invoice INV-2002? Our accountant needs it sometime next week."
+    },
+    "output_schema": "TicketTriage",
+    "prompt_id": "tickets.triage",
+    "schema_sha256": "517a6165b8bf8c17c7feb180ac2b3e8dc391d4cf0d06d8e9511ec8072653c751",
+    "system_sha256": "033aa057582250a044377f1425343ae80edc9c578697357903cb59138caeac31",
+    "template_sha256": "40eb4cd7a1c84d0987401d0d04ada5d937d80c40b0690f311ec835ee3619368b",
+    "tier": "small",
+    "version": 1
+  },
+  "replay_hash": "93725eed99040b07fca516bfb2e6257c1b33c038829dcde9041aab7ca8f0a3be",
+  "request": {
+    "effort": null,
+    "max_tokens": 16000,
+    "messages": [
+      {
+        "attachments": [],
+        "content": "Triage this support ticket.\n\nSubject: Need a copy of last quarter's invoice\n\nCould you send a PDF of invoice INV-2002? Our accountant needs it sometime next week.",
+        "role": "user"
+      }
+    ],
+    "model": "claude-haiku-4-5-20251001",
+    "output_schema": {
+      "additionalProperties": false,
+      "properties": {
+        "queue": {
+          "enum": [
+            "billing",
+            "technical",
+            "account"
+          ],
+          "title": "Queue",
+          "type": "string"
+        },
+        "summary": {
+          "title": "Summary",
+          "type": "string"
+        },
+        "urgent": {
+          "title": "Urgent",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "queue",
+        "urgent",
+        "summary"
+      ],
+      "title": "TicketTriage",
+      "type": "object"
+    },
+    "provider": "anthropic",
+    "system": "You triage support tickets for a fictional software company."
+  },
+  "response": {
+    "model": "claude-haiku-4-5-20251001",
+    "stop_reason": "end_turn",
+    "text": "{\"queue\": \"billing\", \"urgent\": false, \"summary\": \"Customer requests PDF copy of invoice INV-2002 for accounting purposes, needed by next week\"}",
+    "usage": {
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 0,
+      "input_tokens": 306,
+      "output_tokens": 39
+    }
+  },
+  "sequence": 0
+}

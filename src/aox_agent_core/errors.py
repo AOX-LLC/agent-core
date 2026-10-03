@@ -50,6 +50,14 @@ class ProviderRequestError(ProviderError):
     """The provider rejected the request as invalid."""
 
 
+class AttachmentError(AgentCoreError):
+    """An attachment is not a PNG, JPEG or PDF, does not match its declared type, or is too big."""
+
+
+class PromptError(AgentCoreError):
+    """A prompt template could not be rendered from its inputs."""
+
+
 class ModelRefusalError(AgentCoreError):
     """The model declined the request (stop reason 'refusal')."""
 
@@ -71,15 +79,24 @@ class ReplayError(AgentCoreError):
 
 
 class ReplayMissError(ReplayError):
-    """Replay mode found no recorded response for a request."""
+    """Replay mode found no recording for a call. There is never a live fallback.
+
+    key is the replay key that was looked up and path the file it was expected in.
+    """
+
+    def __init__(self, message: str, *, key: str = "", path: str = "") -> None:
+        super().__init__(message)
+        self.key = key
+        self.path = path
+
+
+class StaleRecordingError(ReplayError):
+    """A recording exists for the key, but its prompt template, system prompt or
+    output schema has changed since: bump the prompt version or record again."""
 
 
 class CassetteFormatError(ReplayError):
     """A cassette file is unreadable, malformed or of an unsupported format version."""
-
-
-class CassetteConflictError(ReplayError):
-    """Another recorder wrote the same cassette during this run, so it was not overwritten."""
 
 
 class SecretInRecordingError(ReplayError):

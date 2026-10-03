@@ -27,20 +27,9 @@ from aox_agent_core.audit import (
 from aox_agent_core.config import Provider
 from aox_agent_core.evals import CaseResult, EvalCase, EvalRunner, EvalSuite, Score, Scorecard
 from aox_agent_core.models import ProviderRequest
-from aox_agent_core.replay import Cassette
 
 NOW = datetime(2026, 10, 2, 12, 0, tzinfo=UTC)
 SAMPLE_HASH = "a" * 64
-
-
-@pytest.mark.parametrize("name", ["../escape", "a/b", ".hidden", "", "with space", "x" * 129])
-def test_cassette_names_cannot_leave_the_cassette_directory(name: str) -> None:
-    with pytest.raises(ValidationError):
-        Cassette(name=name)
-
-
-def test_cassette_defaults_to_the_current_format() -> None:
-    assert Cassette(name="triage-flow").format_version == 1
 
 
 def test_provider_request_needs_a_message() -> None:
@@ -116,6 +105,7 @@ def audit_record_fields(**overrides: Any) -> dict[str, Any]:
         "actor_id": "user-17",
         "subject_id": None,
         "payload": {},
+        "run_context": None,
         "prev_hash": GENESIS_HASH,
         "record_hash": SAMPLE_HASH,
         **overrides,

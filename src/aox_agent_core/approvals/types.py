@@ -9,6 +9,7 @@ from uuid import UUID
 from pydantic import AwareDatetime, StringConstraints, model_validator
 
 from aox_agent_core._model import ActionName, FrozenModel, PrincipalId, Sha256Hex
+from aox_agent_core.context import RunContext
 
 RoleName = Annotated[str, StringConstraints(pattern=r"^[a-z][a-z0-9_.-]{0,63}$")]
 ShortText = Annotated[str, StringConstraints(min_length=1, max_length=500)]
@@ -76,6 +77,7 @@ class ApprovalRequest(FrozenModel):
     Hashing the action with the payload means an approval for one action can
     never authorize a different action that happens to share its payload.
     An approval authorizes a single run: using it moves it to CONSUMED.
+    run_context is the run that asked for the approval, if the caller named one.
     """
 
     id: UUID
@@ -92,6 +94,7 @@ class ApprovalRequest(FrozenModel):
     resolved_at: AwareDatetime | None = None
     consumed_at: AwareDatetime | None = None
     reason: ShortText | None = None
+    run_context: RunContext | None = None
 
     @model_validator(mode="after")
     def _lifetime_is_bounded(self) -> Self:

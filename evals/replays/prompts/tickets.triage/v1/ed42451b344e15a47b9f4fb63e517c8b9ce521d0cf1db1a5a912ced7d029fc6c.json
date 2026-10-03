@@ -1,0 +1,73 @@
+{
+  "format_version": 2,
+  "prompt": {
+    "attachments": [],
+    "attempt": 1,
+    "inputs": {
+      "ticket": "Subject: Cannot reset my password\n\nThe reset link for user@example.com says it has expired every time. I need to get into my account before a client meeting in one hour."
+    },
+    "output_schema": "TicketTriage",
+    "prompt_id": "tickets.triage",
+    "schema_sha256": "517a6165b8bf8c17c7feb180ac2b3e8dc391d4cf0d06d8e9511ec8072653c751",
+    "system_sha256": "033aa057582250a044377f1425343ae80edc9c578697357903cb59138caeac31",
+    "template_sha256": "40eb4cd7a1c84d0987401d0d04ada5d937d80c40b0690f311ec835ee3619368b",
+    "tier": "small",
+    "version": 1
+  },
+  "replay_hash": "ed42451b344e15a47b9f4fb63e517c8b9ce521d0cf1db1a5a912ced7d029fc6c",
+  "request": {
+    "effort": null,
+    "max_tokens": 16000,
+    "messages": [
+      {
+        "attachments": [],
+        "content": "Triage this support ticket.\n\nSubject: Cannot reset my password\n\nThe reset link for user@example.com says it has expired every time. I need to get into my account before a client meeting in one hour.",
+        "role": "user"
+      }
+    ],
+    "model": "claude-haiku-4-5-20251001",
+    "output_schema": {
+      "additionalProperties": false,
+      "properties": {
+        "queue": {
+          "enum": [
+            "billing",
+            "technical",
+            "account"
+          ],
+          "title": "Queue",
+          "type": "string"
+        },
+        "summary": {
+          "title": "Summary",
+          "type": "string"
+        },
+        "urgent": {
+          "title": "Urgent",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "queue",
+        "urgent",
+        "summary"
+      ],
+      "title": "TicketTriage",
+      "type": "object"
+    },
+    "provider": "anthropic",
+    "system": "You triage support tickets for a fictional software company."
+  },
+  "response": {
+    "model": "claude-haiku-4-5-20251001",
+    "stop_reason": "end_turn",
+    "text": "{\"queue\":\"account\",\"urgent\":true,\"summary\":\"User unable to reset password - reset link repeatedly expires, needs access restored within one hour for client meeting\"}",
+    "usage": {
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 0,
+      "input_tokens": 311,
+      "output_tokens": 35
+    }
+  },
+  "sequence": 0
+}

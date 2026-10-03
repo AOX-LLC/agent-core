@@ -4,7 +4,6 @@ import argparse
 import asyncio
 import os
 import sys
-from collections import defaultdict
 from collections.abc import Sequence
 from pathlib import Path
 from urllib.parse import urlsplit
@@ -15,9 +14,10 @@ from aox_agent_core.audit.sql import SQLAuditLog, audit_table_exists
 from aox_agent_core.audit.types import AuditHead
 from aox_agent_core.config import AUDIT_DATABASE_URL_ENV, load_config
 from aox_agent_core.errors import AgentCoreError, AuditIntegrityError, CassetteFormatError
-from aox_agent_core.replay.cassette import Cassette, request_hash
+from aox_agent_core.replay.keys import request_hash
+from aox_agent_core.replay.recording import Recording
 from aox_agent_core.replay.scrub import PatternScrubber
-from aox_agent_core.replay.store import parse_cassette, recorded_content
+from aox_agent_core.replay.store import DirectoryRecordingStore, parse_recording, recorded_content
 from aox_agent_core.storage import SQLiteDatabase, driver_errors, open_database
 
 REDACTION_MARKER = "[REDACTED:"
@@ -129,14 +129,14 @@ def _verify_audit(url: str | None, anchor_seq: int | None, anchor_hash: str | No
 
 
 def check_cassettes(directory: Path) -> list[str]:
-    """Return one line per problem found in the cassettes under `directory`.
+    """Return one line per problem found in the recordings under `directory`.
 
-    An empty list means every cassette is valid. Raises AgentCoreError if the
-    configuration cannot be loaded.
+    An empty list means every recording is valid and sits where its key says it
+    belongs. Raises AgentCoreError if the configuration cannot be loaded.
     """
-    paths = sorted(directory.glob("*.json"))
+    paths = sorted(path for path in directory.rglob("*.json") if not path.name.startswith("."))
     if not paths:
-        return [f"{directory}: no cassettes (*.json) found"]
+        return [f"{directory}: no recordings (*.json) found"]
 
     scrubber = PatternScrubber(extra_patterns=load_config().replay.extra_secret_patterns)
     problems: list[str] = []
@@ -147,43 +147,46 @@ def check_cassettes(directory: Path) -> list[str]:
             problems.append(f"{path}: unreadable ({type(error).__name__})")
             continue
         try:
-            cassette = parse_cassette(text, source=path)
+            recording = parse_recording(text, source=path)
         except CassetteFormatError as error:
-            problems.append(f"{path}: not a valid cassette ({_first_validation_problem(error)})")
+            problems.append(f"{path}: {_why_unreadable(error, path)}")
             continue
-        problems += _problems_in(path, cassette, scrubber)
+        problems += _problems_in(directory, path, recording, scrubber)
     return problems
 
 
-def _problems_in(path: Path, cassette: Cassette, scrubber: PatternScrubber) -> list[str]:
+def _problems_in(
+    root: Path, path: Path, recording: Recording, scrubber: PatternScrubber
+) -> list[str]:
     problems: list[str] = []
-    if cassette.name != path.stem:
-        problems.append(f"{path}: name {cassette.name!r} does not match the file name")
+    # A redacted recording keeps the key of what was sent, which can no longer be
+    # recomputed from what was written.
+    is_redacted = REDACTION_MARKER in recording.model_dump_json()
+    expected_key = (
+        recording.prompt.key if recording.prompt is not None else request_hash(recording.request)
+    )
+    if not is_redacted and recording.replay_hash != expected_key:
+        problems.append(f"{path}: key does not match its recorded call")
 
-    sequences: dict[str, list[int]] = defaultdict(list)
-    for index, entry in enumerate(cassette.entries):
-        # A redacted entry keeps the hash of the request as sent, which can no
-        # longer be recomputed from what was written.
-        is_redacted = REDACTION_MARKER in entry.request.model_dump_json()
-        if not is_redacted and entry.request_hash != request_hash(entry.request):
-            problems.append(f"{path}: entries[{index}] request_hash does not match its request")
-        sequences[entry.request_hash].append(entry.sequence)
-    for key, numbers in sequences.items():
-        if sorted(numbers) != list(range(len(numbers))):
-            problems.append(f"{path}: request {key[:12]} has sequence numbers {sorted(numbers)}")
+    store = DirectoryRecordingStore(root, scrubber=scrubber)
+    cassette = path.parent.name if recording.prompt is None else "default"
+    expected_path = store.path_of(recording, cassette=cassette)
+    if path != expected_path:
+        problems.append(f"{path}: misplaced; this recording belongs at {expected_path}")
 
-    for finding in scrubber.find_secrets(recorded_content(cassette.model_dump(mode="json"))):
+    for finding in scrubber.find_secrets(recorded_content(recording.model_dump(mode="json"))):
         problems.append(f"{path}: possible secret ({finding.rule}) at {finding.path}")
     return problems
 
 
-def _first_validation_problem(error: CassetteFormatError) -> str:
+def _why_unreadable(error: CassetteFormatError, path: Path) -> str:
     cause = error.__cause__
     if not isinstance(cause, ValidationError):
-        return "unreadable"
+        # Format 1, or not JSON: the error already says what is wrong.
+        return str(error).removeprefix(f"{path} ")
     detail = cause.errors(include_input=False, include_url=False)[0]
     location = ".".join(str(part) for part in detail["loc"]) or "<root>"
-    return f"{location}: {detail['msg']}"
+    return f"not a valid recording ({location}: {detail['msg']})"
 
 
 if __name__ == "__main__":

@@ -1,9 +1,11 @@
 """Turning token counts into dollars with the configured, dated price table."""
 
 import math
+from collections.abc import Iterable
 from decimal import Decimal
 
 from aox_agent_core.config import ModelPrice
+from aox_agent_core.models.attachments import Attachment
 from aox_agent_core.models.types import Usage
 
 TOKENS_PER_MILLION = Decimal(1_000_000)
@@ -11,6 +13,15 @@ TOKENS_PER_MILLION = Decimal(1_000_000)
 # A deliberately pessimistic characters-per-token ratio for budget checks, which
 # run before any call and cannot ask the API to count tokens.
 CHARACTERS_PER_TOKEN_ESTIMATE = 3
+
+# Pessimistic per-attachment token counts. The API scales an image down to its
+# resolution limit, which bounds its tokens; a PDF page costs its text plus an
+# image of the page.
+IMAGE_TOKENS_ESTIMATE = 5_000
+PDF_PAGE_TOKENS_ESTIMATE = 8_000
+# Pages assumed for a PDF whose pages cannot be counted: the API's per-request
+# PDF page limit, so the estimate stays an upper bound.
+PDF_PAGES_CEILING = 100
 
 
 def cost_of(usage: Usage, price: ModelPrice) -> Decimal:
@@ -40,3 +51,23 @@ def estimate_input_tokens(*texts: str | None) -> int:
     """Over-estimate the tokens in some text, for budget checks before a call."""
     characters = sum(len(text) for text in texts if text)
     return math.ceil(characters / CHARACTERS_PER_TOKEN_ESTIMATE)
+
+
+def estimate_attachment_tokens(
+    attachments: Iterable[Attachment], *, count_pdf_pages: bool = True
+) -> int:
+    """Over-estimate the tokens attachments add, for budget checks before a call.
+
+    A PDF's pages are counted once, when the attachment is built; a PDF whose
+    pages could not be counted is assumed to have PDF_PAGES_CEILING of them. The
+    count is best effort against a PDF built to hide its pages; with
+    count_pdf_pages=False every PDF is assumed to have PDF_PAGES_CEILING.
+    """
+    tokens = 0
+    for attachment in attachments:
+        if attachment.media_type != "application/pdf":
+            tokens += IMAGE_TOKENS_ESTIMATE
+            continue
+        pages = (attachment.pdf_pages if count_pdf_pages else None) or PDF_PAGES_CEILING
+        tokens += pages * PDF_PAGE_TOKENS_ESTIMATE
+    return tokens
