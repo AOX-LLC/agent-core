@@ -287,3 +287,55 @@ async def test_every_audit_column_is_bounded_or_survivable(
 def _unparsable(columns: dict[str, str]) -> bool:
     payload = columns.get("payload", "")
     return "[" * 100 in payload  # json.loads recurses too deeply: a malformed record
+
+
+# The approver's own column: when a decision was made.
+
+RESOLVED_AT_CASES: list[tuple[str, timedelta, timedelta, bool]] = [
+    # (id, created_at relative to now, resolved_at relative to now, the database accepts it)
+    ("now", timedelta(minutes=-1), timedelta(0), True),
+    ("at-created-at", timedelta(minutes=-1), timedelta(minutes=-1), True),
+    ("four-minutes-ahead", timedelta(minutes=-1), timedelta(minutes=4), True),
+    ("before-created-at", timedelta(0), timedelta(minutes=-1), False),
+    ("ten-minutes-ahead", timedelta(minutes=-1), timedelta(minutes=10), False),
+    ("a-year-ahead", timedelta(minutes=-1), timedelta(days=365), False),
+    ("ten-minutes-ago-though-after-created-at", timedelta(hours=-1), timedelta(minutes=-10), False),
+]
+
+
+@pytest.mark.parametrize(
+    ("created", "resolved", "accepted"),
+    [(created, resolved, accepted) for _, created, resolved, accepted in RESOLVED_AT_CASES],
+    ids=[case_id for case_id, *_ in RESOLVED_AT_CASES],
+)
+async def test_the_approver_cannot_date_a_decision_outside_the_requests_life_and_the_clock(
+    control_database: ControlDatabase, created: timedelta, resolved: timedelta, accepted: bool
+) -> None:
+    if control_database.requester_raw is None or control_database.approver_raw is None:
+        pytest.skip("the guard trigger exists only on Postgres")
+    now = datetime.now(UTC)
+    row = uuid4()
+    control_database.requester_raw(
+        raw_request(
+            id=f"'{row}'",
+            created_at=stamp(now + created),
+            expires_at=stamp(now + created + timedelta(hours=2)),
+        )
+    )
+    decide = (
+        f"UPDATE {APPROVALS} SET status = 'approved', decision = 'approve', "
+        f"resolved_by = 'user-17', resolved_at = {stamp(now + resolved)} WHERE id = '{row}'"
+    )
+
+    if accepted:
+        control_database.approver_raw(decide)
+        queue = split_queue(control_database)
+        read = await queue.get(row)
+        assert read.status is ApprovalStatus.APPROVED
+        assert read.resolved_at is not None
+        assert read.resolved_at >= read.created_at
+    else:
+        with pytest.raises(psycopg.Error):
+            control_database.approver_raw(decide)
+        status = control_database.raw(f"SELECT status FROM {APPROVALS} WHERE id = '{row}'")
+        assert status == [("pending",)]

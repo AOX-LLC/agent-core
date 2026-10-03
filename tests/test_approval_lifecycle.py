@@ -33,7 +33,9 @@ NOW = datetime.now(UTC).replace(microsecond=0)
 
 class Clock:
     def __init__(self) -> None:
-        self.now = NOW
+        # Fresh for each test: the Postgres guard bounds a decision's time by its own clock.
+        self.start = datetime.now(UTC).replace(microsecond=0)
+        self.now = self.start
 
     def __call__(self) -> datetime:
         return self.now
@@ -60,9 +62,9 @@ async def audit_trail(database: ControlDatabase) -> list[tuple[str, str, Any, An
 
 async def expired_requests(queue: SplitQueue, clock: Clock, count: int) -> list[ApprovalRequest]:
     """Requests submitted two hours ago with a one-hour lifetime: over by any clock."""
-    clock.now = NOW - timedelta(hours=2)
+    clock.now = clock.start - timedelta(hours=2)
     requests = [await submit(queue, context=RUN) for _ in range(count)]
-    clock.now = NOW
+    clock.now = clock.start
     return requests
 
 

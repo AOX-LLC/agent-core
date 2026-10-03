@@ -53,7 +53,9 @@ NOW = datetime.now(UTC).replace(microsecond=0)
 
 class Clock:
     def __init__(self) -> None:
-        self.now = NOW
+        # Fresh for each test: the Postgres guard bounds a decision's time by its own clock.
+        self.start = datetime.now(UTC).replace(microsecond=0)
+        self.now = self.start
 
     def __call__(self) -> datetime:
         return self.now
@@ -151,7 +153,7 @@ async def test_expired_request_cannot_be_resolved(control_database: ControlDatab
     clock = Clock()
     queue = queue_for(control_database, clock)
     request = await submitted(queue)
-    clock.now = NOW + timedelta(hours=1)
+    clock.now = clock.start + timedelta(hours=1)
 
     with pytest.raises(ApprovalExpiredError):
         await queue.resolve(request.id, decision=Decision.APPROVE, principal=APPROVER)
@@ -222,7 +224,7 @@ async def test_approval_expires_before_use(control_database: ControlDatabase) ->
     queue = queue_for(control_database, clock)
     request = await submitted(queue)
     await queue.resolve(request.id, decision=Decision.APPROVE, principal=APPROVER)
-    clock.now = NOW + timedelta(hours=2)
+    clock.now = clock.start + timedelta(hours=2)
 
     with pytest.raises(ApprovalExpiredError):
         await queue.consume(
@@ -393,9 +395,9 @@ async def test_list_pending_filters_expired_own_and_other_role_requests(
 ) -> None:
     clock = Clock()
     queue = queue_for(control_database, clock)
-    clock.now = NOW - timedelta(hours=2)
+    clock.now = clock.start - timedelta(hours=2)
     stale = await submitted(queue)
-    clock.now = NOW
+    clock.now = clock.start
     fresh = await submitted(queue)
     await submitted(queue, requester=APPROVER)
     await queue.submit(
@@ -475,7 +477,7 @@ async def test_list_pending_pages_past_requests_a_strict_policy_rejects(
     clock = Clock()
     queue = split_queue(control_database, policy=policy, clock=clock)
     for minute in range(5):
-        clock.now = NOW + timedelta(minutes=minute)
+        clock.now = clock.start + timedelta(minutes=minute)
         newest = await submitted(queue)
     policy.newest = newest.id
 
@@ -571,7 +573,7 @@ async def test_list_pending_pages_with_an_after_cursor(control_database: Control
     queue = queue_for(control_database, clock)
     created = []
     for minute in range(5):
-        clock.now = NOW + timedelta(minutes=minute)
+        clock.now = clock.start + timedelta(minutes=minute)
         created.append((await submitted(queue)).id)
 
     first = await queue.list_pending(APPROVER, limit=2)

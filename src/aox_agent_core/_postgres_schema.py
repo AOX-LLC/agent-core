@@ -14,8 +14,8 @@ only its own credentials cannot step outside them with plain SQL:
     from      to         role                    also required
     (insert)  pending    requester               undecided; starts by now, lives at most 168 hours
     pending   approved   approver                decision 'approve', resolved_by set and neither
-                                                 requester nor delegate, resolved_at set,
-                                                 not expired
+                                                 requester nor delegate, resolved_at set (not before
+                                                 created_at, within 5 minutes of now), not expired
     pending   rejected   approver                as approved, with decision 'reject'
     pending   cancelled  requester               closed_at set
     pending   expired    requester or approver   closed_at set, expires_at already past
@@ -424,6 +424,9 @@ BEGIN
            OR jsonb_exists(OLD.delegates::jsonb, NEW.resolved_by)
            OR NEW.resolved_by !~ principal_shape
            OR NEW.resolved_at IS NULL OR NOT_CANONICAL(NEW.resolved_at)
+           OR NEW.resolved_at::timestamptz < OLD.created_at::timestamptz
+           OR NEW.resolved_at::timestamptz NOT BETWEEN db_now - interval '5 minutes'
+                                                   AND db_now + interval '5 minutes'
            OR (NEW.reason IS NOT NULL
                AND (length(NEW.reason) NOT BETWEEN 1 AND 500 OR NEW.reason ~ unsafe_text))
            OR NEW.consumed_at IS DISTINCT FROM OLD.consumed_at
