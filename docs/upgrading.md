@@ -232,7 +232,7 @@ Other changes for the operator:
 
 ## What is not verified
 
-- **Postgres 17 in CI.** The Postgres test files passed against `postgres:17-alpine` on a developer machine. CI runs 16 on Python 3.11 to 3.14 and 17 on Python 3.12 in a separate job, which had not run in CI when this page was written. Postgres 18 and later were not tested.
+- **Postgres 17 in CI.** The Postgres test files passed against `postgres:17-alpine` on a developer machine. CI runs 16 on Python 3.11 to 3.14 and 17 on Python 3.12 in a separate job. Postgres 18 and later were not tested.
 - **A real pooler.** The design fits a transaction-mode pooler (see item 12 for project 04). It has not been run against pgbouncer or any other pooler.
 - **This upgrade on a large or busy database.** `tests/test_upgrade_from_a3.py` replays a schema dump made by 0.1.0a3 with four audit rows and one approval, upgrades it, and checks the rows, the chain and a second installer run. It has not been run on a production-sized database, or with writers active.
 - **Mixed versions.** An a3 library writing to an a4 schema has not been tested. Plan a short window with no writers: stop the a3 processes, run the installer, start a4.
