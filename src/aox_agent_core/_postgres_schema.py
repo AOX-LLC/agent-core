@@ -530,8 +530,45 @@ def check_connection(session: "Session", schema: str) -> str:
             f"{'both' if is_requester else 'neither'}."
         )
     _check_layout(session, table, requester_role, approver_role)
+    _check_connecting_roles(session, table, as_requester=bool(is_requester))
     refuse_requester_create(session, requester_role, schema)
     return ConnectionSide.REQUESTER if is_requester else ConnectionSide.APPROVER
+
+
+# Every role current_user or session_user can switch to, as in the role check.
+_CONNECTING_ROLES = """
+SELECT m.rolname FROM pg_roles m
+WHERE pg_has_role(current_user, m.oid, 'MEMBER') OR pg_has_role(session_user, m.oid, 'MEMBER')
+ORDER BY m.rolname
+"""
+
+
+def _check_connecting_roles(session: "Session", table: str, *, as_requester: bool) -> None:
+    """Refuse a connection whose own roles hold what its side's role must not.
+
+    _check_layout looks at the two installed roles; this looks at the login and
+    every role it can switch to, which may hold direct grants of their own (an
+    a2 app role made a member of the requester role, say). The guard still
+    refuses such writes; this makes the setup fail loudly first.
+    """
+    for (role,) in session.execute(_CONNECTING_ROLES):
+        if as_requester:
+            rights = session.execute(
+                "SELECT "
+                + " OR ".join("has_column_privilege(?, ?, ?, 'UPDATE')" for _ in DECISION_COLUMNS),
+                tuple(value for column in DECISION_COLUMNS for value in (role, table, column)),
+            )[0][0]
+            what = "update a decision column"
+        else:
+            rights = session.execute("SELECT has_table_privilege(?, ?, 'INSERT')", (role, table))[
+                0
+            ][0]
+            what = "insert approval requests"
+        if rights:
+            raise ConfigError(
+                f"This connection can act as {role}, which can {what} on the approvals "
+                "table. Revoke that grant or connect as a role without it."
+            )
 
 
 def refuse_requester_create(session: "Session", requester_role: str, schema: str) -> None:

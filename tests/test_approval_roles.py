@@ -171,3 +171,22 @@ async def test_a_requester_that_can_create_in_public_is_refused(
         install_postgres_schema(
             pg.owner_url, requester_role=REQUESTER_ROLE, approver_role=APPROVER_ROLE
         )
+
+
+async def test_a_login_with_its_own_decision_grant_is_refused(pg: ControlDatabase) -> None:
+    url = pg.login_role(
+        f"GRANT {REQUESTER_ROLE} TO {{role}}",
+        "GRANT UPDATE (decision, resolved_by) ON agent_core_approvals TO {role}",
+    )
+
+    with pytest.raises(ConfigError, match="can update a decision column"):
+        await queue_on(open_database(url)).side()
+
+
+async def test_an_approver_login_with_its_own_insert_grant_is_refused(pg: ControlDatabase) -> None:
+    url = pg.login_role(
+        f"GRANT {APPROVER_ROLE} TO {{role}}", "GRANT INSERT ON agent_core_approvals TO {role}"
+    )
+
+    with pytest.raises(ConfigError, match="can insert approval requests"):
+        await queue_on(open_database(url)).side()
