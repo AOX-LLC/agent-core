@@ -213,9 +213,9 @@ print(report)
 It is idempotent. Run on an a3 schema it:
 
 - adds the `recorded_at` column to the audit table;
-- replaces the audit insert trigger function. The new one takes the same advisory lock the library takes, requires `seq` to be the head's plus one and `prev_hash` to equal the head's `record_hash` (the genesis zeros when the log is empty), checks the schema version (3) and the shape of `event_id`, `record_hash` and `occurred_at`, checks the `occurred_at` bounds, and sets `db_role` and `recorded_at`. It cannot check `record_hash` itself; `verify()` recomputes it;
+- replaces the audit insert trigger function. The new one takes the same advisory lock the library takes, requires `seq` to be the head's plus one and `prev_hash` to equal the head's `record_hash` (the genesis zeros when the log is empty), checks the schema version (3) and the shape of `event_id`, `record_hash` and `occurred_at`, checks the `occurred_at` bounds, bounds `action`, `actor_id`, `subject_id`, `payload` (8192 bytes, a JSON object) and `run_context` (2048 bytes, a JSON object), and sets `db_role` and `recorded_at`. It cannot check `record_hash` itself; `verify()` recomputes it;
 - adds the `payload_json` column to the approvals table;
-- rewrites the approvals guard, which now covers `payload_json`: it is immutable after insert, and a value that is not a JSON object, or is over 8192 bytes, is refused. The requester and approver roles have no UPDATE on it.
+- rewrites the approvals guard, which now measures a request's lifetime in 168 hours regardless of the writer's time zone, bounds `run_context` (2048 bytes, 16 external ids) and `delegates` (4096 bytes), and covers `payload_json`: it is immutable after insert, and a value that is not a JSON object, or is over 8192 bytes, is refused. The requester and approver roles have no UPDATE on it.
 
 It keeps every row and does not change a grant that is already there. The a3 notes on `outside_layout` and `unaudited_approvals` still apply to the report.
 

@@ -52,7 +52,21 @@ Async storage on a connection pool, batch appends, writes inside a host's Postgr
 - The Postgres guard makes `payload_json` immutable after insert and refuses a value that is not a JSON object or is over 8192 bytes. The requester and approver roles have no UPDATE on it.
 - `recorded_at`, like `db_role`, is guaranteed by the database trigger, not by the chain: a table owner could edit it undetected. On SQLite the library writes it from the writer's clock, so it is not independent there.
 - Nothing purges a stored payload. Count it in retention and deletion plans.
+- The audit insert trigger also bounds the text columns a writing role can fill: `action`, `actor_id` and `subject_id` by the library's own patterns and lengths, `payload` at 8192 bytes and a JSON object, `run_context` at 2048 bytes and a JSON object. The approvals guard measures a request's lifetime in 168 hours, not "7 days", which the writer's session time zone could stretch to 169 hours and make unreadable. `tests/test_untrusted_columns.py` holds the matrix: for every column the requester role can write with plain SQL, a hostile value is refused by the database or survived by every reader.
+- A stored request this library will not read (a lifetime or decision order its model refuses) no longer crashes readers: `list_pending` leaves it out and logs, `get` raises `ApprovalIntegrityError`, `resolve`, `consume` and `cancel` refuse it with an audited `malformed_row` denial, and `expire_due` skips it and logs. A request dated up to five minutes ahead is decided at its own date, not before it. `verify()` reports a record it cannot parse or hash as `AuditIntegrityError`, not a raw exception.
+
 - CI runs Postgres 16 across the Python matrix and Postgres 17 on Python 3.12, in a separate job that is not a required check. Not tested against a real pooler.
+
+### Known limits
+
+Found in review and left for 0.1.0a5:
+
+- Any role that can connect can hold the single, database-wide append lock and stall every writer; the library's own append transactions have no `lock_timeout` yet. Set `idle_in_transaction_session_timeout` on the runtime roles.
+- `summary` (requester) and `reason` (approver) accept control, ANSI and bidi characters, up to 500 characters. A UI or terminal that shows them must neutralize them.
+- The approver role may set any canonical `resolved_at`, even one before the request's `created_at`; the library then refuses to read that request.
+- `verify()` stops at the first record that is malformed or has a wrong hash; its message names the record but, for a malformed one, not the `db_role` column. Tampering after that record is not checked until it is dealt with.
+- The database cannot force an audit event: with plain SQL a role can submit, decide, cancel or consume without one. Only the installer's `unaudited_approvals` scan looks for approvals with no event.
+- A requester can fill the approvals table with rows this library hides or skips; each costs a small check on every listing, and is logged at most once a minute.
 
 ## [0.1.0a3] - 2026-10-03
 
