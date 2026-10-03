@@ -419,7 +419,11 @@ async def test_cancelling_an_append_that_waits_for_the_lock_leaves_the_pool_and_
     record = await asyncio.wait_for(log.append(event(2)), timeout=10)
     assert record.seq == 2
     assert (await log.verify()).seq == 2
-    leftover = pg.superuser_raw("SELECT count(*) FROM pg_locks WHERE locktype = 'advisory'")
+    # pg_locks spans the whole server; another run's advisory locks are not this test's.
+    leftover = pg.superuser_raw(
+        "SELECT count(*) FROM pg_locks WHERE locktype = 'advisory' "
+        "AND database = (SELECT oid FROM pg_database WHERE datname = current_database())"
+    )
     assert leftover == [(0,)]
 
 
