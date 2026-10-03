@@ -266,5 +266,5 @@ async def test_a_row_with_a_bad_hash_names_the_role_that_inserted_it(
     first = await log.append(event(1))
     control_database.requester_raw(raw_insert(2, first.record_hash))
 
-    with pytest.raises(Exception, match="inserted by database role agent_core_requester"):
+    with pytest.raises(Exception, match="db_role column reads agent_core_requester"):
         await log.verify()

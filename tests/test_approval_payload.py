@@ -17,6 +17,7 @@ from aox_agent_core.errors import (
     ApprovalIntegrityError,
     ApprovalNotFoundError,
     ApprovalPayloadRejectedError,
+    NotAuthorizedToResolveError,
 )
 from databases import ControlDatabase, SplitQueue, split_queue
 from test_approvals import APPROVER, PAYLOAD, REQUESTER
@@ -340,3 +341,164 @@ async def test_a_payload_with_a_nul_is_refused_not_crashed_on(
 
     with pytest.raises(ApprovalPayloadRejectedError, match="NUL"):
         await submit(queue, payload={"note": "a\x00b"}, include_payload=True)
+
+
+# Second gatekeeper pass: depth, cost, run contexts and size caps
+
+
+def nested(depth: int) -> str:
+    return '{"a":' + "[" * depth + "]" * depth + "}"
+
+
+async def test_a_payload_nested_too_deeply_is_refused_on_submit(
+    control_database: ControlDatabase,
+) -> None:
+    queue = split_queue(control_database)
+
+    with pytest.raises(ApprovalPayloadRejectedError, match="deeper"):
+        await submit(queue, payload=json.loads(nested(40)), include_payload=True)
+
+
+@pytest.mark.parametrize("depth", [40, 300])
+async def test_a_deeply_nested_stored_payload_with_a_correct_hash_is_hidden(
+    control_database: ControlDatabase, depth: int
+) -> None:
+    if control_database.requester_raw is None:
+        pytest.skip("a plain-SQL requester role exists only on Postgres")
+    queue = split_queue(control_database)
+    honest = await submit(queue, include_payload=True)
+    text = nested(depth)
+    sha = approval_payload_hash(ACTION, json.loads(text))
+    bad_id = uuid4()
+    control_database.requester_raw(raw_with_payload(text, sha=sha, id=f"'{bad_id}'"))
+
+    page = await queue.list_pending(APPROVER)
+
+    assert [r.id for r in page] == [honest.id]
+    assert json.loads(ApprovalRequest.__pydantic_serializer__.to_json(page[0]))  # serializes
+    with pytest.raises(ApprovalIntegrityError):
+        await queue.resolve(bad_id, decision=Decision.APPROVE, principal=APPROVER)
+
+
+async def test_rows_with_a_wrong_hash_cost_little_to_hide(
+    control_database: ControlDatabase,
+) -> None:
+    import time
+
+    if control_database.requester_raw is None:
+        pytest.skip("a plain-SQL requester role exists only on Postgres")
+    queue = split_queue(control_database)
+    honest = await submit(queue, include_payload=True)
+    body = json.dumps({f"k{i}": f"value {i}" for i in range(150)})
+    control_database.requester_raw("; ".join(raw_with_payload(body) for _ in range(300)))
+
+    started = time.monotonic()
+    page = await queue.list_pending(APPROVER)
+
+    assert [r.id for r in page] == [honest.id]
+    assert time.monotonic() - started < 3
+
+
+async def test_hidden_rows_are_reported_in_the_log_once_in_a_while(
+    control_database: ControlDatabase, caplog: pytest.LogCaptureFixture
+) -> None:
+    if control_database.requester_raw is None:
+        pytest.skip("a plain-SQL requester role exists only on Postgres")
+    queue = split_queue(control_database)
+    await submit(queue)
+    control_database.requester_raw(raw_with_payload('{"a": 1}'))
+
+    await queue.list_pending(APPROVER)
+    await queue.list_pending(APPROVER)
+
+    assert caplog.text.count("left out of a listing") == 1
+
+
+def bad_context() -> str:
+    return '\'{"run_id":"r1","external_ids":{"api_key":"abc"}}\''
+
+
+async def test_a_stored_run_context_that_a_submit_would_refuse_cannot_block_a_decision(
+    control_database: ControlDatabase,
+) -> None:
+    if control_database.requester_raw is None:
+        pytest.skip("a plain-SQL requester role exists only on Postgres")
+    queue = split_queue(control_database)
+    bad_id = uuid4()
+    control_database.requester_raw(raw_request(id=f"'{bad_id}'", run_context=bad_context()))
+
+    assert [r.id for r in await queue.list_pending(APPROVER)] == [bad_id]
+    decided = await queue.resolve(bad_id, decision=Decision.REJECT, principal=APPROVER)
+
+    assert decided.status is ApprovalStatus.REJECTED
+    log = SQLAuditLog(control_database.database)
+    resolved = [r async for r in log.iter_records() if r.action == "approval.resolved"]
+    assert [(r.run_context, r.payload.get("run_context_dropped")) for r in resolved] == [
+        (None, "true")
+    ]
+
+
+async def test_a_refusal_for_such_a_request_is_still_audited(
+    control_database: ControlDatabase,
+) -> None:
+    if control_database.requester_raw is None:
+        pytest.skip("a plain-SQL requester role exists only on Postgres")
+    queue = split_queue(control_database)
+    bad_id = uuid4()
+    control_database.requester_raw(raw_request(id=f"'{bad_id}'", run_context=bad_context()))
+
+    with pytest.raises(NotAuthorizedToResolveError):
+        await queue.resolve(bad_id, decision=Decision.APPROVE, principal=REQUESTER)
+
+    assert ("approval.resolve_denied", "not_human") in await actions(control_database)
+
+
+async def test_such_a_run_context_does_not_stop_the_expiry_sweep(
+    control_database: ControlDatabase,
+) -> None:
+    if control_database.requester_raw is None:
+        pytest.skip("a plain-SQL requester role exists only on Postgres")
+    queue = split_queue(control_database)
+    now = datetime.now(UTC)
+    due = {
+        "created_at": f"'{canonical_timestamp(now - timedelta(hours=2))}'",
+        "expires_at": f"'{canonical_timestamp(now - timedelta(hours=1))}'",
+    }
+    await submit(queue)
+    control_database.requester_raw(raw_request(run_context=bad_context(), **due))
+    control_database.requester_raw(raw_request(**due))
+
+    assert await queue.expire_due(principal=REQUESTER) == 2
+
+
+@pytest.mark.parametrize(
+    ("column", "value"),
+    [
+        ("run_context", '\'{"run_id":"r1","external_ids":{"a":"' + "x" * 2_100 + "\"}}'"),
+        (
+            "run_context",
+            '\'{"run_id":"r1","external_ids":{'
+            + ",".join(f'"n{i}":"v"' for i in range(17))
+            + "}}'",
+        ),
+        ("delegates", "'[" + ",".join(['"' + "d" * 120 + '"'] * 16) + " " * 3_000 + "]'"),
+    ],
+    ids=["big-context", "17-external-ids", "padded-delegates"],
+)
+async def test_the_database_bounds_the_context_and_delegates_a_requester_writes(
+    control_database: ControlDatabase, column: str, value: str
+) -> None:
+    if control_database.requester_raw is None:
+        pytest.skip("the guard trigger exists only on Postgres")
+    await submit(split_queue(control_database))
+
+    with pytest.raises(psycopg.Error):
+        control_database.requester_raw(raw_request(**{column: value}))
+
+
+async def test_a_backslash_u0000_in_text_is_not_a_nul(control_database: ControlDatabase) -> None:
+    queue = split_queue(control_database)
+
+    request = await submit(queue, payload={"path": "C:\\u0000\\file"}, include_payload=True)
+
+    assert (await queue.get(request.id)).payload == {"path": "C:\\u0000\\file"}

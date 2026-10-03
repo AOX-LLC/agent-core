@@ -485,3 +485,71 @@ async def test_a_host_connection_or_pool_with_a_dict_row_factory_works(
         assert (await log.verify()).seq == 2
     finally:
         await dict_pool.close()
+
+
+class PlainPool:
+    """A pool wrapper whose connection() takes nothing, exactly as ConnectionSource says."""
+
+    def __init__(self, pool: psycopg_pool.AsyncConnectionPool) -> None:
+        self._pool = pool
+
+    def connection(self) -> Any:
+        return self._pool.connection()
+
+
+async def test_a_pool_whose_connection_takes_no_arguments_still_audits_a_refusal(
+    pg: ControlDatabase, pool: psycopg_pool.AsyncConnectionPool
+) -> None:
+    database = PostgresDatabase.from_pool(PlainPool(pool))
+    log = SQLAuditLog(database, schema=pg.schema)
+    queue = queue_on(database, pg, log)
+    request = await submit(queue)
+
+    with pytest.raises(NotTheRequesterError):  # not a TypeError about timeout=
+        async with pool.connection() as connection, connection.transaction():
+            await queue.consume(
+                request.id,
+                action="crm.update_contact",
+                payload=PAYLOAD,
+                principal=STRANGER,
+                connection=connection,
+            )
+
+    assert await audit_actions(log) == ["approval.requested", "approval.consume_denied"]
+
+
+async def test_a_refusal_that_cannot_be_audited_anywhere_says_so_on_the_error_and_in_the_log(
+    pg: ControlDatabase,
+    pool: psycopg_pool.AsyncConnectionPool,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    import psycopg
+
+    database = PostgresDatabase.from_pool(pool)
+    log = SQLAuditLog(database, schema=pg.schema)
+    queue = queue_on(database, pg, log)
+    request = await submit(queue)
+
+    async def fail(*args: Any, **kwargs: Any) -> Any:
+        raise psycopg.OperationalError("the audit write failed")
+
+    monkeypatch.setattr(SQLAuditLog, "append_many_in", fail)
+    caught: NotTheRequesterError | None = None
+    async with pool.connection() as connection, connection.transaction():
+        try:
+            await queue.consume(
+                request.id,
+                action="crm.update_contact",
+                payload=PAYLOAD,
+                principal=STRANGER,
+                connection=connection,
+            )
+        except NotTheRequesterError as error:
+            caught = error
+
+    assert caught is not None
+    assert any("was not audited" in note for note in caught.__notes__)
+    assert "could not be audited at all" in caplog.text
+    assert "approval.consume_denied" in caplog.text
+    assert str(request.id) in caplog.text

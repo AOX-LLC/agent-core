@@ -314,7 +314,8 @@ BEGIN
            OR NOT_CANONICAL(NEW.expires_at) THEN
             RAISE EXCEPTION 'a new approval request has a field of the wrong shape';
         END IF;
-        IF jsonb_typeof(NEW.delegates::jsonb) <> 'array'
+        IF octet_length(NEW.delegates) > 4096
+           OR jsonb_typeof(NEW.delegates::jsonb) <> 'array'
            OR jsonb_array_length(NEW.delegates::jsonb) > 16
            OR EXISTS (
                SELECT 1 FROM jsonb_array_elements(NEW.delegates::jsonb) AS delegate
@@ -323,6 +324,9 @@ BEGIN
             RAISE EXCEPTION 'delegates must be at most 16 principal ids';
         END IF;
         IF NEW.run_context IS NOT NULL THEN
+            IF octet_length(NEW.run_context) > 2048 THEN
+                RAISE EXCEPTION 'a run context is at most 2048 bytes';
+            END IF;
             run_context := NEW.run_context::jsonb;
             IF jsonb_typeof(run_context) <> 'object'
                OR EXISTS (
@@ -332,6 +336,8 @@ BEGIN
                OR jsonb_typeof(run_context -> 'run_id') IS DISTINCT FROM 'string'
                OR run_context ->> 'run_id' !~ opaque_shape
                OR jsonb_typeof(COALESCE(run_context -> 'external_ids', '{}'::jsonb)) <> 'object'
+               OR (SELECT count(*) FROM jsonb_object_keys(
+                       COALESCE(run_context -> 'external_ids', '{}'::jsonb))) > 16
                OR EXISTS (
                    SELECT 1
                    FROM jsonb_each(COALESCE(run_context -> 'external_ids', '{}'::jsonb)) AS id

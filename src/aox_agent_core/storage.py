@@ -21,7 +21,7 @@ import weakref
 from abc import ABC, abstractmethod
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import AbstractAsyncContextManager, asynccontextmanager
+from contextlib import AbstractAsyncContextManager, AsyncExitStack, asynccontextmanager
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
@@ -405,17 +405,19 @@ class PostgresDatabase(Database):
         self, *, write: bool, acquire_timeout: float | None
     ) -> "AsyncIterator[Session]":
         source = await self._source()
-        checkout = (
-            source.connection()
-            if acquire_timeout is None
-            else source.connection(timeout=acquire_timeout)  # type: ignore[call-arg]
-        )
-        async with (
-            checkout as connection,
-            connection.transaction(),
+        async with AsyncExitStack() as stack:
+            checkout = source.connection()
+            if acquire_timeout is None:
+                connection = await stack.enter_async_context(checkout)
+            else:
+                # asyncio's own timeout, so any source works, whatever its connection() takes.
+                async with asyncio.timeout(acquire_timeout):
+                    connection = await stack.enter_async_context(checkout)
+            await stack.enter_async_context(connection.transaction())
             # Plain tuples, whatever row factory the host gave its pool or connection.
-            connection.cursor(row_factory=self._psycopg.rows.tuple_row) as cursor,
-        ):
+            cursor = await stack.enter_async_context(
+                connection.cursor(row_factory=self._psycopg.rows.tuple_row)
+            )
             # Everything below is per transaction, never per session: a pooler in
             # transaction mode hands this backend connection to other clients
             # between transactions, and their session settings reach us too.

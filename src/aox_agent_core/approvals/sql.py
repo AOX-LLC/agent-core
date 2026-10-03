@@ -6,15 +6,17 @@ and denied attempt writes an audit event; when the queue and its audit log share
 a Database, in the same transaction as the change.
 """
 
+import asyncio
 import json
 import logging
+import time
 from collections.abc import Awaitable, Callable, Collection, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from typing import Any, Final, TypeVar
 from uuid import UUID, uuid4
 
-from pydantic import JsonValue
+from pydantic import JsonValue, ValidationError
 
 from aox_agent_core import _postgres_schema as layout
 from aox_agent_core._canonical import canonical_json, sha256_of
@@ -33,7 +35,7 @@ from aox_agent_core.approvals.types import (
 from aox_agent_core.audit.chain import canonical_timestamp
 from aox_agent_core.audit.log import AuditLog
 from aox_agent_core.audit.sql import SQLAuditLog
-from aox_agent_core.audit.types import AuditEvent, check_payload
+from aox_agent_core.audit.types import AuditEvent, check_payload, exceeds_depth
 from aox_agent_core.context import RunContext
 from aox_agent_core.errors import (
     ApprovalAlreadyResolvedError,
@@ -44,6 +46,7 @@ from aox_agent_core.errors import (
     ApprovalNotGrantedError,
     ApprovalPayloadMismatchError,
     ApprovalPayloadRejectedError,
+    AuditPayloadRejectedError,
     ConfigError,
     NotAuthorizedToResolveError,
     NotTheRequesterError,
@@ -112,6 +115,8 @@ PAYLOAD_COLUMN: Final = "payload_json"
 DENIAL_LOCK_TIMEOUT: Final = "2s"
 # Seconds an independent audit write waits for a pooled connection before falling back.
 DENIAL_ACQUIRE_TIMEOUT: Final = 2.0
+# At most one warning this often about requests left out of a listing.
+HIDDEN_WARNING_INTERVAL: Final = 60.0
 _LOG = logging.getLogger(__name__)
 
 _DENIAL_ERRORS: Final[Mapping[DenialReason, type[ApprovalError]]] = {
@@ -174,6 +179,7 @@ class SQLApprovalQueue:
         self._clock = clock if clock is not None else _utc_now
         self._schema = self._table.schema or layout.DEFAULT_SCHEMA
         self._side: ApprovalSide | None = None
+        self._last_hidden_warning = float("-inf")
 
     async def side(self, *, connection: Any = None) -> ApprovalSide:
         """Which side this queue's connection acts for, checking the setup first.
@@ -308,7 +314,7 @@ class SQLApprovalQueue:
             raise ApprovalPayloadRejectedError(
                 f"The payload cannot be stored: more than {layout.MAX_STORED_PAYLOAD_BYTES} bytes."
             )
-        if b"\\u0000" in canonical_json(checked):
+        if _contains_nul(checked):
             # Postgres text cannot hold NUL; refuse it here rather than at the insert.
             raise ApprovalPayloadRejectedError("The payload cannot be stored: it contains NUL.")
         findings = self._scrubber.find_secrets({"payload": checked})
@@ -371,8 +377,20 @@ class SQLApprovalQueue:
         page_size = limit if uses_default_policy else max(limit, PENDING_PAGE_SIZE)
 
         eligible: list[ApprovalRequest] = []
-        resume_after = await self.get(after, connection=connection) if after is not None else None
         scrubber = self._scrubber
+        hidden: list[UUID] = []
+
+        async def read_cursor(session: Session) -> ApprovalRequest | None:
+            await self._prepare(session)
+            # Only created_at and id are needed, so a row that fails the payload check
+            # here does not stop pagination.
+            return await _load(session, self._table, after) if after is not None else None
+
+        resume_after: ApprovalRequest | None = None
+        if after is not None:
+            resume_after = await self._run(read_cursor, write=False, connection=connection)
+            if resume_after is None:
+                raise ApprovalNotFoundError(f"No approval request {after}.")
 
         async def read_pages(session: Session) -> bool:
             """Read pages until `limit` requests pass; return whether more pages remain."""
@@ -388,6 +406,7 @@ class SQLApprovalQueue:
                     limit=page_size,
                     scrubber=scrubber,
                 )
+                hidden.extend(cursor.id for cursor, request in page if request is None)
                 eligible.extend(
                     request
                     for _, request in page
@@ -406,7 +425,26 @@ class SQLApprovalQueue:
         # its own short transaction.
         while await self._run(read_pages, write=False, connection=connection):
             pass
+        self._warn_hidden(hidden)
         return eligible[:limit]
+
+    def _warn_hidden(self, request_ids: list[UUID]) -> None:
+        """Say, at most once a minute, that requests were left out of a listing.
+
+        Hiding is silent to the approver by design; this is the signal for whoever
+        runs the system that something wrote rows the checks refuse.
+        """
+        now = time.monotonic()
+        if not request_ids or now - self._last_hidden_warning < HIDDEN_WARNING_INTERVAL:
+            return
+        self._last_hidden_warning = now
+        _LOG.warning(
+            "%d pending approval request(s) were left out of a listing because their stored "
+            "payload failed the checks (first id %s). Someone with INSERT on "
+            "the approvals table wrote them.",
+            len(request_ids),
+            request_ids[0],
+        )
 
     async def resolve(
         self,
@@ -482,7 +520,8 @@ class SQLApprovalQueue:
                     "resolved_by": principal.id,
                     "resolved_at": now,
                     "reason": reason,
-                }
+                },
+                context={STORED_RECORD: True},
             )
             changed = await session.execute_count(
                 f"UPDATE {self._table.sql} SET status = ?, decision = ?, resolved_by = ?, "
@@ -514,7 +553,7 @@ class SQLApprovalQueue:
             )
             return _Outcome(request=resolved, events=[event])
 
-        return await self._write(decide, connection=connection)
+        return await self._write(decide, connection=connection, stored_context=True)
 
     async def consume(
         self,
@@ -564,7 +603,8 @@ class SQLApprovalQueue:
                 )
 
             consumed = ApprovalRequest.model_validate(
-                {**request.model_dump(), "status": ApprovalStatus.CONSUMED, "consumed_at": now}
+                {**request.model_dump(), "status": ApprovalStatus.CONSUMED, "consumed_at": now},
+                context={STORED_RECORD: True},
             )
             changed = await session.execute_count(
                 f"UPDATE {self._table.sql} SET status = ?, consumed_at = ? "
@@ -590,7 +630,7 @@ class SQLApprovalQueue:
             event = _event("approval.consumed", principal.id, consumed, event_context)
             return _Outcome(request=consumed, events=[event])
 
-        return await self._write(use, connection=connection)
+        return await self._write(use, connection=connection, stored_context=True)
 
     async def cancel(
         self,
@@ -653,7 +693,7 @@ class SQLApprovalQueue:
             event = _event("approval.cancelled", principal.id, cancelled, event_context, **details)
             return _Outcome(request=cancelled, events=[event])
 
-        return await self._write(withdraw, connection=connection)
+        return await self._write(withdraw, connection=connection, stored_context=True)
 
     async def expire_due(
         self,
@@ -696,16 +736,22 @@ class SQLApprovalQueue:
 
         total = 0
         while True:
-            outcome = await self._write_outcome(sweep, connection=connection)
+            outcome = await self._write_outcome(sweep, connection=connection, stored_context=True)
             total += outcome.expired
             if not outcome.batch_full:
                 return total
 
     async def _write(
-        self, work: Callable[[Session], Awaitable[_Outcome]], *, connection: Any = None
+        self,
+        work: Callable[[Session], Awaitable[_Outcome]],
+        *,
+        connection: Any = None,
+        stored_context: bool = False,
     ) -> ApprovalRequest:
         """Run `work` as _write_outcome does, then return its request or raise its error."""
-        outcome = await self._write_outcome(work, connection=connection)
+        outcome = await self._write_outcome(
+            work, connection=connection, stored_context=stored_context
+        )
         if outcome.error is not None:
             raise outcome.error
         if outcome.request is None:
@@ -713,7 +759,11 @@ class SQLApprovalQueue:
         return outcome.request
 
     async def _write_outcome(
-        self, work: Callable[[Session], Awaitable[_Outcome]], *, connection: Any = None
+        self,
+        work: Callable[[Session], Awaitable[_Outcome]],
+        *,
+        connection: Any = None,
+        stored_context: bool = False,
     ) -> _Outcome:
         """Run `work` in a write transaction and audit its events.
 
@@ -744,14 +794,22 @@ class SQLApprovalQueue:
             # so a host rollback would leave records of things that never happened.
             raise ConfigError(
                 "connection= needs an audit log that shares this queue's database: pass the "
-                "same Database object to the SQLAuditLog and the queue."
+                "same Database object to the SQLAuditLog and the queue, or one opened from "
+                "the same connection settings."
             )
 
         async def in_transaction(session: Session) -> _Outcome:
             outcome = await work(session)
             # Checked before the commit, so an event the log would refuse stops the change.
             if checked_log is not None:
-                outcome.events = [checked_log.checked_event(event) for event in outcome.events]
+                # Events about a stored request may carry its context, which can fail
+                # today's rules; a new request's own context must pass them.
+                outcome.events = [
+                    _checked_or_without_context(checked_log, event)
+                    if stored_context
+                    else checked_log.checked_event(event)
+                    for event in outcome.events
+                ]
             keep_apart = connection is not None and outcome.error is not None
             if shares_database and checked_log is not None and not keep_apart:
                 for event in outcome.events:
@@ -763,13 +821,18 @@ class SQLApprovalQueue:
             for event in outcome.events:
                 await audit_log.append(event)
         elif connection is not None and outcome.error is not None and checked_log is not None:
-            await self._record_refusal(checked_log, outcome.events, connection)
+            await self._record_refusal(checked_log, outcome, connection)
         return outcome
 
-    async def _record_refusal(
-        self, log: SQLAuditLog, events: list[AuditEvent], connection: Any
-    ) -> None:
-        """Write a refusal's events apart from the host's transaction, or fall back to it."""
+    async def _record_refusal(self, log: SQLAuditLog, outcome: _Outcome, connection: Any) -> None:
+        """Write a refusal's events apart from the host's transaction, or fall back to it.
+
+        If neither write succeeds the refusal is still raised to the caller, with a note
+        on it saying it went unaudited, and the details are logged: the host's commit
+        will not report it.
+        """
+        events = outcome.events
+        described = _describe(events)
 
         async def apart(session: Session) -> list[Any]:
             if session.dialect is Dialect.POSTGRES:
@@ -779,23 +842,83 @@ class SQLApprovalQueue:
             return await log.append_many_in(session, events)
 
         async def inside(session: Session) -> list[Any]:
-            return await log.append_many_in(session, events)
+            if session.dialect is not Dialect.POSTGRES:
+                return await log.append_many_in(session, events)
+            # The same bound, for this savepoint only: put back before the host goes on.
+            previous = (await session.execute("SELECT current_setting('lock_timeout')"))[0][0]
+            await session.execute(f"SET LOCAL lock_timeout = '{DENIAL_LOCK_TIMEOUT}'")
+            records = await log.append_many_in(session, events)
+            await session.execute("SELECT set_config('lock_timeout', ?, true)", (previous,))
+            return records
 
+        failures: tuple[type[Exception], ...] = (*driver_errors(), TimeoutError)
         try:
             await log.database.run(apart, write=True, acquire_timeout=DENIAL_ACQUIRE_TIMEOUT)
-        except driver_errors() as error:
+        except failures as failure:
             # Not silent: the refusal now lasts only if the host commits.
             _LOG.warning(
-                "A refusal could not be audited apart from the host's transaction (%s); "
-                "it is written in the host's transaction and is lost if that rolls back.",
-                type(error).__name__,
+                "A refusal could not be audited apart from the host's transaction (%s: %s); "
+                "it is written in the host's transaction and is lost if that rolls back. [%s]",
+                type(failure).__name__,
+                failure,
+                described,
             )
             try:
                 await self.database.run_on(connection, inside)
-            except driver_errors():
-                # The host's connection is unusable too. The refusal is still raised to
-                # the caller, and the host's own failure will surface when it commits.
-                _LOG.error("A refusal could not be audited at all.")
+            except failures as second:
+                _LOG.error(
+                    "A refusal could not be audited at all (%s: %s). [%s]",
+                    type(second).__name__,
+                    second,
+                    described,
+                )
+                if outcome.error is not None:
+                    outcome.error.add_note(
+                        "This refusal was not audited: neither the separate write nor the "
+                        "write in the host's transaction succeeded."
+                    )
+
+
+def _checked_or_without_context(log: SQLAuditLog, event: AuditEvent) -> AuditEvent:
+    """The event as the log accepts it. A run context stored with a request may fail the
+    rules in force now (it passed the ones in force when it was written, or a requester
+    wrote it with plain SQL): such an event is written without it, and says so, rather
+    than blocking the decision, the refusal or the expiry sweep it describes."""
+    try:
+        return log.checked_event(event)
+    except AuditPayloadRejectedError:
+        if event.context is None:
+            raise
+        stripped = event.model_copy(
+            update={"context": None, "payload": {**event.payload, "run_context_dropped": "true"}}
+        )
+        return log.checked_event(stripped)
+
+
+def _contains_nul(value: JsonValue) -> bool:
+    """True when any key or string in `value` holds a NUL character."""
+    stack: list[JsonValue] = [value]
+    while stack:
+        item = stack.pop()
+        if isinstance(item, str):
+            if "\x00" in item:
+                return True
+        elif isinstance(item, dict):
+            if any("\x00" in key for key in item):
+                return True
+            stack.extend(item.values())
+        elif isinstance(item, list):
+            stack.extend(item)
+    return False
+
+
+def _describe(events: list[AuditEvent]) -> str:
+    """What events say happened, for a log line: identifiers and reasons, never payloads."""
+    return "; ".join(
+        f"{event.action} subject={event.subject_id} actor={event.actor_id} "
+        f"reason={event.payload.get('reason')}"
+        for event in events
+    )
 
 
 def _consume_refusal(
@@ -908,13 +1031,27 @@ def _event(
     context: RunContext | None,
     **details: str,
 ) -> AuditEvent:
-    return AuditEvent(
-        action=action,
-        actor_id=actor_id,
-        subject_id=str(request.id),
-        payload={"approval_action": request.action, **details},
-        context=context,
-    )
+    payload: dict[str, JsonValue] = {"approval_action": request.action, **details}
+    try:
+        return AuditEvent(
+            action=action,
+            actor_id=actor_id,
+            subject_id=str(request.id),
+            payload=payload,
+            context=context,
+        )
+    except ValidationError:
+        # A context stored with the request that the rules in force now refuse (or that a
+        # requester wrote with plain SQL): the event is written without it, and says so.
+        if context is None:
+            raise
+        return AuditEvent(
+            action=action,
+            actor_id=actor_id,
+            subject_id=str(request.id),
+            payload={**payload, "run_context_dropped": "true"},
+            context=None,
+        )
 
 
 def _missing_event(
@@ -1001,11 +1138,15 @@ def _with_payload(
         payload = json.loads(payload_text)
         if not isinstance(payload, dict):
             raise ValueError("a stored payload is a JSON object")
+        # Cheapest checks first: whoever can insert rows can make a reader do this
+        # for every one of them, on every listing.
+        if exceeds_depth(payload):
+            raise ValueError("a stored payload nests too deeply")
+        if approval_payload_hash(request.action, payload) != request.payload_sha256:
+            raise ValueError("a stored payload does not match payload_sha256")
         check_payload(payload, max_bytes=layout.MAX_STORED_PAYLOAD_BYTES)
         if scrubber.find_secrets({"payload": payload}):
             raise ValueError("a stored payload holds a secret")
-        if approval_payload_hash(request.action, payload) != request.payload_sha256:
-            raise ValueError("a stored payload does not match payload_sha256")
     except (ValueError, TypeError, RecursionError) as error:
         raise ApprovalIntegrityError(
             f"The payload stored with request {request.id} is not one its payload_sha256 binds."
@@ -1052,6 +1193,14 @@ async def _load_pending_page(
         "ORDER BY created_at, id LIMIT ?",
         (*parameters, limit),
     )
+    # Checking a page is CPU work that the requester role can multiply, so it runs off
+    # the event loop.
+    return await asyncio.to_thread(_verify_rows, rows, scrubber)
+
+
+def _verify_rows(
+    rows: list[tuple[Any, ...]], scrubber: Scrubber
+) -> list[tuple[ApprovalRequest, ApprovalRequest | None]]:
     page: list[tuple[ApprovalRequest, ApprovalRequest | None]] = []
     for row in rows:
         request, payload_text = _parse_row(row)
@@ -1093,7 +1242,13 @@ def _row_values(request: ApprovalRequest) -> tuple[Any, ...]:
 
 
 def _parse_row(row: tuple[Any, ...]) -> tuple[ApprovalRequest, str | None]:
-    """The request without its payload, and the stored payload text, unparsed."""
+    """The request without its payload, and the stored payload text, unparsed.
+
+    The run context is read back structurally only: it was checked when written, and a
+    rule added later must not make a stored request unreadable. Whatever writes
+    audit events from it copes with a context the current rules refuse
+    (_write_outcome drops it from the event).
+    """
     # NULL columns are dropped so the model's defaults apply.
     names = [name.strip() for name in _COLUMNS.split(",")]
     fields = {name: value for name, value in zip(names, row, strict=True) if value is not None}

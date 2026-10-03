@@ -2,6 +2,7 @@
 
 import json
 import re
+from collections.abc import Iterable
 from datetime import timedelta
 from typing import Annotated, Final, Literal
 from uuid import UUID
@@ -21,6 +22,8 @@ MAX_PAYLOAD_BYTES = 8_192
 # How far a caller-supplied occurred_at may lie from the database's clock.
 OCCURRED_AT_MAX_FUTURE: Final = timedelta(minutes=5)
 OCCURRED_AT_MAX_PAST: Final = timedelta(hours=24)
+# How deeply containers may nest in a payload. A hostile value must not recurse the reader.
+MAX_PAYLOAD_DEPTH: Final = 32
 MAX_SAFE_INTEGER: Final = 2**53 - 1
 
 # A payload key is rejected when, lowercased with everything but letters and digits
@@ -140,6 +143,8 @@ def check_payload(
     scan strings for secrets; the audit log and the approval queue do, with their
     scrubber.
     """
+    if exceeds_depth(payload):
+        raise ValueError(f"payload nests deeper than {MAX_PAYLOAD_DEPTH} levels")
     forbidden = sorted(_forbidden_keys(payload))
     if forbidden:
         raise ValueError(f"payload has forbidden keys: {', '.join(forbidden)}")
@@ -160,6 +165,27 @@ def check_payload(
     if size > max_bytes:
         raise ValueError(f"payload is {size} bytes; the limit is {max_bytes}")
     return payload
+
+
+def exceeds_depth(value: JsonValue, limit: int = MAX_PAYLOAD_DEPTH) -> bool:
+    """True when objects and arrays nest more than `limit` levels deep.
+
+    Iterative, so a value built to be deeper than Python can recurse is refused
+    without being recursed into.
+    """
+    stack: list[tuple[JsonValue, int]] = [(value, 1)]
+    while stack:
+        item, depth = stack.pop()
+        if isinstance(item, dict):
+            children: Iterable[JsonValue] = item.values()
+        elif isinstance(item, list):
+            children = item
+        else:
+            continue
+        if depth > limit:
+            return True
+        stack.extend((child, depth + 1) for child in children)
+    return False
 
 
 def _forbidden_keys(value: JsonValue) -> set[str]:
