@@ -857,19 +857,20 @@ class SQLApprovalQueue:
         except failures as failure:
             # Not silent: the refusal now lasts only if the host commits.
             _LOG.warning(
-                "A refusal could not be audited apart from the host's transaction (%s: %s); "
-                "it is written in the host's transaction and is lost if that rolls back. [%s]",
+                "A refusal could not be audited apart from the host's transaction (%s, "
+                "sqlstate %s); it is written in the host's transaction and is lost if that "
+                "rolls back. [%s]",
                 type(failure).__name__,
-                failure,
+                _sqlstate(failure),
                 described,
             )
             try:
                 await self.database.run_on(connection, inside)
             except failures as second:
                 _LOG.error(
-                    "A refusal could not be audited at all (%s: %s). [%s]",
+                    "A refusal could not be audited at all (%s, sqlstate %s). [%s]",
                     type(second).__name__,
-                    second,
+                    _sqlstate(second),
                     described,
                 )
                 if outcome.error is not None:
@@ -910,6 +911,12 @@ def _contains_nul(value: JsonValue) -> bool:
         elif isinstance(item, list):
             stack.extend(item)
     return False
+
+
+def _sqlstate(error: BaseException) -> str | None:
+    """The SQLSTATE of a driver error, for logs: its message can quote row values."""
+    state = getattr(error, "sqlstate", None)
+    return state if isinstance(state, str) else None
 
 
 def _describe(events: list[AuditEvent]) -> str:
