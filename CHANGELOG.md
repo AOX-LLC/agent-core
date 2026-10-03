@@ -8,6 +8,50 @@ Pre-releases are spelled the PEP 440 way, so tags look like `v0.1.0a1`.
 
 ## [Unreleased]
 
+## [0.1.0a7] - 2026-10-03
+
+Opt-in binding of `resolved_by` to the deciding database login, the login on every audit row, `wait_for_decision` and `verify_report`. One operator reinstall: run `install_postgres_schema` as the owner role again (see docs/upgrading.md), for every deployment, bound or not. Upgrade from 0.1.0a6; from 0.1.0a4 or earlier go through docs/upgrading.md.
+
+### Changed (breaking)
+
+- The approvals guard is revision 7 (`-- agent-core guard revision 7`) and the audit insert trigger revision 6. A connection refuses guard revision 6 and trigger revision 5 with a `ConfigError` that says to run `install_postgres_schema` from 0.1.0a7 as the owner, before anything is written.
+- The audit schema version is 4. A new record carries `schema_version` 4 and the insert trigger requires it; records written at 2 and 3 still verify. The hash covers the same fields as before, so no chain is rehashed.
+- The Postgres schema gains the audit column `db_login` and, always, the login mapping table `agent_core_approver_logins` with the function `agent_core_bound_principal()` (see Added). On SQLite the audit column is added in place on first use.
+
+### Added
+
+- `AuditRecord.db_login`: the login a connection authenticated as, `session_user` on Postgres. The insert trigger sets it whatever the writer supplied, outside the hash, next to `db_role`, which stays `current_user`. `SET ROLE` changes `db_role` and never `db_login`, so a row names the real login after a role switch. None on SQLite and on records written before 0.1.0a7.
+- Opt-in login binding. `install_postgres_schema(..., bind_resolved_by=None)`: `True` makes the guard refuse a decision to approved or rejected whose `resolved_by` is not the principal mapped to the deciding login; `False` turns it off; `None`, the default, keeps the installed setting (off in a new install), so a reinstall never switches it off by accident. It is off by default because a host whose approvers share one login, or a pooler login shared by many users, cannot use it.
+  - **The identity judged is `session_user`**, the login that authenticated, not `current_user`. A member who logs in as themselves and then runs `SET ROLE` to another approver's login, or to the approver group role, is still judged as themselves and can record only their own mapped principal. Only a superuser can change `session_user`, and the guard already refuses superusers.
+  - `agent_core_approver_logins(login, login_oid, principal, mapped_at, removed_at)`: one login per principal, unique both ways. Rows are never deleted (a trigger refuses DELETE and TRUNCATE); a mapping ends by setting `removed_at`, once. Both unique constraints cover removed rows, so a login or principal is never reused. `login_oid` is the role's OID when mapped, so a role dropped and created again under the same name inherits nothing, and a rename cannot move a mapping. Only the owner writes it: neither runtime role is granted anything on it, and the guard reads it through `agent_core_bound_principal()`, a SECURITY DEFINER function with a pinned `search_path` that is executable by the approver role only and returns only the connecting login's own principal.
+  - `bind_approver_login(owner_url, *, login, principal, schema="public")` and `unbind_approver_login(owner_url, *, login, schema="public")`, run as the owner. A login must be a login role, not a superuser, a member of the approver role and not of the requester role.
+  - `InstallReport.login_binding` and `InstallReport.unmapped_logins`: login roles that are members of the approver role with no active mapping (with binding on, they cannot decide).
+  - `SQLApprovalQueue` refuses to start when binding is on and the mapping table, the function or the table's triggers are missing, when either runtime role (or a role the connection can switch to) can write the table, or, on the approver side, when the connecting login has no mapping. `resolve` checks `principal.id` against the mapped principal first and raises `NotAuthorizedToResolveError`, audited as `approval.resolve_denied` with the new `DenialReason.LOGIN_BINDING` (`"login_binding"`). The guard enforces the rule for plain SQL too. The requester role still has no route to approved.
+- `wait_for_decision(queue, request_id, *, timeout, poll_interval=1 s, max_poll_interval=30 s)`, importable from `aox_agent_core.approvals`, and `SyncApprovalQueue.wait_for_decision`. A function over any `ApprovalQueue` (it only calls `get`), so a host's own queue needs nothing new. The first read is immediate; then the pause starts at `poll_interval` and roughly doubles after each read, with jitter (0.75 to 1.25 times), up to `max_poll_interval` and never beyond the time left, so a 72 hour wait does not poll every second. It returns the request as soon as its status is not pending (a lapsed request reads as expired). `ApprovalWaitTimeoutError`, carrying `request_id` and `last`, on timeout. No `connection=`; nothing is held between reads.
+- `SQLAuditLog.verify_report(*, expected_head=None, max_problems=1000) -> VerifyReport`: walks the whole chain and reports every malformed, missing, mislinked, altered or unanchored record (`VerifyProblem.kind` is `malformed`, `seq`, `link`, `hash` or `anchor`), continuing from a bad record's stored hash so one problem is reported once. It stops at `max_problems` and sets `truncated`. `verify()` is unchanged and still raises at the first problem. It is a method of `SQLAuditLog`, not of the `AuditLog` protocol or `SyncAuditLog`.
+
+### Security
+
+- A login can no longer record someone else's `resolved_by` when binding is on, by the library or by plain SQL, including after `SET ROLE`; tests run that through the guard with real roles. Every audit row names the real login.
+
+### Known limits
+
+- Binding covers `resolved_by` only. The audit event's `actor_id` is still what the library was told; read `db_login` next to it.
+- The owner role and superusers are trusted: they can edit the mapping table's triggers and rows. The unique constraints stop the library and a runtime role from reusing a login, not an owner who drops them.
+- A role OID can in theory come round again after the cluster's OID counter wraps; a mapping then follows the name and OID together, and a recreated role with the same name and OID is not told apart.
+- A login that is renamed stops matching its mapping (safe: refused), and a removed mapping's login name must never be reused: use a new role name and a new principal id.
+- Binding was tested on Postgres 16 with roles in one cluster, not with a pooler or a host whose approvers share a login.
+- Everything still listed under Known limits in 0.1.0a6 and 0.1.0a5 that this section does not say is fixed: the test-isolation limit (roles are cluster-wide), the lock-order race in a host's transaction, the database cannot force an audit event, and the per-listing cost of requests the library hides.
+
+### Planned work, after 0.1.0
+
+Moved out of this release for scope, not because they were found wanting; none of them ships here:
+
+- The `anthropic` optional extra, so a bare install is pydantic and opentelemetry-api and replays without the SDK, with recording format 3 and an SDK-independent output-schema hash checked on every replay (and the live re-record of the library's own cassettes). In 0.1.0a7 the base install still depends on `anthropic` and recordings are format 2.
+- Concurrent-append coalescing: independent `append()` calls without `connection=` sharing one transaction, each in its own savepoint.
+- An in-process cache of the requests a listing hides.
+- A pgbouncer transaction-mode CI job. A transaction-mode pooler is still not tested.
+
 ## [0.1.0a6] - 2026-10-03
 
 Fix release for 0.1.0a5. **0.1.0a5 was tagged but never released** (see below): upgrade from 0.1.0a4 straight to 0.1.0a6. Details are added below as each fix lands.
@@ -243,7 +287,8 @@ The first pre-release. Projects can pin it; the API may still change before 0.1.
 - Extras `bedrock`, `postgres`, `otel` and `testing`; examples for a routed call and for the control layer.
 - CI on every pull request (lint, types, tests on Python 3.11 to 3.14 with Postgres, package check, gitleaks) and a tag-driven release workflow.
 
-[Unreleased]: https://github.com/AOX-LLC/agent-core/compare/v0.1.0a6...HEAD
+[Unreleased]: https://github.com/AOX-LLC/agent-core/compare/v0.1.0a7...HEAD
+[0.1.0a7]: https://github.com/AOX-LLC/agent-core/compare/v0.1.0a6...v0.1.0a7
 [0.1.0a6]: https://github.com/AOX-LLC/agent-core/compare/v0.1.0a5...v0.1.0a6
 [0.1.0a5]: https://github.com/AOX-LLC/agent-core/compare/v0.1.0a4...v0.1.0a5
 [0.1.0a4]: https://github.com/AOX-LLC/agent-core/compare/v0.1.0a3...v0.1.0a4
