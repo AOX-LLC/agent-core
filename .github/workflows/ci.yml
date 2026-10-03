@@ -1,7 +1,8 @@
 name: CI
 
 # The job names lint, types, tests, package and gitleaks are required status
-# checks on main. Renaming one means updating the ruleset in the same change.
+# checks on main (lint also checks that CHANGELOG.md has a section for the
+# package version). Renaming one means updating the ruleset in the same change.
 
 on:
   pull_request:
@@ -39,6 +40,20 @@ jobs:
       - run: uv sync
       - run: uv run ruff check --output-format=github
       - run: uv run ruff format --check
+      # The release workflow refuses a tag whose version has no CHANGELOG section
+      # (0.1.0a5 was tagged that way), so fail here, on the pull request, instead.
+      - name: CHANGELOG has a section for the package version
+        run: |
+          version="$(uv version --short)"
+          awk -v heading="## [$version]" '
+            index($0, heading) == 1 { in_section = 1; next }
+            in_section && /^## \[/ { exit }
+            in_section && NF { found = 1 }
+            END { exit !found }
+          ' CHANGELOG.md || {
+            echo "::error file=CHANGELOG.md::No non-empty '## [$version]' section for the package version $version."
+            exit 1
+          }
 
   types:
     name: types
