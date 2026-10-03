@@ -13,8 +13,9 @@ only its own credentials cannot step outside them with plain SQL:
 
     from      to         role                    also required
     (insert)  pending    requester               undecided; starts by now, lives at most 168 hours
-    pending   approved   approver                decision 'approve', resolved_by set and not the
-                                                 requester, resolved_at set, not expired
+    pending   approved   approver                decision 'approve', resolved_by set and neither
+                                                 requester nor delegate, resolved_at set,
+                                                 not expired
     pending   rejected   approver                as approved, with decision 'reject'
     pending   cancelled  requester               closed_at set
     pending   expired    requester or approver   closed_at set, expires_at already past
@@ -420,6 +421,7 @@ BEGIN
         IF NEW.decision IS DISTINCT FROM
                (CASE NEW.status WHEN 'approved' THEN 'approve' ELSE 'reject' END)
            OR NEW.resolved_by IS NULL OR NEW.resolved_by = OLD.requested_by
+           OR jsonb_exists(OLD.delegates::jsonb, NEW.resolved_by)
            OR NEW.resolved_by !~ principal_shape
            OR NEW.resolved_at IS NULL OR NOT_CANONICAL(NEW.resolved_at)
            OR (NEW.reason IS NOT NULL

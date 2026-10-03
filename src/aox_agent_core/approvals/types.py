@@ -186,6 +186,7 @@ class DenialReason(StrEnum):
     NOT_HUMAN = "not_human"
     MISSING_ROLE = "missing_role"
     SELF_APPROVAL = "self_approval"
+    DELEGATE_APPROVAL = "delegate_approval"
     NOT_PENDING = "not_pending"
     NOT_REQUESTER = "not_requester"
     UNKNOWN_ACTION = "unknown_action"

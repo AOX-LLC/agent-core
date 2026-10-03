@@ -33,7 +33,9 @@ class RoleApproverPolicy:
     - the action is listed in `roles_by_action`, and the request's stored
       required_role is the role listed for it;
     - the principal holds that role;
-    - the principal is not the one who requested it (no self-approval);
+    - the principal is not the one who requested it (no self-approval), and is not
+      one of the delegates the requester named to consume it (a delegate may use
+      an approval, never grant it);
     - the request is still pending and has not expired at `now`.
 
     Checks run in that order and the first failure is the reason returned.
@@ -82,6 +84,8 @@ class RoleApproverPolicy:
             return _deny(DenialReason.MISSING_ROLE)
         if principal.id == request.requested_by:
             return _deny(DenialReason.SELF_APPROVAL)
+        if principal.id in request.delegates:
+            return _deny(DenialReason.DELEGATE_APPROVAL)
         if request.status is ApprovalStatus.EXPIRED:
             return _deny(DenialReason.EXPIRED)
         if request.status is not ApprovalStatus.PENDING:
