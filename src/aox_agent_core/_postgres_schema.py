@@ -12,7 +12,7 @@ below, using the database's own clock and role membership, so a role holding
 only its own credentials cannot step outside them with plain SQL:
 
     from      to         role                    also required
-    (insert)  pending    requester               undecided; lifetime starts by now, at most 7 days
+    (insert)  pending    requester               undecided; starts by now, lives at most 168 hours
     pending   approved   approver                decision 'approve', resolved_by set and not the
                                                  requester, resolved_at set, not expired
     pending   rejected   approver                as approved, with decision 'reject'
@@ -161,6 +161,17 @@ BEGIN
     END IF;
     IF NEW.seq <> head_seq + 1 OR NEW.prev_hash IS DISTINCT FROM head_hash THEN
         RAISE EXCEPTION '<table> is append-only: a record must follow the last one';
+    END IF;
+    IF NEW.action !~ '^[a-z][a-z0-9_]*([.][a-z][a-z0-9_]*)*$' OR length(NEW.action) > 100
+       OR NEW.actor_id !~ '^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$'
+       OR (NEW.subject_id IS NOT NULL
+           AND NEW.subject_id !~ '^[A-Za-z0-9][A-Za-z0-9._:-]{0,199}$')
+       OR octet_length(NEW.payload) > 8192
+       OR jsonb_typeof(NEW.payload::jsonb) IS DISTINCT FROM 'object'
+       OR (NEW.run_context IS NOT NULL
+           AND (octet_length(NEW.run_context) > 2048
+                OR jsonb_typeof(NEW.run_context::jsonb) IS DISTINCT FROM 'object')) THEN
+        RAISE EXCEPTION '<table> is append-only: a new record has a field of the wrong shape';
     END IF;
     IF NEW.schema_version IS DISTINCT FROM 3
        OR NEW.event_id !~ '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
@@ -360,7 +371,7 @@ BEGIN
         END IF;
         IF NEW.created_at::timestamptz > db_now + interval '5 minutes'
            OR NEW.expires_at::timestamptz <= NEW.created_at::timestamptz
-           OR NEW.expires_at::timestamptz > NEW.created_at::timestamptz + interval '7 days' THEN
+           OR NEW.expires_at::timestamptz > NEW.created_at::timestamptz + interval '168 hours' THEN
             RAISE EXCEPTION 'an approval request must start by now and live at most 7 days';
         END IF;
         RETURN NEW;
@@ -384,7 +395,7 @@ BEGIN
         -- Rows written before the guard existed (0.1.0a2) may carry any lifetime;
         -- such a request can be neither decided nor used, only cancelled or expired.
         is_overlong := NOT_CANONICAL(OLD.created_at) OR NOT_CANONICAL(OLD.expires_at)
-            OR OLD.expires_at::timestamptz > OLD.created_at::timestamptz + interval '7 days';
+            OR OLD.expires_at::timestamptz > OLD.created_at::timestamptz + interval '168 hours';
         IF is_expired OR is_overlong THEN
             RAISE EXCEPTION 'approval request % has expired or has no valid lifetime', OLD.id;
         END IF;
@@ -427,7 +438,7 @@ BEGIN
         -- Rows written before the guard existed (0.1.0a2) may carry any lifetime;
         -- such a request can be neither decided nor used, only cancelled or expired.
         is_overlong := NOT_CANONICAL(OLD.created_at) OR NOT_CANONICAL(OLD.expires_at)
-            OR OLD.expires_at::timestamptz > OLD.created_at::timestamptz + interval '7 days';
+            OR OLD.expires_at::timestamptz > OLD.created_at::timestamptz + interval '168 hours';
         IF is_expired OR is_overlong THEN
             RAISE EXCEPTION 'approval request % has expired or has no valid lifetime', OLD.id;
         END IF;

@@ -109,6 +109,7 @@ _COLUMNS = (
     "expires_at, status, decision, resolved_by, resolved_at, consumed_at, reason, run_context, "
     "delegates, closed_at, payload_json"
 )
+_COLUMN_INDEX: Final = {name.strip(): i for i, name in enumerate(_COLUMNS.split(","))}
 DELEGATES_COLUMN: Final = "delegates"
 PAYLOAD_COLUMN: Final = "payload_json"
 # Seconds an independent audit write waits for the append lock before falling back.
@@ -378,15 +379,15 @@ class SQLApprovalQueue:
 
         eligible: list[ApprovalRequest] = []
         scrubber = self._scrubber
-        hidden: list[UUID] = []
+        hidden: list[str] = []
 
-        async def read_cursor(session: Session) -> ApprovalRequest | None:
+        async def read_cursor(session: Session) -> tuple[str, str] | None:
             await self._prepare(session)
-            # Only created_at and id are needed, so a row that fails the payload check
-            # here does not stop pagination.
-            return await _load(session, self._table, after) if after is not None else None
+            # Raw created_at and id are all a cursor needs, so a row this library will
+            # not read does not stop pagination either.
+            return await _cursor_of(session, self._table, after) if after is not None else None
 
-        resume_after: ApprovalRequest | None = None
+        resume_after: tuple[str, str] | None = None
         if after is not None:
             resume_after = await self._run(read_cursor, write=False, connection=connection)
             if resume_after is None:
@@ -406,7 +407,7 @@ class SQLApprovalQueue:
                     limit=page_size,
                     scrubber=scrubber,
                 )
-                hidden.extend(cursor.id for cursor, request in page if request is None)
+                hidden.extend(cursor[1] for cursor, request in page if request is None)
                 eligible.extend(
                     request
                     for _, request in page
@@ -428,7 +429,7 @@ class SQLApprovalQueue:
         self._warn_hidden(hidden)
         return eligible[:limit]
 
-    def _warn_hidden(self, request_ids: list[UUID]) -> None:
+    def _warn_hidden(self, request_ids: list[str]) -> None:
         """Say, at most once a minute, that requests were left out of a listing.
 
         Hiding is silent to the approver by design; this is the signal for whoever
@@ -478,7 +479,7 @@ class SQLApprovalQueue:
                         principal.id,
                         request_id,
                         context,
-                        reason="payload_integrity",
+                        reason=getattr(error, "reason", "payload_integrity"),
                     ),
                 )
             if request is None:
@@ -509,6 +510,9 @@ class SQLApprovalQueue:
                     ),
                 )
 
+            # A request may be dated up to five minutes ahead (the guard allows it, for clock
+            # skew); a decision is never dated before its request.
+            decided_at = max(now, request.created_at)
             status = (
                 ApprovalStatus.APPROVED if decision is Decision.APPROVE else ApprovalStatus.REJECTED
             )
@@ -518,7 +522,7 @@ class SQLApprovalQueue:
                     "status": status,
                     "decision": decision,
                     "resolved_by": principal.id,
-                    "resolved_at": now,
+                    "resolved_at": decided_at,
                     "reason": reason,
                 },
                 context={STORED_RECORD: True},
@@ -530,7 +534,7 @@ class SQLApprovalQueue:
                     status.value,
                     decision.value,
                     principal.id,
-                    canonical_timestamp(now),
+                    canonical_timestamp(decided_at),
                     reason,
                     str(request_id),
                     ApprovalStatus.PENDING.value,
@@ -580,7 +584,19 @@ class SQLApprovalQueue:
 
         async def use(session: Session) -> _Outcome:
             await self._require_side(session, "consume approvals", ApprovalSide.REQUESTER)
-            request = await _load(session, self._table, request_id)
+            try:
+                request = await _load(session, self._table, request_id)
+            except _StoredRowError as stored:
+                return _denied(
+                    stored,
+                    _missing_event(
+                        "approval.consume_denied",
+                        principal.id,
+                        request_id,
+                        context,
+                        reason=stored.reason,
+                    ),
+                )
             if request is None:
                 return _denied(
                     ApprovalNotFoundError(f"No approval request {request_id}."),
@@ -655,7 +671,19 @@ class SQLApprovalQueue:
 
         async def withdraw(session: Session) -> _Outcome:
             await self._require_side(session, "cancel requests", ApprovalSide.REQUESTER)
-            request = await _load(session, self._table, request_id)
+            try:
+                request = await _load(session, self._table, request_id)
+            except _StoredRowError as stored:
+                return _denied(
+                    stored,
+                    _missing_event(
+                        "approval.cancel_denied",
+                        principal.id,
+                        request_id,
+                        context,
+                        reason=stored.reason,
+                    ),
+                )
             if request is None:
                 return _denied(
                     ApprovalNotFoundError(f"No approval request {request_id}."),
@@ -721,7 +749,14 @@ class SQLApprovalQueue:
             await self._prepare(session)
             if not await _table_exists(session, self._table):
                 return _Outcome()
-            due = await _load_due(session, self._table, moment, limit)
+            due, rows_read, unreadable = await _load_due(session, self._table, moment, limit)
+            if unreadable:
+                _LOG.warning(
+                    "%d due approval request(s) are stored in a form this library will not read "
+                    "and were not expired (first id %s).",
+                    len(unreadable),
+                    unreadable[0],
+                )
             events = []
             for request in due:
                 if await _close(session, self._table, request, ApprovalStatus.EXPIRED, moment):
@@ -732,7 +767,10 @@ class SQLApprovalQueue:
                     events.append(
                         _event("approval.expired", principal.id, expired, request.run_context)
                     )
-            return _Outcome(events=events, expired=len(events), batch_full=len(due) == limit)
+            # A full batch of unreadable rows must not loop: go on only if some expired.
+            return _Outcome(
+                events=events, expired=len(events), batch_full=rows_read == limit and bool(events)
+            )
 
         total = 0
         while True:
@@ -880,6 +918,17 @@ class SQLApprovalQueue:
                     )
 
 
+class _StoredRowError(ApprovalIntegrityError):
+    """A stored row that cannot be read as a request, or whose payload is not bound.
+
+    `reason` is what an audited refusal records: malformed_row or payload_integrity.
+    """
+
+    def __init__(self, message: str, *, reason: str) -> None:
+        super().__init__(message)
+        self.reason = reason
+
+
 def _checked_or_without_context(log: SQLAuditLog, event: AuditEvent) -> AuditEvent:
     """The event as the log accepts it. A run context stored with a request may fail the
     rules in force now (it passed the ones in force when it was written, or a requester
@@ -1012,8 +1061,12 @@ _POSTGRES_STATEMENT_NOW_TEXT = (
 
 async def _load_due(
     session: Session, table: TableName, now: datetime, limit: int
-) -> list[ApprovalRequest]:
-    """Up to `limit` pending requests whose lifetime ended by `now`, oldest expiry first."""
+) -> tuple[list[ApprovalRequest], int, list[str]]:
+    """Up to `limit` pending requests whose lifetime ended by `now`, oldest expiry first.
+
+    Returns the requests this library can read, how many rows it read, and the ids of
+    the rows it cannot read, which the sweep leaves as they are.
+    """
     database_clock = (
         f" AND expires_at <= {_POSTGRES_STATEMENT_NOW_TEXT}"
         if session.dialect is Dialect.POSTGRES
@@ -1024,7 +1077,14 @@ async def _load_due(
         f"{database_clock} ORDER BY expires_at, id LIMIT ?",
         (ApprovalStatus.PENDING.value, canonical_timestamp(now), limit),
     )
-    return [_request_from_row(row) for row in rows]
+    readable: list[ApprovalRequest] = []
+    unreadable: list[str] = []
+    for row in rows:
+        try:
+            readable.append(_request_from_row(row))
+        except _StoredRowError:
+            unreadable.append(row[0])
+    return readable, len(rows), unreadable
 
 
 def _denied(error: ApprovalError, event: AuditEvent) -> _Outcome:
@@ -1155,8 +1215,9 @@ def _with_payload(
         if scrubber.find_secrets({"payload": payload}):
             raise ValueError("a stored payload holds a secret")
     except (ValueError, TypeError, RecursionError) as error:
-        raise ApprovalIntegrityError(
-            f"The payload stored with request {request.id} is not one its payload_sha256 binds."
+        raise _StoredRowError(
+            f"The payload stored with request {request.id} is not one its payload_sha256 binds.",
+            reason="payload_integrity",
         ) from error
     return request.model_copy(update={"payload": payload})
 
@@ -1166,16 +1227,16 @@ async def _load_pending_page(
     table: TableName,
     *,
     now: datetime,
-    after: ApprovalRequest | None,
+    after: tuple[str, str] | None,
     narrowed_to: Principal | None,
     limit: int,
     scrubber: Scrubber,
-) -> list[tuple[ApprovalRequest, ApprovalRequest | None]]:
+) -> list[tuple[tuple[str, str], ApprovalRequest | None]]:
     """One page of pending, unexpired requests after `after`, in (created_at, id) order.
 
-    Each is a pair: the request as the page cursor needs it, and the request with its
-    checked payload, or None when the stored payload fails the check and must not be
-    shown.
+    Each is a pair: the row's cursor (created_at, id), and the request with its checked
+    payload, or None when the row cannot be read or its payload fails the check and it
+    must not be shown.
 
     With `narrowed_to`, only requests that principal could resolve under the
     default policy: a role it holds, and not its own.
@@ -1189,7 +1250,7 @@ async def _load_pending_page(
         # A row-value comparison lets the (status, created_at, id) index seek straight
         # to the page start, even when many requests share a created_at.
         conditions.append("(created_at, id) > (?, ?)")
-        parameters += [canonical_timestamp(after.created_at), str(after.id)]
+        parameters += [after[0], after[1]]
     if narrowed_to is not None:
         roles = sorted(narrowed_to.roles)
         conditions.append(f"required_role IN ({', '.join('?' for _ in roles)})")
@@ -1207,15 +1268,28 @@ async def _load_pending_page(
 
 def _verify_rows(
     rows: list[tuple[Any, ...]], scrubber: Scrubber
-) -> list[tuple[ApprovalRequest, ApprovalRequest | None]]:
-    page: list[tuple[ApprovalRequest, ApprovalRequest | None]] = []
+) -> list[tuple[tuple[str, str], ApprovalRequest | None]]:
+    page: list[tuple[tuple[str, str], ApprovalRequest | None]] = []
     for row in rows:
-        request, payload_text = _parse_row(row)
+        cursor = (row[_COLUMN_INDEX["created_at"]], row[0])
         try:
-            page.append((request, _with_payload(request, payload_text, scrubber)))
+            request, payload_text = _parse_row(row)
+            page.append((cursor, _with_payload(request, payload_text, scrubber)))
         except ApprovalIntegrityError:
-            page.append((request, None))
+            page.append((cursor, None))
     return page
+
+
+async def _cursor_of(
+    session: Session, table: TableName, request_id: UUID
+) -> tuple[str, str] | None:
+    """The page cursor (created_at, id) of a request, read raw."""
+    if not await _table_exists(session, table):
+        return None
+    rows = await session.execute(
+        f"SELECT created_at, id FROM {table.sql} WHERE id = ?", (str(request_id),)
+    )
+    return (rows[0][0], rows[0][1]) if rows else None
 
 
 def _row_values(request: ApprovalRequest) -> tuple[Any, ...]:
@@ -1260,10 +1334,19 @@ def _parse_row(row: tuple[Any, ...]) -> tuple[ApprovalRequest, str | None]:
     names = [name.strip() for name in _COLUMNS.split(",")]
     fields = {name: value for name, value in zip(names, row, strict=True) if value is not None}
     payload_text = fields.pop(PAYLOAD_COLUMN, None)
-    if RUN_CONTEXT_COLUMN in fields:
-        fields[RUN_CONTEXT_COLUMN] = json.loads(fields[RUN_CONTEXT_COLUMN])
-    fields[DELEGATES_COLUMN] = json.loads(fields.get(DELEGATES_COLUMN, "[]"))
-    return ApprovalRequest.model_validate(fields, context={STORED_RECORD: True}), payload_text
+    try:
+        if RUN_CONTEXT_COLUMN in fields:
+            fields[RUN_CONTEXT_COLUMN] = json.loads(fields[RUN_CONTEXT_COLUMN])
+        fields[DELEGATES_COLUMN] = json.loads(fields.get(DELEGATES_COLUMN, "[]"))
+        request = ApprovalRequest.model_validate(fields, context={STORED_RECORD: True})
+    except (ValueError, TypeError, RecursionError) as error:
+        # Whatever the row says, the reader must neither crash nor guess: the model's own
+        # rules (a lifetime over 7 days, a decision before the request) refuse it.
+        raise _StoredRowError(
+            f"Approval request {row[0]} is stored in a form this library will not read.",
+            reason="malformed_row",
+        ) from error
+    return request, payload_text
 
 
 def _request_from_row(row: tuple[Any, ...]) -> ApprovalRequest:

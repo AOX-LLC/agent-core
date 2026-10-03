@@ -362,7 +362,12 @@ def _check_link(record: AuditRecord, previous: AuditHead) -> None:
         )
     if record.prev_hash != previous.record_hash:
         raise AuditIntegrityError(f"Record {record.seq} does not link to record {previous.seq}.")
-    if compute_record_hash(record) != record.record_hash:
+    try:
+        hash_holds = compute_record_hash(record) == record.record_hash
+    except (ValueError, RecursionError) as error:
+        # Content the hash cannot be taken of, such as a number JSON cannot spell.
+        raise AuditIntegrityError(f"Record {record.seq} cannot be hashed.") from error
+    if not hash_holds:
         # A row the database accepted with a wrong hash shows who inserted it.
         by = (
             f" (its db_role column reads {record.db_role}; the hash does not cover it)"
@@ -614,5 +619,5 @@ def record_from_row(row: tuple[Any, ...]) -> AuditRecord:
             },
             context={STORED_RECORD: True},
         )
-    except (ValueError, TypeError, ValidationError) as error:
+    except (ValueError, TypeError, ValidationError, RecursionError) as error:
         raise AuditIntegrityError(f"Record {seq} is malformed and cannot be checked.") from error
