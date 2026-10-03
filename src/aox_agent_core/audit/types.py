@@ -138,7 +138,7 @@ def check_payload(
 ) -> dict[str, JsonValue]:
     """Return `payload` if it is small, plain JSON that any reader can hash exactly.
 
-    Raises ValueError for forbidden keys, floats, integers beyond the safe range,
+    Raises ValueError for forbidden keys, NUL characters, floats, integers beyond the safe range,
     text that is not valid Unicode, and more than `max_bytes` of JSON. It does not
     scan strings for secrets; the audit log and the approval queue do, with their
     scrubber.
@@ -149,6 +149,8 @@ def check_payload(
     if forbidden:
         raise ValueError(f"payload has forbidden keys: {', '.join(forbidden)}")
 
+    if _contains_nul(payload):
+        raise ValueError("payload text must not contain NUL")
     if _contains_float(payload):
         raise ValueError("payload numbers must be integers; write decimals as strings")
     if _contains_unsafe_integer(payload):
@@ -204,6 +206,24 @@ def is_secret_shaped_key(key: str) -> bool:
     """True when a key, lowercased and stripped to letters and digits, ends in a secret word."""
     normalized = re.sub(r"[^a-z0-9]", "", key.lower())
     return normalized.endswith(FORBIDDEN_KEY_SUFFIXES)
+
+
+def _contains_nul(value: JsonValue) -> bool:
+    """True when any key or string in `value` holds a NUL character, which Postgres text
+    and jsonb cannot store."""
+    stack: list[JsonValue] = [value]
+    while stack:
+        item = stack.pop()
+        if isinstance(item, str):
+            if "\x00" in item:
+                return True
+        elif isinstance(item, dict):
+            if any("\x00" in key for key in item):
+                return True
+            stack.extend(item.values())
+        elif isinstance(item, list):
+            stack.extend(item)
+    return False
 
 
 def _contains_float(value: JsonValue) -> bool:

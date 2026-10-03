@@ -6,13 +6,23 @@ from enum import StrEnum
 from typing import Annotated, Self
 from uuid import UUID
 
-from pydantic import AwareDatetime, JsonValue, StringConstraints, model_validator
+from pydantic import (
+    AfterValidator,
+    AwareDatetime,
+    JsonValue,
+    StringConstraints,
+    model_validator,
+)
 
 from aox_agent_core._model import ActionName, FrozenModel, PrincipalId, Sha256Hex
+from aox_agent_core._text import require_safe_text
 from aox_agent_core.context import RunContext
 
 RoleName = Annotated[str, StringConstraints(pattern=r"^[a-z][a-z0-9_.-]{0,63}$")]
-ShortText = Annotated[str, StringConstraints(min_length=1, max_length=500)]
+# Free text for people to read: no control, bidirectional or other format characters.
+ShortText = Annotated[
+    str, StringConstraints(min_length=1, max_length=500), AfterValidator(require_safe_text)
+]
 
 TTL_SECONDS_MAX = 7 * 24 * 60 * 60
 MAX_DELEGATES = 16

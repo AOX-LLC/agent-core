@@ -91,6 +91,15 @@ PUBLIC_LAYOUT: Final[Mapping[str, Mapping[str, frozenset[str] | None]]] = {
 DECISION_COLUMNS: Final = ("decision", "resolved_by", "resolved_at", "reason")
 
 
+# Characters of the Unicode categories Cc, Cf, Zl and Zp that free text may not carry; a
+# subset of what the library refuses (tests check it), so the database never refuses
+# what the library accepts. Backslashes are for Postgres' regex, not for Python.
+UNSAFE_TEXT_PATTERN: Final = (
+    r"[\u0001-\u001f\u007f-\u009f\u00ad\u0600-\u0605\u061c\u06dd\u070f\u08e2\u180e"
+    r"\u200b-\u200f\u2028-\u202e\u2060-\u2064\u2066-\u206f\ufeff\ufff9-\ufffb]"
+)
+
+
 def identifier(name: str, *, what: str) -> str:
     """`name` double-quoted, after checking it is a plain lowercase identifier."""
     if not IDENTIFIER.fullmatch(name):
@@ -247,6 +256,7 @@ def approvals_guard_ddl(schema: str, requester_role: str, approver_role: str) ->
         _GUARD_BODY.replace("'<requester>'", f"'{requester_role}'")
         .replace("'<approver>'", f"'{approver_role}'")
         .replace("<max_payload>", str(MAX_STORED_PAYLOAD_BYTES))
+        .replace("<unsafe_text>", UNSAFE_TEXT_PATTERN)
     )
     return (
         f"""CREATE OR REPLACE FUNCTION {quoted_schema}.{APPROVALS_TABLE}_guard()
@@ -292,6 +302,7 @@ DECLARE
     timestamp_shape text :=
         '^[0-9]{4}-[0-9]{2}-[0-9]{2}T([01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9][.][0-9]{6}Z$';
     principal_shape text := '^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$';
+    unsafe_text text := '<unsafe_text>';
     opaque_shape text := '^[A-Za-z0-9][A-Za-z0-9._:/-]{0,199}$';
     run_context jsonb;
     is_overlong boolean;
@@ -318,6 +329,7 @@ BEGIN
            OR NEW.action !~ '^[a-z][a-z0-9_]*([.][a-z][a-z0-9_]*)*$'
            OR length(NEW.action) > 100
            OR length(NEW.summary) NOT BETWEEN 1 AND 500
+           OR NEW.summary ~ unsafe_text
            OR NEW.payload_sha256 !~ '^[0-9a-f]{64}$'
            OR NEW.requested_by !~ principal_shape
            OR NEW.required_role !~ '^[a-z][a-z0-9_.-]{0,63}$'
@@ -404,7 +416,8 @@ BEGIN
            OR NEW.resolved_by IS NULL OR NEW.resolved_by = OLD.requested_by
            OR NEW.resolved_by !~ principal_shape
            OR NEW.resolved_at IS NULL OR NOT_CANONICAL(NEW.resolved_at)
-           OR (NEW.reason IS NOT NULL AND length(NEW.reason) NOT BETWEEN 1 AND 500)
+           OR (NEW.reason IS NOT NULL
+               AND (length(NEW.reason) NOT BETWEEN 1 AND 500 OR NEW.reason ~ unsafe_text))
            OR NEW.consumed_at IS DISTINCT FROM OLD.consumed_at
            OR NEW.closed_at IS DISTINCT FROM OLD.closed_at THEN
             RAISE EXCEPTION 'a decision sets decision, resolved_by and resolved_at only';

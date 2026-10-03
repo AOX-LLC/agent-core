@@ -20,6 +20,7 @@ from pydantic import JsonValue, ValidationError
 
 from aox_agent_core import _postgres_schema as layout
 from aox_agent_core._canonical import canonical_json, sha256_of
+from aox_agent_core._text import check_short_text, neutralized
 from aox_agent_core._validation import STORED_RECORD
 from aox_agent_core.approvals.policy import ApproverPolicy, RoleApproverPolicy
 from aox_agent_core.approvals.types import (
@@ -315,9 +316,6 @@ class SQLApprovalQueue:
             raise ApprovalPayloadRejectedError(
                 f"The payload cannot be stored: more than {layout.MAX_STORED_PAYLOAD_BYTES} bytes."
             )
-        if _contains_nul(checked):
-            # Postgres text cannot hold NUL; refuse it here rather than at the insert.
-            raise ApprovalPayloadRejectedError("The payload cannot be stored: it contains NUL.")
         findings = self._scrubber.find_secrets({"payload": checked})
         if findings:
             located = ", ".join(f"{finding.rule} at {finding.path}" for finding in findings)
@@ -665,8 +663,8 @@ class SQLApprovalQueue:
         if the request is no longer pending, ApprovalExpiredError if it has
         expired, and ApprovalNotFoundError if it does not exist; each is audited.
         """
-        if reason is not None and not 0 < len(reason) <= 500:
-            raise ValueError("reason must be 1 to 500 characters")
+        if reason is not None:
+            check_short_text(reason, what="reason")
         details = {"cancel_reason": reason} if reason is not None else {}
 
         async def withdraw(session: Session) -> _Outcome:
@@ -943,23 +941,6 @@ def _checked_or_without_context(log: SQLAuditLog, event: AuditEvent) -> AuditEve
             update={"context": None, "payload": {**event.payload, "run_context_dropped": "true"}}
         )
         return log.checked_event(stripped)
-
-
-def _contains_nul(value: JsonValue) -> bool:
-    """True when any key or string in `value` holds a NUL character."""
-    stack: list[JsonValue] = [value]
-    while stack:
-        item = stack.pop()
-        if isinstance(item, str):
-            if "\x00" in item:
-                return True
-        elif isinstance(item, dict):
-            if any("\x00" in key for key in item):
-                return True
-            stack.extend(item.values())
-        elif isinstance(item, list):
-            stack.extend(item)
-    return False
 
 
 def _sqlstate(error: BaseException) -> str | None:
@@ -1333,6 +1314,11 @@ def _parse_row(row: tuple[Any, ...]) -> tuple[ApprovalRequest, str | None]:
     # NULL columns are dropped so the model's defaults apply.
     names = [name.strip() for name in _COLUMNS.split(",")]
     fields = {name: value for name, value in zip(names, row, strict=True) if value is not None}
+    # Free text a requester or approver wrote before control characters were refused, or
+    # with plain SQL: shown with each replaced, so no UI or terminal is driven by it.
+    for column in ("summary", "reason"):
+        if isinstance(fields.get(column), str):
+            fields[column] = neutralized(fields[column])
     payload_text = fields.pop(PAYLOAD_COLUMN, None)
     try:
         if RUN_CONTEXT_COLUMN in fields:
