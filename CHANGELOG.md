@@ -8,6 +8,51 @@ Pre-releases are spelled the PEP 440 way, so tags look like `v0.1.0a1`.
 
 ## [Unreleased]
 
+## [0.1.0a4] - 2026-10-03
+
+Async storage on a connection pool, batch appends, writes inside a host's Postgres transaction, and approvals that can carry their exact payload.
+
+### Changed (breaking)
+
+- Storage is async. `Database.run(work)` takes `async def work(session)`; `Session.execute` and `Session.execute_count` are coroutines; `Database.run_sync` is gone; `SQLAuditLog.append_in` is a coroutine, and so is `audit_table_exists`. `install_postgres_schema` and the CLI stay blocking.
+- A Postgres `Database` owns a `psycopg_pool.AsyncConnectionPool`, opened on first use on the running event loop. Close it with `await database.aclose()` or `async with`. Use one `Database` per event loop; a second loop gets a `ConfigError`. `open_database(url, *, max_connections=10)`.
+- The `AuditLog` protocol gains `append_many(events)`. A host's own log must add it.
+- The `ApprovalQueue` protocol's `submit()` gains `include_payload=False`. A host's own queue must accept it.
+- `ApprovalRequest` gains `payload`, and `AuditEvent` gains `occurred_at`. `AuditRecord` gains `recorded_at`, outside the hash.
+- `AuditEvent.occurred_at=None` now means the database's clock on Postgres. Before, it was always the application's clock. On SQLite it is still the writer's clock.
+- Postgres 16 or later. An older server is refused with a `ConfigError` at connect and at install.
+- The Postgres schema changes: `audit.recorded_at` and `approvals.payload_json` are new columns, the audit insert trigger is replaced, and the approvals guard covers `payload_json`. An a3 schema is refused until `install_postgres_schema` is run again as the owner (see docs/upgrading.md). The audit log and the approvals queue each raise a `ConfigError` that says so before they write anything.
+- The `postgres` extra is `psycopg[binary,pool]`.
+
+### Added
+
+- `PostgresDatabase.from_pool(pool)`: borrows a host's pool, never closes it.
+- `connection=` on `SQLAuditLog.append` and `append_many` and on `SQLApprovalQueue.submit`, `get`, `list_pending`, `resolve`, `consume`, `cancel`, `expire_due` and `side`: run inside a transaction the host already has open on a psycopg `AsyncConnection`, in a savepoint, never committing, rolling back or closing it. Postgres only. The connection must be in a transaction at READ COMMITTED, or `ConfigError`. See docs/upgrading.md for the hazards.
+- `SQLAuditLog.append_many(events)`: all or nothing, one lock, one commit, consecutive records, at most `MAX_APPEND_BATCH` (1000) events; an error names the index of the event it refused.
+- `AuditEvent.occurred_at`, bounded by `OCCURRED_AT_MAX_PAST` (24 hours) and `OCCURRED_AT_MAX_FUTURE` (5 minutes) around the database's clock, else `AuditTimeRejectedError`. `AuditRecord.recorded_at`, set by the Postgres insert trigger whatever the writer sends.
+- `submit(..., include_payload=True)` stores the exact payload with the request (`payload_json`), at most 8192 bytes of canonical JSON, under the audit log's rules; `ApprovalRequest.payload` holds it. Every `get`, `list_pending` and `resolve` checks it against `payload_sha256`.
+- `aox_agent_core.sync`: `SyncAuditLog` and `SyncApprovalQueue`, blocking wrappers that run on a background loop thread, with `close()` and context-manager support. They raise `EventLoopRunningError` inside a running loop and take no `connection=`.
+- `ApprovalIntegrityError` and `ApprovalPayloadRejectedError` (`ApprovalError`), and `AuditTimeRejectedError` (`AuditError`).
+- `benchmarks/audit_throughput.py` and `benchmarks/README.md`.
+- docs/upgrading.md: the upgrade from 0.1.0a3 for a project with its own backends, a project on the SQL backends, and the operator.
+
+### Changed
+
+- Every Postgres statement runs with `prepare=False`. Isolation and `search_path` are set per transaction (`SET TRANSACTION`, `SET LOCAL`), never per session. There is no `LISTEN`, and advisory locks are transaction-level. This fits a transaction-mode pooler; it has not been tested against one.
+- The Postgres audit insert trigger takes the same advisory lock the library takes, and requires `seq` to be the head's plus one and `prev_hash` to equal the head's `record_hash` (genesis zeros when empty), schema version 3, the shape of `event_id`, `record_hash` and `occurred_at`, and the `occurred_at` bounds. It cannot check `record_hash`, which `verify()` recomputes.
+- The SQLite append trigger also checks `prev_hash`. An a3 SQLite file gets the new trigger and the `recorded_at` and `payload_json` columns in place on first use.
+- A denied `consume`, `resolve` or `cancel` inside a host transaction is audited on a separate connection of the audit log's own pool and committed at once, waiting at most 2 seconds (`DENIAL_LOCK_TIMEOUT`) for the append lock. If that fails it is written in the host's transaction, and lost if the host rolls back.
+- The audit hash is unchanged. It covers `occurred_at` as before and not `recorded_at`; the schema version stays 3, and records from a3 verify as they did.
+- docs/compat-03.md maps project 03's interfaces to this release.
+
+### Security
+
+- Stored approval payloads are bound to the request. `resolve` refuses a request whose stored payload does not match `payload_sha256` and audits `approval.resolve_denied` with reason `payload_integrity`; the request stays pending. `get` raises `ApprovalIntegrityError` and `list_pending` omits it. `cancel` and `consume` do not check, so a requester can always withdraw. The payload is never copied into the audit log. `summary` is written by the requester and is not covered by the hash, so a UI must show `payload` when present.
+- The Postgres guard makes `payload_json` immutable after insert and refuses a value that is not a JSON object or is over 8192 bytes. The requester and approver roles have no UPDATE on it.
+- `recorded_at`, like `db_role`, is guaranteed by the database trigger, not by the chain: a table owner could edit it undetected. On SQLite the library writes it from the writer's clock, so it is not independent there.
+- Nothing purges a stored payload. Count it in retention and deletion plans.
+- CI runs Postgres 16 across the Python matrix and Postgres 17 on Python 3.12, in a separate job that is not a required check. Not tested against a real pooler.
+
 ## [0.1.0a3] - 2026-10-03
 
 Approvals enforced by Postgres itself, not only by the library.
@@ -93,7 +138,8 @@ The first pre-release. Projects can pin it; the API may still change before 0.1.
 - Extras `bedrock`, `postgres`, `otel` and `testing`; examples for a routed call and for the control layer.
 - CI on every pull request (lint, types, tests on Python 3.11 to 3.14 with Postgres, package check, gitleaks) and a tag-driven release workflow.
 
-[Unreleased]: https://github.com/AOX-LLC/agent-core/compare/v0.1.0a3...HEAD
+[Unreleased]: https://github.com/AOX-LLC/agent-core/compare/v0.1.0a4...HEAD
+[0.1.0a4]: https://github.com/AOX-LLC/agent-core/compare/v0.1.0a3...v0.1.0a4
 [0.1.0a3]: https://github.com/AOX-LLC/agent-core/compare/v0.1.0a2...v0.1.0a3
 [0.1.0a2]: https://github.com/AOX-LLC/agent-core/compare/v0.1.0a1...v0.1.0a2
 [0.1.0a1]: https://github.com/AOX-LLC/agent-core/releases/tag/v0.1.0a1

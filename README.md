@@ -56,22 +56,22 @@ An attachment's type is read from its first bytes, never from its name, and is c
 
 ## Install
 
-The distribution is named `aox-agent-core`. Replace `vX.Y.Z` with a release tag. The examples use `v0.1.0a3`.
+The distribution is named `aox-agent-core`. Replace `vX.Y.Z` with a release tag. The examples use `v0.1.0a4`.
 
 ```sh
-pip install "aox-agent-core @ git+https://github.com/AOX-LLC/agent-core@v0.1.0a3"
+pip install "aox-agent-core @ git+https://github.com/AOX-LLC/agent-core@v0.1.0a4"
 ```
 
 With extras:
 
 ```sh
-pip install "aox-agent-core[postgres,otel] @ git+https://github.com/AOX-LLC/agent-core@v0.1.0a3"
+pip install "aox-agent-core[postgres,otel] @ git+https://github.com/AOX-LLC/agent-core@v0.1.0a4"
 ```
 
 With uv:
 
 ```sh
-uv add "aox-agent-core @ git+https://github.com/AOX-LLC/agent-core" --tag v0.1.0a3
+uv add "aox-agent-core @ git+https://github.com/AOX-LLC/agent-core" --tag v0.1.0a4
 ```
 
 | Extra      | Adds                                         |

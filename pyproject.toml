@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "aox-agent-core"
-version = "0.1.0a3"
+version = "0.1.0a4"
 description = "Routed Claude calls with structured outputs, tracing with cost, record/replay, human approvals, an append-only audit log and evals."
 readme = "README.md"
 license = "MIT"
