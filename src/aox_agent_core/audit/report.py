@@ -48,4 +48,4 @@ class VerifyReport(FrozenModel):
 
     @property
     def ok(self) -> bool:
-        return not self.problems
+        return not self.problems and not self.truncated

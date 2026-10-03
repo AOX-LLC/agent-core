@@ -156,3 +156,41 @@ async def test_the_report_changes_nothing(control_database: ControlDatabase) -> 
     await log.verify_report()
 
     assert control_database.raw(f"SELECT seq, record_hash FROM {TABLE} ORDER BY seq") == before
+
+
+@pytest.mark.parametrize("bad", [0, -1])
+async def test_a_max_problems_below_one_is_refused_not_reported_as_ok(
+    control_database: ControlDatabase, bad: int
+) -> None:
+    log = await filled_log(control_database, 3)
+    drop_triggers(control_database)
+    control_database.raw(f"UPDATE {TABLE} SET actor_id = 'someone-else' WHERE seq = 2")
+
+    with pytest.raises(ValueError, match="at least 1"):
+        await log.verify_report(max_problems=bad)
+
+
+def test_a_truncated_report_is_not_ok() -> None:
+    from aox_agent_core.audit import AuditHead, VerifyReport
+
+    report = VerifyReport(
+        head=AuditHead(seq=0, record_hash="0" * 64), records_checked=0, truncated=True
+    )
+
+    assert not report.ok
+
+
+async def test_an_anchor_on_an_unreadable_record_is_not_called_a_cut_tail(
+    control_database: ControlDatabase,
+) -> None:
+    log = await filled_log(control_database, 6)
+    anchor = await log.head()
+    drop_triggers(control_database)
+    control_database.raw(f"UPDATE {TABLE} SET payload = 'not json' WHERE seq = 6")
+
+    report = await log.verify_report(expected_head=anchor)
+
+    assert (6, "malformed") in kinds(report)
+    detail = next(p.detail for p in report.problems if p.kind == "anchor")
+    assert "could not be read" in detail
+    assert "removed from the end" not in detail
