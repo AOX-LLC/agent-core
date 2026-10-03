@@ -53,7 +53,7 @@ dev = [
     "opentelemetry-sdk>=1.30,<2",
     "packaging>=24",
     "pytest>=9.1",
-    "psycopg[binary]>=3.2,<4",
+    "psycopg[binary,pool]>=3.2,<4",
     "pytest-asyncio>=1.0",
     "ruff>=0.16.10",
 ]
