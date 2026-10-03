@@ -28,9 +28,12 @@ run context or delegates.
 import re
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
-from typing import Final
+from typing import TYPE_CHECKING, Final
 
 from aox_agent_core.errors import ConfigError
+
+if TYPE_CHECKING:
+    from aox_agent_core.storage import Session
 
 AUDIT_TABLE: Final = "agent_core_audit"
 APPROVALS_TABLE: Final = "agent_core_approvals"
@@ -61,7 +64,6 @@ REQUESTER_LAYOUT: Final[Mapping[str, Mapping[str, frozenset[str] | None]]] = {
         "INSERT": None,
         "UPDATE": frozenset({"status", "consumed_at", "closed_at"}),
     },
-    ROLES_TABLE: {"SELECT": None},
 }
 APPROVER_LAYOUT: Final[Mapping[str, Mapping[str, frozenset[str] | None]]] = {
     AUDIT_TABLE: {"SELECT": None, "INSERT": None},
@@ -71,6 +73,10 @@ APPROVER_LAYOUT: Final[Mapping[str, Mapping[str, frozenset[str] | None]]] = {
             {"status", "decision", "resolved_by", "resolved_at", "reason", "closed_at"}
         ),
     },
+}
+# Which role is which is no secret (pg_roles lists every role), and every role
+# must be able to read it, so the connect check can say what is wrong.
+PUBLIC_LAYOUT: Final[Mapping[str, Mapping[str, frozenset[str] | None]]] = {
     ROLES_TABLE: {"SELECT": None},
 }
 # Decision columns the requester role must never be able to write.
@@ -169,7 +175,6 @@ def approvals_tables_ddl(schema: str) -> tuple[str, ...]:
             approver_role TEXT NOT NULL
         )""",
         f"REVOKE ALL ON {table} FROM PUBLIC",
-        f"REVOKE ALL ON {roles} FROM PUBLIC",
     )
 
 
@@ -364,7 +369,7 @@ def grant_statements(
 ) -> Iterable[tuple[str, str]]:
     """(table, GRANT statement) pairs for a role's layout."""
     quoted_schema = identifier(schema, what="schema")
-    quoted_role = identifier(role, what="role")
+    quoted_role = "PUBLIC" if role == "PUBLIC" else identifier(role, what="role")
     for table, privileges in layout.items():
         for privilege, columns in privileges.items():
             on = f"({', '.join(sorted(columns))}) " if columns is not None else ""
@@ -377,3 +382,125 @@ def within_layout(grant: Grant, layout: Mapping[str, Mapping[str, frozenset[str]
         return False
     columns = allowed[grant.privilege]
     return columns is None or (grant.column is not None and grant.column in columns)
+
+
+class ConnectionSide:
+    """Which run-time role a connection acts as."""
+
+    REQUESTER: Final = "requester"
+    APPROVER: Final = "approver"
+
+
+# Every role that current_user or session_user can switch to, with or without
+# inheriting its privileges, is checked: none may be a superuser, own the table,
+# or be able to delete or truncate it.
+_CONNECTION_SQL = """
+SELECT
+    EXISTS (
+        SELECT 1 FROM pg_roles m
+        WHERE (pg_has_role(current_user, m.oid, 'MEMBER')
+               OR pg_has_role(session_user, m.oid, 'MEMBER'))
+          AND (m.rolsuper OR m.oid = c.relowner
+               OR has_table_privilege(m.oid, c.oid, 'DELETE')
+               OR has_table_privilege(m.oid, c.oid, 'TRUNCATE'))
+    ),
+    pg_has_role(current_user, ?, 'MEMBER') OR pg_has_role(session_user, ?, 'MEMBER'),
+    pg_has_role(current_user, ?, 'MEMBER') OR pg_has_role(session_user, ?, 'MEMBER'),
+    pg_has_role(?, ?, 'MEMBER') OR pg_has_role(?, ?, 'MEMBER')
+FROM pg_class c WHERE c.oid = to_regclass(?)
+"""
+
+
+def check_connection(session: "Session", schema: str) -> str:
+    """Check the approvals schema and the connecting role; return the role's side.
+
+    Raises ConfigError, before anything is written, when the schema predates
+    0.1.0a3 or lost a guard trigger, when the requester and approver roles
+    overlap or hold more than their layout allows on the decision columns, or
+    when the connecting role is a superuser, the owner, able to delete rows,
+    or a member of both roles or of neither.
+    """
+    quoted_schema = identifier(schema, what="schema")
+    table = f"{quoted_schema}.{APPROVALS_TABLE}"
+    roles_table = f"{quoted_schema}.{ROLES_TABLE}"
+    exists, has_roles = session.execute(
+        "SELECT to_regclass(?) IS NOT NULL, to_regclass(?) IS NOT NULL", (table, roles_table)
+    )[0]
+    if not exists:
+        raise ConfigError(
+            f"Table {schema}.{APPROVALS_TABLE} does not exist; install it with "
+            "storage.install_postgres_schema as the owner role."
+        )
+    triggers = {
+        row[0]
+        for row in session.execute(
+            "SELECT tgname FROM pg_trigger "
+            "WHERE tgrelid = to_regclass(?) AND NOT tgisinternal AND tgenabled <> 'D'",
+            (table,),
+        )
+    }
+    if not has_roles or not triggers >= APPROVALS_TRIGGERS:
+        missing = sorted(APPROVALS_TRIGGERS - triggers)
+        raise ConfigError(
+            f"The approvals table in {schema} is not protected by the database "
+            f"({'missing or disabled: ' + ', '.join(missing) if missing else 'no role table'}): "
+            "it was created by agent-core 0.1.0a2, or its guard was removed. As the owner "
+            "role, run install_postgres_schema from 0.1.0a3 with the requester and approver "
+            "roles; it upgrades the schema in place and keeps every row."
+        )
+    requester_role, approver_role = session.execute(
+        f"SELECT requester_role, approver_role FROM {roles_table}"
+    )[0]
+    can_change, is_requester, is_approver, overlap = session.execute(
+        _CONNECTION_SQL,
+        (
+            requester_role,
+            requester_role,
+            approver_role,
+            approver_role,
+            requester_role,
+            approver_role,
+            approver_role,
+            requester_role,
+            table,
+        ),
+    )[0]
+    if overlap or requester_role == approver_role:
+        raise ConfigError(
+            f"The requester role {requester_role} and approver role {approver_role} overlap, "
+            "so a requester could approve. Use two unrelated roles."
+        )
+    if can_change:
+        raise ConfigError(
+            "This connection's role, or a role it can switch to, is a superuser, owns the "
+            "approvals table, or can delete from or truncate it. Connect as the requester or "
+            "the approver role."
+        )
+    if is_requester == is_approver:
+        raise ConfigError(
+            "This connection's role must be a member of exactly one of "
+            f"{requester_role} and {approver_role}; it is a member of "
+            f"{'both' if is_requester else 'neither'}."
+        )
+    _check_layout(session, table, requester_role, approver_role)
+    return ConnectionSide.REQUESTER if is_requester else ConnectionSide.APPROVER
+
+
+def _check_layout(session: "Session", table: str, requester_role: str, approver_role: str) -> None:
+    """Refuse grants that would let a requester decide or an approver submit."""
+    decision_rights = session.execute(
+        "SELECT " + ", ".join("has_column_privilege(?, ?, ?, 'UPDATE')" for _ in DECISION_COLUMNS),
+        tuple(value for column in DECISION_COLUMNS for value in (requester_role, table, column)),
+    )[0]
+    writable = [
+        column for column, can in zip(DECISION_COLUMNS, decision_rights, strict=True) if can
+    ]
+    if writable:
+        raise ConfigError(
+            f"The requester role {requester_role} can update {', '.join(writable)} on the "
+            "approvals table, so it could record a decision. Revoke that grant."
+        )
+    if session.execute("SELECT has_table_privilege(?, ?, 'INSERT')", (approver_role, table))[0][0]:
+        raise ConfigError(
+            f"The approver role {approver_role} can insert approval requests. Revoke that grant."
+        )

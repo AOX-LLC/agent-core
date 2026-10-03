@@ -15,12 +15,14 @@ from uuid import UUID, uuid4
 
 from pydantic import JsonValue
 
+from aox_agent_core import _postgres_schema as layout
 from aox_agent_core._canonical import canonical_json, sha256_of
 from aox_agent_core._validation import STORED_RECORD
 from aox_agent_core.approvals.policy import ApproverPolicy, RoleApproverPolicy
 from aox_agent_core.approvals.types import (
     TTL_SECONDS_MAX,
     ApprovalRequest,
+    ApprovalSide,
     ApprovalStatus,
     Decision,
     DenialReason,
@@ -39,9 +41,16 @@ from aox_agent_core.errors import (
     ApprovalNotFoundError,
     ApprovalNotGrantedError,
     ApprovalPayloadMismatchError,
+    ConfigError,
     NotAuthorizedToResolveError,
 )
-from aox_agent_core.storage import Database, Dialect, Session, require_current_table
+from aox_agent_core.storage import (
+    Database,
+    Dialect,
+    Session,
+    bring_table_up_to_date,
+    require_current_table,
+)
 
 ResultT = TypeVar("ResultT")
 
@@ -64,8 +73,12 @@ CREATE TABLE {APPROVALS_TABLE} (
     resolved_at TEXT,
     consumed_at TEXT,
     reason TEXT,
-    run_context TEXT
+    run_context TEXT,
+    closed_at TEXT,
+    delegates TEXT NOT NULL DEFAULT '[]'
 )"""
+# Columns added in 0.1.0a3, with their SQLite types.
+ADDED_IN_A3: Final = {"closed_at": "TEXT", "delegates": "TEXT NOT NULL DEFAULT '[]'"}
 
 _PENDING_INDEX_DDL = (
     f"CREATE INDEX agent_core_approvals_pending ON {APPROVALS_TABLE} (status, created_at, id)"
@@ -126,6 +139,34 @@ class SQLApprovalQueue:
         self._audit_log = audit_log
         self._policy = policy if policy is not None else RoleApproverPolicy()
         self._clock = clock if clock is not None else _utc_now
+        self._schema = layout.DEFAULT_SCHEMA
+        self._side: ApprovalSide | None = None
+
+    async def side(self) -> ApprovalSide:
+        """Which side this queue's connection acts for, checking the setup first.
+
+        Raises ConfigError if the Postgres schema or roles are wrong; see
+        _postgres_schema.check_connection.
+        """
+        return await self.database.run(self._prepare)
+
+    def _prepare(self, session: Session) -> ApprovalSide:
+        """Check the connection once per queue, upgrading a SQLite file in place."""
+        if self._side is None:
+            if session.dialect is Dialect.SQLITE:
+                bring_table_up_to_date(session, APPROVALS_TABLE, ADDED_IN_A3)
+                self._side = ApprovalSide.BOTH
+            else:
+                self._side = ApprovalSide(layout.check_connection(session, self._schema))
+        return self._side
+
+    def _require_side(self, session: Session, operation: str, side: ApprovalSide) -> None:
+        actual = self._prepare(session)
+        if actual not in (side, ApprovalSide.BOTH):
+            raise ConfigError(
+                f"This queue connects as the {actual.value} role, which cannot {operation}; "
+                f"use a queue on the {side.value} role's connection."
+            )
 
     def _now(self) -> datetime:
         now = self._clock()
@@ -165,6 +206,7 @@ class SQLApprovalQueue:
         )
 
         def insert(session: Session) -> _Outcome:
+            self._require_side(session, "submit requests", ApprovalSide.REQUESTER)
             _ensure_table(session)
             require_current_table(session, APPROVALS_TABLE, RUN_CONTEXT_COLUMN)
             session.execute(
@@ -186,7 +228,12 @@ class SQLApprovalQueue:
 
     async def get(self, request_id: UUID) -> ApprovalRequest:
         """Return the request; raises ApprovalNotFoundError if there is none."""
-        request = await self.database.run(lambda session: _load(session, request_id))
+
+        def read(session: Session) -> ApprovalRequest | None:
+            self._prepare(session)
+            return _load(session, request_id)
+
+        request = await self.database.run(read)
         if request is None:
             raise ApprovalNotFoundError(f"No approval request {request_id}.")
         return request
@@ -226,6 +273,7 @@ class SQLApprovalQueue:
         def read_pages(session: Session) -> bool:
             """Read pages until `limit` requests pass; return whether more pages remain."""
             nonlocal resume_after
+            self._prepare(session)
             while len(eligible) < limit:
                 page = _load_pending_page(
                     session, now=now, after=resume_after, narrowed_to=narrowed_to, limit=page_size
@@ -268,6 +316,7 @@ class SQLApprovalQueue:
         """
 
         def decide(session: Session) -> _Outcome:
+            self._require_side(session, "decide requests", ApprovalSide.APPROVER)
             request = _load(session, request_id)
             if request is None:
                 return _denied(
@@ -363,6 +412,7 @@ class SQLApprovalQueue:
         presented_hash = approval_payload_hash(action, payload)
 
         def use(session: Session) -> _Outcome:
+            self._require_side(session, "consume approvals", ApprovalSide.REQUESTER)
             request = _load(session, request_id)
             if request is None:
                 return _denied(

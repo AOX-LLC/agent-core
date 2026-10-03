@@ -72,6 +72,7 @@ EXPECTED_EXPORTS = {
         "TTL_SECONDS_MAX",
         "ApprovalQueue",
         "ApprovalRequest",
+        "ApprovalSide",
         "ApprovalStatus",
         "ApproverPolicy",
         "Decision",

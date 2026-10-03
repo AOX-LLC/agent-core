@@ -340,6 +340,7 @@ def install_postgres_schema(
         for role, role_layout in (
             (requester_role, layout.REQUESTER_LAYOUT),
             (approver_role, layout.APPROVER_LAYOUT),
+            ("PUBLIC", layout.PUBLIC_LAYOUT),
         ):
             # Decided per table before granting anything, so a role's first grant on
             # a table does not stop the rest of its layout there.
@@ -350,9 +351,12 @@ def install_postgres_schema(
                 if table in fresh_tables:
                     session.execute(statement)
             # Both roles must reach the schema; in public, PUBLIC usually grants it.
-            if not session.execute("SELECT has_schema_privilege(?, ?, 'USAGE')", (role, schema))[0][
-                0
-            ]:
+            if (
+                role != "PUBLIC"
+                and not session.execute(
+                    "SELECT has_schema_privilege(?, ?, 'USAGE')", (role, schema)
+                )[0][0]
+            ):
                 session.execute(
                     f"GRANT USAGE ON SCHEMA {layout.identifier(schema, what='schema')} "
                     f"TO {layout.identifier(role, what='role')}"
@@ -371,7 +375,11 @@ def outside_layout(
     session: Session, schema: str, requester_role: str, approver_role: str
 ) -> list[Grant]:
     """Grants on the library's tables beyond the owner's and the two roles' layouts."""
-    layouts = {requester_role: layout.REQUESTER_LAYOUT, approver_role: layout.APPROVER_LAYOUT}
+    layouts = {
+        requester_role: layout.REQUESTER_LAYOUT,
+        approver_role: layout.APPROVER_LAYOUT,
+        "PUBLIC": layout.PUBLIC_LAYOUT,
+    }
     found: list[Grant] = []
     for table in (layout.AUDIT_TABLE, layout.APPROVALS_TABLE, layout.ROLES_TABLE):
         for grant in _grants_on(session, schema, table):

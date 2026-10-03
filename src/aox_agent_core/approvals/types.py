@@ -52,6 +52,21 @@ class ApprovalStatus(StrEnum):
     CANCELLED = "cancelled"
 
 
+class ApprovalSide(StrEnum):
+    """Which side of the approval queue a connection acts for.
+
+    On Postgres the requester role (the agent side) submits, consumes and
+    cancels, and the approver role (the decision side) approves and rejects;
+    the database enforces it. SQLite has no roles, so a SQLite queue is BOTH and
+    the library's checks are all there is: anyone who can write the file is
+    trusted with everything.
+    """
+
+    REQUESTER = "requester"
+    APPROVER = "approver"
+    BOTH = "both"
+
+
 class Decision(StrEnum):
     APPROVE = "approve"
     REJECT = "reject"
