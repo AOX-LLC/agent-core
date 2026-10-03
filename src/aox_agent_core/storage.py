@@ -695,10 +695,7 @@ def install_postgres_schema(
     layout.identifier(schema, what="schema")
     if requester_role == approver_role:
         raise ConfigError("The requester and approver roles must be different roles.")
-    if urlsplit(
-        owner_url.get_secret_value() if isinstance(owner_url, SecretStr) else owner_url
-    ).scheme not in {"postgresql", "postgres"}:
-        raise ConfigError("install_postgres_schema needs a postgresql:// URL.")
+    _require_postgres_url(owner_url, what="install_postgres_schema")
 
     async def install(session: Session) -> InstallReport:
         await layout.require_postgres_version(session)
@@ -716,8 +713,9 @@ def install_postgres_schema(
         # Checked before the guard is written: a run with other role names must not
         # get as far as rewriting it with them.
         await _record_roles(session, schema, requester_role, approver_role)
-        for statement in layout.logins_ddl(schema, approver_role):
+        for statement in layout.logins_ddl(schema, requester_role, approver_role):
             await session.execute(statement)
+        await layout.require_logins_made_by_owner(session, schema)
         binding = bind_resolved_by
         if binding is None:
             binding = bool(await layout.login_binding_enabled(session, schema))
@@ -1103,7 +1101,7 @@ async def _record_roles(
 
 _UNMAPPED_LOGINS = """
 SELECT r.rolname FROM pg_roles r
-WHERE r.rolcanlogin AND NOT r.rolsuper AND pg_has_role(r.oid, ?, 'MEMBER') AND r.rolname <> ?
+WHERE r.rolcanlogin AND NOT r.rolsuper AND pg_has_role(r.oid, ?, 'MEMBER')
   AND NOT EXISTS (SELECT 1 FROM {table} m
                   WHERE m.login_oid = r.oid AND m.login = r.rolname AND m.removed_at IS NULL)
 ORDER BY r.rolname
@@ -1113,9 +1111,7 @@ ORDER BY r.rolname
 async def _unmapped_logins(session: Session, schema: str, approver_role: str) -> list[str]:
     """Login roles that are members of the approver role and have no active mapping."""
     table = f"{layout.identifier(schema, what='schema')}.{layout.LOGINS_TABLE}"
-    rows = await session.execute(
-        _UNMAPPED_LOGINS.format(table=table), (approver_role, approver_role)
-    )
+    rows = await session.execute(_UNMAPPED_LOGINS.format(table=table), (approver_role,))
     return [row[0] for row in rows]
 
 
@@ -1135,7 +1131,7 @@ def bind_approver_login(
     """
     if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}", principal) is None:
         raise ConfigError(f"{principal!r} is not a principal id.")
-    _owner_url(owner_url)
+    _require_postgres_url(owner_url)
 
     async def bind(session: Session) -> None:
         requester_role, approver_role = await _installed_roles(session, schema)
@@ -1165,10 +1161,19 @@ def bind_approver_login(
                 f"{layout.LOGINS_TABLE}. A login or a principal is never mapped twice, even "
                 "after a mapping is removed; use a new principal id for a new login."
             )
-        await session.execute(
-            f"INSERT INTO {table} (login, login_oid, principal) VALUES (?, ?, ?)",
-            (login, login_oid, principal),
-        )
+        try:
+            await session.execute(
+                f"INSERT INTO {table} (login, login_oid, principal) VALUES (?, ?, ?)",
+                (login, login_oid, principal),
+            )
+        except driver_errors() as error:
+            if getattr(error, "sqlstate", None) != "23505":
+                raise
+            # A concurrent bind of the same login or principal won the race.
+            raise ConfigError(
+                f"The login {login!r} or the principal {principal!r} was mapped at the same "
+                "time by another run. A login or a principal is never mapped twice."
+            ) from error
 
     _run_as_owner(owner_url, bind)
 
@@ -1181,7 +1186,7 @@ def unbind_approver_login(
     Run as the owner role. The row stays, with removed_at set. Raises ConfigError if the
     login has no active mapping.
     """
-    _owner_url(owner_url)
+    _require_postgres_url(owner_url)
 
     async def unbind(session: Session) -> None:
         table = f"{layout.identifier(schema, what='schema')}.{layout.LOGINS_TABLE}"
@@ -1196,20 +1201,19 @@ def unbind_approver_login(
     _run_as_owner(owner_url, unbind)
 
 
-def _owner_url(owner_url: str | SecretStr) -> None:
+def _require_postgres_url(owner_url: str | SecretStr, *, what: str = "This") -> None:
     raw = owner_url.get_secret_value() if isinstance(owner_url, SecretStr) else owner_url
     if urlsplit(raw).scheme not in {"postgresql", "postgres"}:
-        raise ConfigError("This needs a postgresql:// URL.")
+        raise ConfigError(f"{what} needs a postgresql:// URL.")
 
 
 async def _installed_roles(session: Session, schema: str) -> tuple[str, str]:
     roles = f"{layout.identifier(schema, what='schema')}.{layout.ROLES_TABLE}"
-    try:
-        rows = await session.execute(f"SELECT requester_role, approver_role FROM {roles}")
-    except Exception as error:
+    if not (await session.execute("SELECT to_regclass(?) IS NOT NULL", (roles,)))[0][0]:
         raise ConfigError(
             f"The approvals schema is not installed in {schema}; run install_postgres_schema."
-        ) from error
+        )
+    rows = await session.execute(f"SELECT requester_role, approver_role FROM {roles}")
     return rows[0][0], rows[0][1]
 
 

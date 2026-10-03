@@ -204,7 +204,6 @@ class SQLApprovalQueue:
         self._clock = clock if clock is not None else _utc_now
         self._schema = self._table.schema or layout.DEFAULT_SCHEMA
         self._side: ApprovalSide | None = None
-        self._binds_logins = False
         self._last_hidden_warning = float("-inf")
 
     async def side(self, *, connection: Any = None) -> ApprovalSide:
@@ -235,7 +234,6 @@ class SQLApprovalQueue:
                 self._side = ApprovalSide.BOTH
             else:
                 side = ApprovalSide(await layout.check_connection(session, self._schema))
-                self._binds_logins = bool(await layout.login_binding_enabled(session, self._schema))
                 # An installer that predates this release leaves columns out.
                 await bring_table_up_to_date(
                     session, APPROVALS_TABLE, ADDED_COLUMNS, schema=self._table.schema
@@ -555,7 +553,9 @@ class SQLApprovalQueue:
         ApprovalAlreadyResolvedError if it is no longer pending,
         ApprovalExpiredError if it has expired, and ApprovalNotFoundError if it
         does not exist. Each of those is audited first, with `context` or, without
-        one, the request's own.
+        one, the request's own. With login binding on (Postgres), a principal other
+        than the one the owner mapped to this connection's login is refused the same
+        way, as DenialReason.LOGIN_BINDING.
         """
 
         async def decide(session: Session) -> _Outcome:
@@ -602,7 +602,10 @@ class SQLApprovalQueue:
                     ),
                 )
 
-            if self._binds_logins:
+            if session.dialect is Dialect.POSTGRES and await layout.login_binding_enabled(
+                session, self._schema
+            ):
+                # Read here, not once at start-up: an operator can turn binding on or off.
                 # The guard enforces this; asking first gives the refusal a name and an audit
                 # event instead of a driver error. The mapping is read inside this transaction.
                 bound = await layout.bound_principal(session, self._schema)

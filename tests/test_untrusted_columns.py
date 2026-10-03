@@ -1145,7 +1145,7 @@ async def test_a_queue_refuses_to_start_when_binding_is_on_and_the_mapping_is_mi
         await approver_queue(unmapped_url).side()
     # Nor does any queue once the mapping table is gone or can be written by a runtime role.
     control_database.superuser_raw(f"GRANT INSERT ON agent_core_approver_logins TO {APPROVER_ROLE}")
-    with pytest.raises(ConfigError, match="can write the login mapping table"):
+    with pytest.raises(ConfigError, match="holds a privilege on the login mapping table"):
         await approver_queue(url).side()
     control_database.superuser_raw(
         f"REVOKE INSERT ON agent_core_approver_logins FROM {APPROVER_ROLE}"
@@ -1242,3 +1242,165 @@ def test_renaming_roles_cannot_move_a_mapping_to_another_login(
     with pytest.raises(psycopg.Error, match=MISMATCH):
         runner_as(mapped_url.replace(f"{mapped}@", f"{mapped}_old@", 1), decide_sql(row, "user-17"))
     assert status_of(control_database, row) == "pending"
+
+
+# What the gatekeeper's review of 0.1.0a7 found: who made, owns and can reach the mapping.
+
+LOGINS = "agent_core_approver_logins"
+
+
+def probe_role(database: ControlDatabase, *options: str) -> str:
+    role = f"agent_core_probe_{uuid4().hex[:8]}"
+    database.superuser_raw(f"CREATE ROLE {role} {' '.join(options)}")
+    database.roles.append(role)
+    return role
+
+
+def approver_queue_at(database: ControlDatabase, url: str) -> SQLApprovalQueue:
+    connection = open_database(url)
+    return SQLApprovalQueue(
+        connection,
+        audit_log=SQLAuditLog(connection, schema=database.schema),
+        schema=database.schema,
+        policy=RoleApproverPolicy(roles_by_action=TEST_ACTION_ROLES),
+    )
+
+
+async def test_a_mapping_table_the_approver_role_owns_is_refused_not_adopted(
+    control_database: ControlDatabase,
+) -> None:
+    if control_database.superuser_url is None:
+        pytest.skip("login binding exists only on Postgres")
+    login, url = approver_login(control_database)
+    bind_logins(control_database, (login, "user-17"))
+    control_database.superuser_raw(f"ALTER TABLE {LOGINS} OWNER TO {APPROVER_ROLE}")
+
+    with pytest.raises(ConfigError, match="was not made by the approvals table's owner"):
+        await approver_queue_at(control_database, url).side()
+
+
+def test_the_installer_refuses_a_mapping_table_made_by_another_role(
+    control_database: ControlDatabase,
+) -> None:
+    if control_database.superuser_url is None:
+        pytest.skip("the installer is Postgres only")
+    squatter = probe_role(control_database, "NOLOGIN")
+    control_database.superuser_raw(f"GRANT {squatter} TO agent_core_owner")
+    control_database.superuser_raw(f"ALTER TABLE {LOGINS} OWNER TO {squatter}")
+
+    with pytest.raises(ConfigError, match="was not made by the approvals table's owner"):
+        bind_logins(control_database, on=False)
+
+
+async def test_a_column_grant_on_the_mapping_table_is_refused_and_the_installer_removes_it(
+    control_database: ControlDatabase,
+) -> None:
+    if control_database.superuser_url is None:
+        pytest.skip("login binding exists only on Postgres")
+    login, url = approver_login(control_database)
+    other, other_url = approver_login(control_database)
+    bind_logins(control_database, (login, "user-17"))
+    control_database.superuser_raw(
+        f"GRANT INSERT (login, login_oid, principal) ON {LOGINS} TO {APPROVER_ROLE}"
+    )
+
+    # has_table_privilege cannot see a column grant; the ACL check does.
+    with pytest.raises(ConfigError, match="holds a privilege on the login mapping table"):
+        await approver_queue_at(control_database, url).side()
+    # The unmapped approver login cannot use it to map itself while the queue refuses; and
+    # a reinstall takes the grant back from the two runtime roles.
+    bind_logins(control_database, on=True)
+    assert await approver_queue_at(control_database, url).side() is ApprovalSide.APPROVER
+    with pytest.raises(psycopg.Error, match="permission denied"):
+        runner_as(
+            other_url,
+            f"INSERT INTO {LOGINS} (login, login_oid, principal) VALUES ('{other}', 1, 'user-17')",
+        )
+
+
+def test_a_privilege_for_any_other_role_stops_the_installer(
+    control_database: ControlDatabase,
+) -> None:
+    if control_database.superuser_url is None:
+        pytest.skip("the installer is Postgres only")
+    third = probe_role(control_database, "NOLOGIN")
+    control_database.superuser_raw(f"GRANT SELECT ON {LOGINS} TO {third}")
+
+    with pytest.raises(ConfigError, match="holds a privilege on the login mapping table"):
+        bind_logins(control_database, on=False)
+
+
+def test_with_binding_off_the_guard_does_not_call_the_lookup_so_a6_behaviour_holds(
+    control_database: ControlDatabase,
+) -> None:
+    if control_database.superuser_url is None:
+        pytest.skip("login binding exists only on Postgres")
+    schema = control_database.schema
+    guard = f"SELECT pg_get_functiondef('{schema}.agent_core_approvals_guard()'::regprocedure)"
+    assert "agent_core_bound_principal" not in control_database.superuser_raw(guard)[0][0]
+    # A member that holds the column grants itself, with no EXECUTE on the lookup, may decide.
+    direct = probe_role(control_database, "LOGIN", "NOINHERIT")
+    control_database.superuser_raw(f"GRANT {APPROVER_ROLE} TO {direct}")
+    control_database.superuser_raw(
+        f"GRANT SELECT ON {APPROVALS} TO {direct}; "
+        f"GRANT UPDATE (status, decision, resolved_by, resolved_at) ON {APPROVALS} TO {direct}"
+    )
+    assert control_database.superuser_url is not None
+    url = control_database.superuser_url.replace("postgres@", f"{direct}@", 1)
+    row = pending_row(control_database)
+
+    runner_as(url, decide_sql(row, "user-17"))
+    assert status_of(control_database, row) == "approved"
+
+    bind_logins(control_database, on=True)
+    assert "agent_core_bound_principal" in control_database.superuser_raw(guard)[0][0]
+
+
+async def test_a_queue_notices_binding_turned_on_or_off_after_it_started(
+    control_database: ControlDatabase,
+) -> None:
+    if control_database.superuser_url is None:
+        pytest.skip("login binding exists only on Postgres")
+    login, url = approver_login(control_database)
+    bind_logins(control_database, (login, APPROVER.id), on=False)
+    queue = approver_queue_at(control_database, url)
+    assert await queue.side() is ApprovalSide.APPROVER
+
+    async def new_request() -> Any:
+        return await split_queue(control_database).submit(
+            action=ACTION,
+            summary="s",
+            payload={"n": uuid4().hex},
+            requested_by=REQUESTER,
+            required_role="ops.approver",
+            ttl_seconds=600,
+        )
+
+    bind_logins(control_database, on=True)  # after the queue started
+    with pytest.raises(NotAuthorizedToResolveError, match="only the principal"):
+        await queue.resolve(
+            (await new_request()).id, decision=Decision.APPROVE, principal=OTHER_APPROVER
+        )
+    bind_logins(control_database, on=False)
+    resolved = await queue.resolve(
+        (await new_request()).id, decision=Decision.APPROVE, principal=OTHER_APPROVER
+    )
+    assert resolved.resolved_by == OTHER_APPROVER.id
+
+
+def test_the_report_names_an_approver_role_that_is_itself_a_login_and_unmapped(
+    control_database: ControlDatabase,
+) -> None:
+    if control_database.superuser_url is None:
+        pytest.skip("the installer is Postgres only")
+    assert control_database.owner_url is not None
+
+    report = install_postgres_schema(
+        control_database.owner_url,
+        requester_role=REQUESTER_ROLE,
+        approver_role=APPROVER_ROLE,
+        schema=control_database.schema,
+        bind_resolved_by=True,
+    )
+
+    assert APPROVER_ROLE in report.unmapped_logins

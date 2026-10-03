@@ -324,7 +324,7 @@ def approvals_tables_ddl(schema: str) -> tuple[str, ...]:
     )
 
 
-def logins_ddl(schema: str, approver_role: str) -> tuple[str, ...]:
+def logins_ddl(schema: str, requester_role: str, approver_role: str) -> tuple[str, ...]:
     """The login mapping table, its guard, the lookup function and their grants.
 
     Always installed, so an owner can map logins before turning binding on. Nothing on the
@@ -373,6 +373,8 @@ def logins_ddl(schema: str, approver_role: str) -> tuple[str, ...]:
         f"""CREATE OR REPLACE TRIGGER {LOGINS_TRUNCATE_TRIGGER} BEFORE TRUNCATE ON {table}
         FOR EACH STATEMENT EXECUTE FUNCTION {quoted_schema}.{LOGINS_TABLE}_guard()""",
         f"REVOKE ALL ON {table} FROM PUBLIC",
+        # Table-level REVOKE also removes column grants.
+        f"REVOKE ALL ON {table} FROM {identifier(requester_role, what='role')}, {approver}",
         f"""CREATE OR REPLACE FUNCTION {function}() RETURNS text
         LANGUAGE sql STABLE SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $$
             SELECT m.principal FROM {table} m JOIN pg_roles r ON r.oid = m.login_oid
@@ -422,7 +424,7 @@ def approvals_guard_ddl(
         .replace("<retention_floor>", str(int(payload_retention_floor_seconds)))
         .replace("<binding>", "on" if bind_logins else "off")
         .replace("<bind_logins>", "true" if bind_logins else "false")
-        .replace("<bound_principal>", f"{quoted_schema}.{BOUND_PRINCIPAL_FUNCTION}")
+        .replace("<binding_check>", _binding_check(quoted_schema) if bind_logins else "")
     )
     return (
         f"""CREATE OR REPLACE FUNCTION {quoted_schema}.{APPROVALS_TABLE}_guard()
@@ -434,6 +436,19 @@ def approvals_guard_ddl(
         FOR EACH ROW EXECUTE FUNCTION {quoted_schema}.{APPROVALS_TABLE}_guard()""",
         f"""CREATE OR REPLACE TRIGGER {APPROVALS_TRUNCATE_TRIGGER} BEFORE TRUNCATE ON {table}
         FOR EACH STATEMENT EXECUTE FUNCTION {quoted_schema}.{APPROVALS_TABLE}_guard()""",
+    )
+
+
+def _binding_check(quoted_schema: str) -> str:
+    """The guard's login-binding rule. Written into the guard only when binding is on:
+    Postgres checks EXECUTE on a function when it prepares the statement that calls it, so a
+    call left in the guard while binding is off would still refuse a role without EXECUTE."""
+    return (
+        f"        IF NEW.resolved_by IS DISTINCT FROM {quoted_schema}.{BOUND_PRINCIPAL_FUNCTION}()"
+        " THEN\n"
+        "            RAISE EXCEPTION 'resolved_by must be the principal mapped to the deciding "
+        "login';\n"
+        "        END IF;\n"
     )
 
 
@@ -624,10 +639,7 @@ BEGIN
         IF is_expired OR is_overlong THEN
             RAISE EXCEPTION 'approval request % has expired or has no valid lifetime', OLD.id;
         END IF;
-        IF bind_logins AND NEW.resolved_by IS DISTINCT FROM <bound_principal>() THEN
-            RAISE EXCEPTION 'resolved_by must be the principal mapped to the deciding login';
-        END IF;
-        IF NEW.decision IS DISTINCT FROM
+<binding_check>        IF NEW.decision IS DISTINCT FROM
                (CASE NEW.status WHEN 'approved' THEN 'approve' ELSE 'reject' END)
            OR NEW.resolved_by IS NULL OR NEW.resolved_by = OLD.requested_by
            OR jsonb_exists(OLD.delegates::jsonb, NEW.resolved_by)
@@ -1042,6 +1054,7 @@ async def _require_login_mapping(
             "owner role, run install_postgres_schema from 0.1.0a7, then map each approver "
             "login with bind_approver_login."
         )
+    await require_logins_made_by_owner(session, schema)
     roles = [requester_role, approver_role] + [
         row[0] for row in await session.execute(_CONNECTING_ROLES)
     ]
@@ -1062,6 +1075,54 @@ async def _require_login_mapping(
         raise ConfigError(
             f"Login binding is on in {schema}, and the login {login} has no principal mapped. "
             "As the owner role, map it with bind_approver_login before it decides requests."
+        )
+
+
+_LOGINS_ACL_SQL = """
+SELECT g.grantee::regrole::text FROM pg_class c, aclexplode(c.relacl) g
+WHERE c.oid = to_regclass(?) AND g.grantee <> c.relowner
+UNION ALL
+SELECT g.grantee::regrole::text FROM pg_attribute a, aclexplode(a.attacl) g, pg_class c
+WHERE a.attrelid = to_regclass(?) AND c.oid = a.attrelid AND a.attnum > 0
+  AND NOT a.attisdropped AND g.grantee <> c.relowner
+"""
+
+
+async def require_logins_made_by_owner(session: "Session", schema: str) -> None:
+    """Refuse a mapping table or lookup function the owner did not make, or others can reach.
+
+    The installer creates the table only if it is absent, so a table another role made first
+    would be adopted, with that role as its owner. The table and the function must have the
+    approvals table's owner, the function must be SECURITY DEFINER with a pinned search_path,
+    and no role but the owner may hold any table or column privilege on the table (default
+    privileges and column grants included).
+    """
+    quoted_schema = identifier(schema, what="schema")
+    table = f"{quoted_schema}.{LOGINS_TABLE}"
+    function = f"{quoted_schema}.{BOUND_PRINCIPAL_FUNCTION}()"
+    owners = (
+        await session.execute(
+            "SELECT t.relowner = a.relowner, p.proowner = a.relowner, p.prosecdef, "
+            "COALESCE(p.proconfig::text[] @> ARRAY['search_path=pg_catalog, pg_temp'], false) "
+            "FROM pg_class t, pg_class a, pg_proc p "
+            "WHERE t.oid = to_regclass(?) AND a.oid = to_regclass(?) "
+            "AND p.oid = to_regprocedure(?)",
+            (table, f"{quoted_schema}.{APPROVALS_TABLE}", function),
+        )
+    )[0:1]
+    if not owners or not all(owners[0]):
+        raise ConfigError(
+            f"The login mapping table or {BOUND_PRINCIPAL_FUNCTION}() in {schema} was not made by "
+            "the approvals table's owner, or the function is not SECURITY DEFINER with a pinned "
+            "search_path. Another role may have created them first. As the owner role, drop "
+            "them and run install_postgres_schema again."
+        )
+    grantees = [row[0] for row in await session.execute(_LOGINS_ACL_SQL, (table, table))]
+    if grantees:
+        raise ConfigError(
+            f"{', '.join(sorted(set(grantees)))} holds a privilege on the login mapping table in "
+            f"{schema}, directly, by column or by default privileges. Only the owner may. As the "
+            "owner role, REVOKE ALL on it from them."
         )
 
 
