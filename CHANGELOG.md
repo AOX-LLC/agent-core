@@ -32,6 +32,10 @@ Fix release for 0.1.0a5. **0.1.0a5 was tagged but never released** (see below): 
 - `expire_due` and `purge_payloads` skip a request another transaction holds (`FOR UPDATE SKIP LOCKED`, taken by the UPDATE after the audit append lock, so the lock order is unchanged) instead of failing the whole sweep with `LockNotAvailable` after `lock_timeout`. The request is picked up by the next sweep. SQLite is unchanged.
 - `install_postgres_schema` reports `InstallReport.backdated_finishes`: finished requests that still hold a payload and whose finish time is before their own creation or decision (at most 1000, by id). 0.1.0a4 let the closing role write `closed_at` and `consumed_at`, so such a row is purgeable at once under any retention floor; the guard has written those times itself since 0.1.0a5. The installer changes nothing about them; check them before the first purge. A backdated time that still falls after the request's creation and decision cannot be told from a real one and is not listed.
 
+### Known limits
+
+- Test isolation (a test-suite issue, not the library; for Phase 5). The Postgres tests create the requester and approver roles, and roles are cluster-wide, not per database. Two test runs, or a test run and a review probe, against the same Postgres server at once can collide on them. On Python 3.14 two of five full local runs failed in the installer and schema tests (3 to 4 failures each, none reproducible alone), while 3.11 passed every run. The collision is the suspected cause and was not confirmed. Run one suite at a time against a test server until the tests use their own role names.
+
 ## [0.1.0a5] - 2026-10-03
 
 **Tagged but not released; use 0.1.0a6.** The `v0.1.0a5` tag exists, but the release workflow refused it because this section was filed under Unreleased, so there is no GitHub release and no published wheel. The tag stays where it is. Everything in this section ships in 0.1.0a6.
