@@ -240,6 +240,7 @@ DECLARE
     principal_shape text := '^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$';
     opaque_shape text := '^[A-Za-z0-9][A-Za-z0-9._:/-]{0,199}$';
     run_context jsonb;
+    is_overlong boolean;
     as_requester boolean;
     as_approver boolean;
     db_now timestamptz := statement_timestamp();
@@ -324,8 +325,12 @@ BEGIN
         IF NOT as_approver THEN
             RAISE EXCEPTION 'only the approver role may decide an approval request';
         END IF;
-        IF is_expired THEN
-            RAISE EXCEPTION 'approval request % has expired', OLD.id;
+        -- Rows written before the guard existed (0.1.0a2) may carry any lifetime;
+        -- such a request can be neither decided nor used, only cancelled or expired.
+        is_overlong := NOT_CANONICAL(OLD.created_at) OR NOT_CANONICAL(OLD.expires_at)
+            OR OLD.expires_at::timestamptz > OLD.created_at::timestamptz + interval '7 days';
+        IF is_expired OR is_overlong THEN
+            RAISE EXCEPTION 'approval request % has expired or has no valid lifetime', OLD.id;
         END IF;
         IF NEW.decision IS DISTINCT FROM
                (CASE NEW.status WHEN 'approved' THEN 'approve' ELSE 'reject' END)
@@ -363,8 +368,12 @@ BEGIN
         IF NOT as_requester THEN
             RAISE EXCEPTION 'only the requester role may consume an approval';
         END IF;
-        IF is_expired THEN
-            RAISE EXCEPTION 'approval request % has expired', OLD.id;
+        -- Rows written before the guard existed (0.1.0a2) may carry any lifetime;
+        -- such a request can be neither decided nor used, only cancelled or expired.
+        is_overlong := NOT_CANONICAL(OLD.created_at) OR NOT_CANONICAL(OLD.expires_at)
+            OR OLD.expires_at::timestamptz > OLD.created_at::timestamptz + interval '7 days';
+        IF is_expired OR is_overlong THEN
+            RAISE EXCEPTION 'approval request % has expired or has no valid lifetime', OLD.id;
         END IF;
         IF NEW.consumed_at IS NULL OR NOT_CANONICAL(NEW.consumed_at)
            OR ROW(NEW.decision, NEW.resolved_by, NEW.resolved_at, NEW.reason, NEW.closed_at)
@@ -402,12 +411,18 @@ class InstallReport:
     other than the owner, the requester and the approver, or held by those two
     beyond their layout: an a2 app role's grants, say. The installer never
     revokes them; revoke them yourself once nothing uses them.
+
+    unaudited_approvals lists approved, unconsumed requests that no
+    approval.resolved audit event approves: what plain SQL could have approved
+    before 0.1.0a3. closed_approvals lists those the run cancelled, when asked.
     """
 
     schema: str
     requester_role: str
     approver_role: str
     outside_layout: tuple[Grant, ...] = field(default=())
+    unaudited_approvals: tuple[str, ...] = field(default=())
+    closed_approvals: tuple[str, ...] = field(default=())
 
     def __str__(self) -> str:
         lines = [
@@ -417,6 +432,15 @@ class InstallReport:
         if self.outside_layout:
             lines.append("Grants outside the layout, to revoke once nothing uses them:")
             lines += [f"  {grant}" for grant in self.outside_layout]
+        if self.unaudited_approvals:
+            lines.append(
+                "Approved, unused requests with no approval.resolved audit event "
+                "(possibly approved by plain SQL before 0.1.0a3):"
+            )
+            lines += [f"  {request_id}" for request_id in self.unaudited_approvals]
+        if self.closed_approvals:
+            lines.append("Cancelled by this run, as asked:")
+            lines += [f"  {request_id}" for request_id in self.closed_approvals]
         return "\n".join(lines)
 
 

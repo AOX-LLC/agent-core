@@ -582,6 +582,8 @@ async def test_an_a2_schema_is_upgraded_in_place() -> None:
         ]
         assert (await log.verify()).seq == 2
         assert status_of(database, legacy_id) == "approved"
+        assert report.unaudited_approvals == (legacy_id,)
+        assert legacy_id in str(report)
         assert {grant.role for grant in report.outside_layout} == {LEGACY_APP_ROLE}
         assert (
             Grant(table="agent_core_approvals", role=LEGACY_APP_ROLE, privilege="UPDATE")
@@ -600,6 +602,26 @@ async def test_an_a2_schema_is_upgraded_in_place() -> None:
                 database.owner_url, requester_role=REQUESTER_ROLE, approver_role=APPROVER_ROLE
             ).outside_layout
             == report.outside_layout
+        )
+
+        # Asked to, a run cancels what no audit event approved: the a2 row, and the
+        # one approved above by plain SQL as the approver, outside the library.
+        closing = install_postgres_schema(
+            database.owner_url,
+            requester_role=REQUESTER_ROLE,
+            approver_role=APPROVER_ROLE,
+            close_unaudited_approvals=True,
+        )
+        assert set(closing.closed_approvals) == {legacy_id, pending_id}
+        assert status_of(database, legacy_id) == "cancelled"
+        assert database.raw(
+            "SELECT tgenabled FROM pg_trigger WHERE tgname = 'agent_core_approvals_guard'"
+        ) == [("O",)]
+        assert (
+            install_postgres_schema(
+                database.owner_url, requester_role=REQUESTER_ROLE, approver_role=APPROVER_ROLE
+            ).unaudited_approvals
+            == ()
         )
 
 
@@ -708,3 +730,21 @@ def test_a_decision_of_the_wrong_shape_is_refused(pg: ControlDatabase, assignmen
 
     assert refused(pg.approver_raw, sql)
     assert status_of(pg, request_id) == "pending"
+
+
+def test_a_row_with_an_overlong_lifetime_can_be_neither_decided_nor_used(
+    pg: ControlDatabase,
+) -> None:
+    # What a2 let any app role write: a ten-year lifetime, past the guard.
+    approved = planted(pg, "approved")
+    pending = planted(pg, "pending")
+    pg.superuser_raw(
+        "SET session_replication_role = replica; UPDATE agent_core_approvals "
+        f"SET expires_at = '{stamp(NOW + timedelta(days=3650))}'"
+    )
+    assert pg.requester_raw is not None
+    assert pg.approver_raw is not None
+
+    assert refused(pg.requester_raw, transition_sql(approved, "consumed", status_only=False))
+    assert refused(pg.approver_raw, transition_sql(pending, "approved", status_only=False))
+    assert not refused(pg.requester_raw, transition_sql(pending, "cancelled", status_only=False))

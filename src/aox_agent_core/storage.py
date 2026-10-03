@@ -335,6 +335,7 @@ def install_postgres_schema(
     requester_role: str,
     approver_role: str,
     schema: str = "public",
+    close_unaudited_approvals: bool = False,
 ) -> InstallReport:
     """Create or upgrade the audit and approval tables in `schema`, as the owner role.
 
@@ -349,9 +350,13 @@ def install_postgres_schema(
     layout only on a table where that role holds no privilege yet, and never
     revokes anything, so it never weakens a grant an operator tightened. The
     returned report lists grants outside the layout, such as an a2 app role's,
-    for the operator to revoke. Raises ConfigError for tables from 0.1.0a1, for
-    role names other than those an earlier run recorded, or for roles that
-    overlap. Needs Postgres 14 or later.
+    for the operator to revoke, and the approved, unused requests that no
+    approval.resolved audit event approves (what plain SQL could have approved
+    under 0.1.0a2). With close_unaudited_approvals=True it also cancels those,
+    in the same transaction, and lists them as closed. Raises ConfigError for
+    tables from 0.1.0a1, for role names other than those an earlier run
+    recorded, for roles that overlap, or while the requester role can create
+    objects in the schema or in public. Needs Postgres 14 or later.
     """
     layout.identifier(requester_role, what="role")
     layout.identifier(approver_role, what="role")
@@ -400,14 +405,65 @@ def install_postgres_schema(
                     f"GRANT USAGE ON SCHEMA {layout.identifier(schema, what='schema')} "
                     f"TO {layout.identifier(role, what='role')}"
                 )
+        unaudited = _unaudited_approvals(session, schema)
+        if close_unaudited_approvals and unaudited:
+            _cancel_as_owner(session, schema, unaudited)
         return InstallReport(
             schema=schema,
             requester_role=requester_role,
             approver_role=approver_role,
             outside_layout=tuple(outside_layout(session, schema, requester_role, approver_role)),
+            unaudited_approvals=tuple(unaudited),
+            closed_approvals=tuple(unaudited) if close_unaudited_approvals else (),
         )
 
     return database.run_sync(install, write=True)
+
+
+# Canonical JSON (sorted keys, no spaces) puts the decision exactly so in a
+# resolved event's payload; matching text needs no cast of rows a2 may have left.
+_UNAUDITED_APPROVALS_SQL = """
+SELECT a.id FROM {approvals} a
+WHERE a.status = 'approved'
+  AND NOT EXISTS (
+    SELECT 1 FROM {audit} e
+    WHERE e.action = 'approval.resolved' AND e.subject_id = a.id
+      AND e.payload LIKE '%"decision":"approve"%'
+  )
+ORDER BY a.id
+"""
+
+
+def _unaudited_approvals(session: Session, schema: str) -> list[str]:
+    """Approved, unused requests that no approval.resolved audit event approves."""
+    quoted = layout.identifier(schema, what="schema")
+    sql = _UNAUDITED_APPROVALS_SQL.format(
+        approvals=f"{quoted}.{layout.APPROVALS_TABLE}", audit=f"{quoted}.{layout.AUDIT_TABLE}"
+    )
+    return [row[0] for row in session.execute(sql)]
+
+
+def _cancel_as_owner(session: Session, schema: str, request_ids: list[str]) -> None:
+    """Cancel requests the guard would refuse to touch, inside the install transaction.
+
+    The owner switches the guard off for this one statement and back on before
+    the transaction commits, so no other session ever sees it off.
+    """
+    table = f"{layout.identifier(schema, what='schema')}.{layout.APPROVALS_TABLE}"
+    session.execute(f"ALTER TABLE {table} DISABLE TRIGGER {layout.APPROVALS_GUARD_TRIGGER}")
+    for request_id in request_ids:
+        session.execute(
+            f"UPDATE {table} SET status = 'cancelled', decision = NULL, resolved_by = NULL, "
+            "resolved_at = NULL, consumed_at = NULL, reason = ?, "
+            "closed_at = to_char(statement_timestamp() AT TIME ZONE 'UTC', "
+            "'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') WHERE id = ? AND status = 'approved'",
+            (
+                "Cancelled by install_postgres_schema: no approval.resolved audit event "
+                "approved it.",
+                request_id,
+            ),
+        )
+    session.execute(f"ALTER TABLE {table} ENABLE TRIGGER {layout.APPROVALS_GUARD_TRIGGER}")
 
 
 def outside_layout(

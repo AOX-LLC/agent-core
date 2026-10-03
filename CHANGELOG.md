@@ -20,6 +20,7 @@ Approvals enforced by Postgres itself, not only by the library.
 - The library pins `search_path` to `pg_catalog, pg_temp` on every Postgres transaction, and the installer and every queue refuse to run while the requester role can create objects in the install schema or in `public` (PUBLIC's default before Postgres 15), where approver-side code could run them with the approver's rights.
 - The guard requires the library's canonical UTC timestamps and checks every column's shape, so session settings cannot change how a lifetime is read and a hand-written row cannot block the approver's listing.
 - The requester chooses `required_role`. `RoleApproverPolicy(roles_by_action=...)` lets the approver side decide which role each action needs.
+- Requests approved by plain SQL under 0.1.0a2 survive an upgrade. The guard refuses to let a request whose lifetime exceeds 7 days be decided or used, the install report lists approved, unused requests no `approval.resolved` event approves (`unaudited_approvals`), and `close_unaudited_approvals=True` cancels them during the upgrade.
 
 ### Changed (breaking)
 
