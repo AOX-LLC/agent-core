@@ -789,9 +789,21 @@ def test_a_row_with_an_overlong_lifetime_can_be_neither_decided_nor_used(
     assert not refused(pg.requester_raw, transition_sql(pending, "cancelled", status_only=False))
 
 
-def test_closing_is_refused_when_the_audit_log_lives_elsewhere(pg: ControlDatabase) -> None:
+@pytest.mark.parametrize("forged", [False, True], ids=["no-events", "requester-forged-event"])
+def test_closing_is_refused_when_the_audit_log_lives_elsewhere(
+    pg: ControlDatabase, forged: bool
+) -> None:
     assert pg.owner_url is not None
-    request_id = planted(pg, "approved")  # approved, and no resolved event here at all
+    assert pg.requester_raw is not None
+    request_id = planted(pg, "approved")  # approved, and no approver-side event here
+    if forged:
+        # One event the requester appends must not make the local log look in use.
+        pg.requester_raw(
+            "INSERT INTO agent_core_audit (seq, schema_version, event_id, occurred_at, action, "
+            "actor_id, subject_id, payload, prev_hash, record_hash) VALUES "
+            f"(1, 3, '{uuid4()}', '{stamp(NOW)}', 'approval.resolved', 'user-17', "
+            f"'{uuid4()}', '{{}}', '{'0' * 64}', '{'0' * 64}')"
+        )
 
     with pytest.raises(ConfigError, match="audit log may live elsewhere"):
         install_postgres_schema(

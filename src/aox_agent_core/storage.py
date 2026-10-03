@@ -407,7 +407,7 @@ def install_postgres_schema(
                 )
         unaudited = _unaudited_approvals(session, schema, approver_role)
         if close_unaudited_approvals and unaudited:
-            _refuse_closing_without_local_audit(session, schema)
+            _refuse_closing_without_local_audit(session, schema, approver_role)
             _cancel_as_owner(session, schema, unaudited)
         return InstallReport(
             schema=schema,
@@ -425,17 +425,17 @@ def install_postgres_schema(
 # resolved event's payload; matching text needs no cast of rows a2 may have left.
 # Only an event the approver side wrote counts, or one from before db_role existed:
 # the requester role may append audit events too.
-_UNAUDITED_APPROVALS_SQL = """
-SELECT a.id FROM {approvals} a
+_FROM_THE_APPROVER_SIDE = """(e.db_role IS NULL OR EXISTS (
+    SELECT 1 FROM pg_roles r WHERE r.rolname = e.db_role AND pg_has_role(r.oid, ?, 'MEMBER')
+))"""
+_UNAUDITED_APPROVALS_SQL = f"""
+SELECT a.id FROM {{approvals}} a
 WHERE a.status = 'approved'
   AND NOT EXISTS (
-    SELECT 1 FROM {audit} e
+    SELECT 1 FROM {{audit}} e
     WHERE e.action = 'approval.resolved' AND e.subject_id = a.id
       AND e.payload LIKE '%"decision":"approve"%'
-      AND (e.db_role IS NULL OR EXISTS (
-        SELECT 1 FROM pg_roles r
-        WHERE r.rolname = e.db_role AND pg_has_role(r.oid, ?, 'MEMBER')
-      ))
+      AND {_FROM_THE_APPROVER_SIDE}
   )
 ORDER BY a.id
 """
@@ -456,11 +456,16 @@ def _qualified_tables(schema: str) -> dict[str, str]:
     }
 
 
-def _refuse_closing_without_local_audit(session: Session, schema: str) -> None:
+def _refuse_closing_without_local_audit(session: Session, schema: str, approver_role: str) -> None:
     """Closing relies on resolved events in this schema's audit table. With none there
-    at all, the audit log lives elsewhere, and every live approval would look unaudited."""
+    from the approver side, the audit log lives elsewhere, and every live approval
+    would look unaudited. Events the requester appended do not count."""
     audit = _qualified_tables(schema)["audit"]
-    if not session.execute(f"SELECT 1 FROM {audit} WHERE action = 'approval.resolved' LIMIT 1"):
+    if not session.execute(
+        f"SELECT 1 FROM {audit} e WHERE e.action = 'approval.resolved' "
+        f"AND {_FROM_THE_APPROVER_SIDE} LIMIT 1",
+        (approver_role,),
+    ):
         raise ConfigError(
             f"close_unaudited_approvals needs the approval.resolved events in {schema}'s "
             "audit table, and it holds none: the audit log may live elsewhere. Nothing was "
