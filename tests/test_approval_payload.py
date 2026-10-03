@@ -234,3 +234,109 @@ async def test_an_unknown_request_is_still_not_found(control_database: ControlDa
 
     with pytest.raises(ApprovalNotFoundError):
         await queue.get(uuid4())
+
+
+# What the requester can write with plain SQL (Postgres) must not hurt the approver
+
+
+def raw_with_payload(payload_text: str, *, sha: str | None = None, **columns: str) -> str:
+    return raw_request(
+        payload_json=f"'{payload_text}'",
+        payload_sha256=f"'{sha}'" if sha else f"'{'c' * 64}'",
+        **columns,
+    )
+
+
+HOSTILE_PAYLOADS = {
+    "infinite-number": '{"a": 1e400}',
+    "huge-integer": '{"n": ' + "9" * 5_000 + "}",
+    "deep-nesting": '{"a":' + "[" * 3_500 + "]" * 3_500 + "}",
+}
+
+
+@pytest.mark.parametrize("payload_text", HOSTILE_PAYLOADS.values(), ids=HOSTILE_PAYLOADS.keys())
+async def test_a_hostile_stored_payload_hides_only_its_own_request(
+    control_database: ControlDatabase, payload_text: str
+) -> None:
+    if control_database.requester_raw is None:
+        pytest.skip("a plain-SQL requester role exists only on Postgres")
+    queue = split_queue(control_database)
+    honest = await submit(queue, include_payload=True)
+    bad_id = uuid4()
+    control_database.requester_raw(raw_with_payload(payload_text, id=f"'{bad_id}'"))
+
+    assert [r.id for r in await queue.list_pending(APPROVER)] == [honest.id]
+    with pytest.raises(ApprovalIntegrityError):
+        await queue.get(bad_id)
+    with pytest.raises(ApprovalIntegrityError):
+        await queue.resolve(bad_id, decision=Decision.APPROVE, principal=APPROVER)
+    assert ("approval.resolve_denied", "payload_integrity") in await actions(control_database)
+    assert (await queue.resolve(honest.id, decision=Decision.APPROVE, principal=APPROVER)).payload
+
+
+async def test_a_hostile_row_does_not_stop_the_expiry_sweep(
+    control_database: ControlDatabase,
+) -> None:
+    if control_database.requester_raw is None:
+        pytest.skip("a plain-SQL requester role exists only on Postgres")
+    queue = split_queue(control_database)
+    now = datetime.now(UTC)
+    due = {
+        "created_at": f"'{canonical_timestamp(now - timedelta(hours=2))}'",
+        "expires_at": f"'{canonical_timestamp(now - timedelta(hours=1))}'",
+    }
+    await submit(queue)  # makes sure the table is known to the library
+    control_database.requester_raw(raw_with_payload(HOSTILE_PAYLOADS["deep-nesting"], **due))
+    control_database.requester_raw(raw_with_payload(HOSTILE_PAYLOADS["infinite-number"], **due))
+
+    assert await queue.expire_due(principal=REQUESTER) == 2
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"amount": 12.5},
+        {"amount": 9_007_199_254_740_993},
+        {"api_key": "abc"},
+        {"note": "key sk-ant-" + "a1B2c3D4e5F6g7H8i9J0k1L2"},
+    ],
+    ids=["float", "unsafe-integer", "secret-key", "secret-text"],
+)
+async def test_a_stored_payload_that_a_submit_would_refuse_is_not_shown(
+    control_database: ControlDatabase, payload: dict[str, Any]
+) -> None:
+    if control_database.requester_raw is None:
+        pytest.skip("a plain-SQL requester role exists only on Postgres")
+    queue = split_queue(control_database)
+    await submit(queue)
+    bad_id = uuid4()
+    # The hash matches: the requester computed it itself, so only the rules can catch it.
+    sha = approval_payload_hash(ACTION, payload)
+    control_database.requester_raw(raw_with_payload(json.dumps(payload), sha=sha, id=f"'{bad_id}'"))
+
+    assert [r.id for r in await queue.list_pending(APPROVER)] != [bad_id]
+    assert bad_id not in [r.id for r in await queue.list_pending(APPROVER)]
+    with pytest.raises(ApprovalIntegrityError):
+        await queue.get(bad_id)
+
+
+async def test_consume_and_cancel_return_no_payload(control_database: ControlDatabase) -> None:
+    queue = split_queue(control_database)
+    used = await submit(queue, include_payload=True)
+    withdrawn = await submit(queue, include_payload=True)
+    await queue.resolve(used.id, decision=Decision.APPROVE, principal=APPROVER)
+
+    consumed = await queue.consume(used.id, action=ACTION, payload=PAYLOAD, principal=REQUESTER)
+    cancelled = await queue.cancel(withdrawn.id, principal=REQUESTER)
+
+    assert consumed.payload is None
+    assert cancelled.payload is None
+
+
+async def test_a_payload_with_a_nul_is_refused_not_crashed_on(
+    control_database: ControlDatabase,
+) -> None:
+    queue = split_queue(control_database)
+
+    with pytest.raises(ApprovalPayloadRejectedError, match="NUL"):
+        await submit(queue, payload={"note": "a\x00b"}, include_payload=True)

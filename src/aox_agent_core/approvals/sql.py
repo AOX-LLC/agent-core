@@ -7,6 +7,7 @@ a Database, in the same transaction as the change.
 """
 
 import json
+import logging
 from collections.abc import Awaitable, Callable, Collection, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
@@ -109,6 +110,9 @@ DELEGATES_COLUMN: Final = "delegates"
 PAYLOAD_COLUMN: Final = "payload_json"
 # Seconds an independent audit write waits for the append lock before falling back.
 DENIAL_LOCK_TIMEOUT: Final = "2s"
+# Seconds an independent audit write waits for a pooled connection before falling back.
+DENIAL_ACQUIRE_TIMEOUT: Final = 2.0
+_LOG = logging.getLogger(__name__)
 
 _DENIAL_ERRORS: Final[Mapping[DenialReason, type[ApprovalError]]] = {
     DenialReason.NOT_HUMAN: NotAuthorizedToResolveError,
@@ -304,6 +308,9 @@ class SQLApprovalQueue:
             raise ApprovalPayloadRejectedError(
                 f"The payload cannot be stored: more than {layout.MAX_STORED_PAYLOAD_BYTES} bytes."
             )
+        if b"\\u0000" in canonical_json(checked):
+            # Postgres text cannot hold NUL; refuse it here rather than at the insert.
+            raise ApprovalPayloadRejectedError("The payload cannot be stored: it contains NUL.")
         findings = self._scrubber.find_secrets({"payload": checked})
         if findings:
             located = ", ".join(f"{finding.rule} at {finding.path}" for finding in findings)
@@ -318,7 +325,7 @@ class SQLApprovalQueue:
 
         async def read(session: Session) -> ApprovalRequest | None:
             await self._prepare(session)
-            return await _load(session, self._table, request_id)
+            return await _load(session, self._table, request_id, scrubber=self._scrubber)
 
         request = await self._run(read, write=False, connection=connection)
         if request is None:
@@ -365,6 +372,7 @@ class SQLApprovalQueue:
 
         eligible: list[ApprovalRequest] = []
         resume_after = await self.get(after, connection=connection) if after is not None else None
+        scrubber = self._scrubber
 
         async def read_pages(session: Session) -> bool:
             """Read pages until `limit` requests pass; return whether more pages remain."""
@@ -378,16 +386,17 @@ class SQLApprovalQueue:
                     after=resume_after,
                     narrowed_to=narrowed_to,
                     limit=page_size,
+                    scrubber=scrubber,
                 )
                 eligible.extend(
                     request
-                    for request in page
-                    if _payload_is_bound(request)
+                    for _, request in page
+                    if request is not None
                     and self._policy.evaluate(principal, request, now=now).allowed
                 )
                 if len(page) < page_size:
                     return False
-                resume_after = page[-1]
+                resume_after = page[-1][0]
                 if session.dialect is Dialect.SQLITE:
                     return len(eligible) < limit
             return False
@@ -421,7 +430,7 @@ class SQLApprovalQueue:
         async def decide(session: Session) -> _Outcome:
             await self._require_side(session, "decide requests", ApprovalSide.APPROVER)
             try:
-                request = await _load(session, self._table, request_id)
+                request = await _load(session, self._table, request_id, scrubber=self._scrubber)
             except ApprovalIntegrityError as error:
                 # What is stored is not what the hash binds: nobody may approve it.
                 return _denied(
@@ -532,7 +541,7 @@ class SQLApprovalQueue:
 
         async def use(session: Session) -> _Outcome:
             await self._require_side(session, "consume approvals", ApprovalSide.REQUESTER)
-            request = await _load(session, self._table, request_id, verify=False)
+            request = await _load(session, self._table, request_id)
             if request is None:
                 return _denied(
                     ApprovalNotFoundError(f"No approval request {request_id}."),
@@ -606,7 +615,7 @@ class SQLApprovalQueue:
 
         async def withdraw(session: Session) -> _Outcome:
             await self._require_side(session, "cancel requests", ApprovalSide.REQUESTER)
-            request = await _load(session, self._table, request_id, verify=False)
+            request = await _load(session, self._table, request_id)
             if request is None:
                 return _denied(
                     ApprovalNotFoundError(f"No approval request {request_id}."),
@@ -718,15 +727,25 @@ class SQLApprovalQueue:
         and the host will most likely roll back when the error reaches it, which
         would erase the record of the refusal; so it is written on a connection of
         the audit log's own pool, committed at once. If that cannot be done
-        promptly (the pool is exhausted, the append lock is held by the host's own
-        earlier audit write, the database fails) the record goes into the host's
+        promptly (no pooled connection within DENIAL_ACQUIRE_TIMEOUT, the append lock
+        still held after DENIAL_LOCK_TIMEOUT by the host's own earlier audit write, the
+        database fails) the failure is logged and the record goes into the host's
         transaction instead, where it lasts only if the host commits.
+
+        With `connection` the log must share this queue's database, or ConfigError.
         """
         audit_log = self._audit_log
         checked_log = audit_log if isinstance(audit_log, SQLAuditLog) else None
         shares_database = checked_log is not None and checked_log.database.same_database(
             self.database
         )
+        if connection is not None and not shares_database:
+            # Events appended through another log commit at once, before the host does,
+            # so a host rollback would leave records of things that never happened.
+            raise ConfigError(
+                "connection= needs an audit log that shares this queue's database: pass the "
+                "same Database object to the SQLAuditLog and the queue."
+            )
 
         async def in_transaction(session: Session) -> _Outcome:
             outcome = await work(session)
@@ -763,9 +782,20 @@ class SQLApprovalQueue:
             return await log.append_many_in(session, events)
 
         try:
-            await log.database.run(apart, write=True)
-        except driver_errors():
-            await self.database.run_on(connection, inside)
+            await log.database.run(apart, write=True, acquire_timeout=DENIAL_ACQUIRE_TIMEOUT)
+        except driver_errors() as error:
+            # Not silent: the refusal now lasts only if the host commits.
+            _LOG.warning(
+                "A refusal could not be audited apart from the host's transaction (%s); "
+                "it is written in the host's transaction and is lost if that rolls back.",
+                type(error).__name__,
+            )
+            try:
+                await self.database.run_on(connection, inside)
+            except driver_errors():
+                # The host's connection is unusable too. The refusal is still raised to
+                # the caller, and the host's own failure will surface when it commits.
+                _LOG.error("A refusal could not be audited at all.")
 
 
 def _consume_refusal(
@@ -845,7 +875,7 @@ async def _close(
 
 # The database's clock as a canonical timestamp, so the sweep picks only what the
 # guard agrees has expired, even when the application's clock runs ahead.
-_POSTGRES_NOW_TEXT = (
+_POSTGRES_STATEMENT_NOW_TEXT = (
     "to_char(statement_timestamp() AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"')"
 )
 
@@ -855,7 +885,9 @@ async def _load_due(
 ) -> list[ApprovalRequest]:
     """Up to `limit` pending requests whose lifetime ended by `now`, oldest expiry first."""
     database_clock = (
-        f" AND expires_at <= {_POSTGRES_NOW_TEXT}" if session.dialect is Dialect.POSTGRES else ""
+        f" AND expires_at <= {_POSTGRES_STATEMENT_NOW_TEXT}"
+        if session.dialect is Dialect.POSTGRES
+        else ""
     )
     rows = await session.execute(
         f"SELECT {_COLUMNS} FROM {table.sql} WHERE status = ? AND expires_at <= ?"
@@ -933,12 +965,13 @@ async def _table_exists(session: Session, table: TableName) -> bool:
 
 
 async def _load(
-    session: Session, table: TableName, request_id: UUID, *, verify: bool = True
+    session: Session, table: TableName, request_id: UUID, *, scrubber: Scrubber | None = None
 ) -> ApprovalRequest | None:
-    """The request, with a stored payload checked against its hash unless verify is off.
+    """The request. With a `scrubber`, a stored payload is checked and returned too.
 
-    Raises ApprovalIntegrityError when the check fails. Cancelling and consuming
-    skip it: neither shows the payload to anyone, and the requester must be able to
+    The check is _with_payload's: ApprovalIntegrityError if it fails. Without one
+    the request comes back with payload None, however it was stored: cancelling and
+    consuming show the payload to nobody, and the requester must be able to
     withdraw a request whatever is stored with it.
     """
     if not await _table_exists(session, table):
@@ -948,19 +981,36 @@ async def _load(
     )
     if not rows:
         return None
-    request = _request_from_row(rows[0])
-    if verify and not _payload_is_bound(request):
+    request, payload_text = _parse_row(rows[0])
+    return request if scrubber is None else _with_payload(request, payload_text, scrubber)
+
+
+def _with_payload(
+    request: ApprovalRequest, payload_text: str | None, scrubber: Scrubber
+) -> ApprovalRequest:
+    """The request carrying its stored payload, after every check a submit applies.
+
+    The stored text must parse, pass the audit log's rules for a payload (keys,
+    numbers, size), hold no secret, and hash to payload_sha256. Whoever wrote the
+    row, the requester with plain SQL included, anything else is an integrity error:
+    the approver is shown nothing the hash does not bind.
+    """
+    if payload_text is None:
+        return request
+    try:
+        payload = json.loads(payload_text)
+        if not isinstance(payload, dict):
+            raise ValueError("a stored payload is a JSON object")
+        check_payload(payload, max_bytes=layout.MAX_STORED_PAYLOAD_BYTES)
+        if scrubber.find_secrets({"payload": payload}):
+            raise ValueError("a stored payload holds a secret")
+        if approval_payload_hash(request.action, payload) != request.payload_sha256:
+            raise ValueError("a stored payload does not match payload_sha256")
+    except (ValueError, TypeError, RecursionError) as error:
         raise ApprovalIntegrityError(
-            f"The payload stored with request {request_id} does not match its payload_sha256."
-        )
-    return request
-
-
-def _payload_is_bound(request: ApprovalRequest) -> bool:
-    """True when the request stores no payload, or the one it stores hashes to payload_sha256."""
-    if request.payload is None:
-        return True
-    return approval_payload_hash(request.action, request.payload) == request.payload_sha256
+            f"The payload stored with request {request.id} is not one its payload_sha256 binds."
+        ) from error
+    return request.model_copy(update={"payload": payload})
 
 
 async def _load_pending_page(
@@ -971,8 +1021,13 @@ async def _load_pending_page(
     after: ApprovalRequest | None,
     narrowed_to: Principal | None,
     limit: int,
-) -> list[ApprovalRequest]:
+    scrubber: Scrubber,
+) -> list[tuple[ApprovalRequest, ApprovalRequest | None]]:
     """One page of pending, unexpired requests after `after`, in (created_at, id) order.
+
+    Each is a pair: the request as the page cursor needs it, and the request with its
+    checked payload, or None when the stored payload fails the check and must not be
+    shown.
 
     With `narrowed_to`, only requests that principal could resolve under the
     default policy: a role it holds, and not its own.
@@ -997,7 +1052,14 @@ async def _load_pending_page(
         "ORDER BY created_at, id LIMIT ?",
         (*parameters, limit),
     )
-    return [_request_from_row(row) for row in rows]
+    page: list[tuple[ApprovalRequest, ApprovalRequest | None]] = []
+    for row in rows:
+        request, payload_text = _parse_row(row)
+        try:
+            page.append((request, _with_payload(request, payload_text, scrubber)))
+        except ApprovalIntegrityError:
+            page.append((request, None))
+    return page
 
 
 def _row_values(request: ApprovalRequest) -> tuple[Any, ...]:
@@ -1030,16 +1092,21 @@ def _row_values(request: ApprovalRequest) -> tuple[Any, ...]:
     )
 
 
-def _request_from_row(row: tuple[Any, ...]) -> ApprovalRequest:
+def _parse_row(row: tuple[Any, ...]) -> tuple[ApprovalRequest, str | None]:
+    """The request without its payload, and the stored payload text, unparsed."""
     # NULL columns are dropped so the model's defaults apply.
     names = [name.strip() for name in _COLUMNS.split(",")]
     fields = {name: value for name, value in zip(names, row, strict=True) if value is not None}
+    payload_text = fields.pop(PAYLOAD_COLUMN, None)
     if RUN_CONTEXT_COLUMN in fields:
         fields[RUN_CONTEXT_COLUMN] = json.loads(fields[RUN_CONTEXT_COLUMN])
     fields[DELEGATES_COLUMN] = json.loads(fields.get(DELEGATES_COLUMN, "[]"))
-    if PAYLOAD_COLUMN in fields:
-        fields["payload"] = json.loads(fields.pop(PAYLOAD_COLUMN))
-    return ApprovalRequest.model_validate(fields, context={STORED_RECORD: True})
+    return ApprovalRequest.model_validate(fields, context={STORED_RECORD: True}), payload_text
+
+
+def _request_from_row(row: tuple[Any, ...]) -> ApprovalRequest:
+    """The request with payload None: for reads that show no payload to anyone."""
+    return _parse_row(row)[0]
 
 
 def _utc_now() -> datetime:

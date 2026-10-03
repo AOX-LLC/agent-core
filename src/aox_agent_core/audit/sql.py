@@ -363,7 +363,9 @@ def _check_link(record: AuditRecord, previous: AuditHead) -> None:
     if record.prev_hash != previous.record_hash:
         raise AuditIntegrityError(f"Record {record.seq} does not link to record {previous.seq}.")
     if compute_record_hash(record) != record.record_hash:
-        raise AuditIntegrityError(f"Record {record.seq} was altered after it was written.")
+        # A row the database accepted with a wrong hash shows who inserted it.
+        by = f" (inserted by database role {record.db_role})" if record.db_role else ""
+        raise AuditIntegrityError(f"Record {record.seq} was altered after it was written{by}.")
 
 
 async def audit_table_exists(database: Database, *, schema: str | None = None) -> bool:

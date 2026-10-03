@@ -417,3 +417,71 @@ async def test_cancelling_an_append_that_waits_for_the_lock_leaves_the_pool_and_
     assert (await log.verify()).seq == 2
     leftover = pg.superuser_raw("SELECT count(*) FROM pg_locks WHERE locktype = 'advisory'")
     assert leftover == [(0,)]
+
+
+async def test_a_log_on_another_database_object_is_refused_for_a_host_connection(
+    pg: ControlDatabase, pool: psycopg_pool.AsyncConnectionPool
+) -> None:
+    queue = queue_on(
+        PostgresDatabase.from_pool(pool), pg, SQLAuditLog(open_database(pg.url), schema=pg.schema)
+    )
+
+    with pytest.raises(ConfigError, match="shares this queue's database"):
+        async with pool.connection() as connection, connection.transaction():
+            await submit(queue, connection=connection)
+
+    assert pg.raw("SELECT count(*) FROM agent_core_approvals") == [(0,)]
+    assert pg.raw("SELECT count(*) FROM agent_core_audit") == [(0,)]
+
+
+async def test_an_exhausted_pool_delays_a_refusal_briefly_then_falls_back_loudly(
+    pg: ControlDatabase, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    import time
+
+    monkeypatch.setattr("aox_agent_core.approvals.sql.DENIAL_ACQUIRE_TIMEOUT", 0.3)
+    one = psycopg_pool.AsyncConnectionPool(pg.url, min_size=1, max_size=1, open=False)
+    await one.open()
+    try:
+        database = PostgresDatabase.from_pool(one)
+        log = SQLAuditLog(database, schema=pg.schema)
+        queue = queue_on(database, pg, log)
+        request = await submit(queue)
+
+        started = time.monotonic()
+        async with one.connection() as connection, connection.transaction():
+            with pytest.raises(NotTheRequesterError):
+                await queue.consume(
+                    request.id,
+                    action="crm.update_contact",
+                    payload=PAYLOAD,
+                    principal=STRANGER,
+                    connection=connection,
+                )
+        # The wait was bounded, the fallback was logged, and the refusal sits in the
+        # host's transaction, which committed here because the host caught the error.
+        assert time.monotonic() - started < 5
+        assert "could not be audited apart" in caplog.text
+        assert await audit_actions(log) == ["approval.requested", "approval.consume_denied"]
+    finally:
+        await one.close()
+
+
+async def test_a_host_connection_or_pool_with_a_dict_row_factory_works(
+    pg: ControlDatabase,
+) -> None:
+    from psycopg.rows import dict_row
+
+    dict_pool = psycopg_pool.AsyncConnectionPool(
+        pg.url, min_size=1, max_size=2, open=False, kwargs={"row_factory": dict_row}
+    )
+    await dict_pool.open()
+    try:
+        log = SQLAuditLog(PostgresDatabase.from_pool(dict_pool))
+        await log.append(event(1))
+        async with dict_pool.connection() as connection, connection.transaction():
+            await log.append(event(2), connection=connection)
+
+        assert (await log.verify()).seq == 2
+    finally:
+        await dict_pool.close()

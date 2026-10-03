@@ -255,3 +255,16 @@ async def test_a_batch_in_one_statement_links_each_row_to_the_one_before(
 
     assert [record.seq for record in records] == list(range(1, 31))
     assert (await log.verify()).seq == 30
+
+
+async def test_a_row_with_a_bad_hash_names_the_role_that_inserted_it(
+    control_database: ControlDatabase,
+) -> None:
+    if control_database.requester_raw is None:
+        pytest.skip("db_role is set only on Postgres")
+    log = SQLAuditLog(control_database.database)
+    first = await log.append(event(1))
+    control_database.requester_raw(raw_insert(2, first.record_hash))
+
+    with pytest.raises(Exception, match="inserted by database role agent_core_requester"):
+        await log.verify()

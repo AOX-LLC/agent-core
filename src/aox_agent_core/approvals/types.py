@@ -106,7 +106,8 @@ class ApprovalRequest(FrozenModel):
     present only when the requester asked for it to be stored (include_payload);
     the queue has checked it against payload_sha256 before returning the request,
     so what an approver sees there is what the hash binds. It is None when the
-    requester did not store it.
+    requester did not store it, and on what consume(), cancel() and expire_due()
+    work on: they check nothing about a stored payload, so they return none.
     """
 
     id: UUID

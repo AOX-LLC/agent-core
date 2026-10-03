@@ -125,7 +125,11 @@ class Database(ABC):
     dialect: Dialect
 
     async def run(
-        self, work: Callable[[Session], Awaitable[ResultT]], *, write: bool = False
+        self,
+        work: Callable[[Session], Awaitable[ResultT]],
+        *,
+        write: bool = False,
+        acquire_timeout: float | None = None,
     ) -> ResultT:
         """Run `work` in one transaction and return its result.
 
@@ -133,9 +137,10 @@ class Database(ABC):
         transaction takes the database's write lock up front (BEGIN IMMEDIATE), so
         concurrent writers queue instead of failing later. Postgres has no
         equivalent here; writers that must be serialized take their own lock (the
-        audit log uses an advisory lock).
+        audit log uses an advisory lock). `acquire_timeout` bounds the wait for a pooled
+        connection, in seconds (Postgres; the pool's own default otherwise).
         """
-        async with self._transaction(write=write) as session:
+        async with self._transaction(write=write, acquire_timeout=acquire_timeout) as session:
             return await work(session)
 
     async def run_on(
@@ -163,7 +168,9 @@ class Database(ABC):
     def _identity(self) -> tuple[str, ...]: ...
 
     @abstractmethod
-    def _transaction(self, *, write: bool) -> AbstractAsyncContextManager[Session]: ...
+    def _transaction(
+        self, *, write: bool, acquire_timeout: float | None
+    ) -> AbstractAsyncContextManager[Session]: ...
 
 
 def run_blocking(make: Callable[[], Awaitable[ResultT]]) -> ResultT:
@@ -251,7 +258,9 @@ class SQLiteDatabase(Database):
         await asyncio.to_thread(self._close_connection)
 
     @asynccontextmanager
-    async def _transaction(self, *, write: bool) -> "AsyncIterator[Session]":
+    async def _transaction(
+        self, *, write: bool, acquire_timeout: float | None
+    ) -> "AsyncIterator[Session]":
         async with self._loop_lock():
             connection = await asyncio.to_thread(self._open, write=write)
             is_temporary = connection is not self._connection
@@ -379,21 +388,33 @@ class PostgresDatabase(Database):
     async def aclose(self) -> None:
         """Close the pool this object opened. A host's pool is never closed here."""
         owned, loop = self._owned, self._owned_loop
-        self._owned, self._owned_loop, self._opened = None, None, False
-        if owned is None or loop is None or loop.is_closed():
-            # Nothing was opened, or its event loop is gone and took its tasks with it.
+        if owned is None or loop is None:
+            return
+        if loop.is_closed():
+            # Its event loop is gone and took the pool's tasks with it.
+            self._owned, self._owned_loop, self._opened = None, None, False
             return
         if loop is not asyncio.get_running_loop():
+            # Left as it was, so the loop that owns it can still close it.
             raise ConfigError("Close a Database on the event loop that opened its pool.")
+        self._owned, self._owned_loop, self._opened = None, None, False
         await owned.close()
 
     @asynccontextmanager
-    async def _transaction(self, *, write: bool) -> "AsyncIterator[Session]":
+    async def _transaction(
+        self, *, write: bool, acquire_timeout: float | None
+    ) -> "AsyncIterator[Session]":
         source = await self._source()
+        checkout = (
+            source.connection()
+            if acquire_timeout is None
+            else source.connection(timeout=acquire_timeout)  # type: ignore[call-arg]
+        )
         async with (
-            source.connection() as connection,
+            checkout as connection,
             connection.transaction(),
-            connection.cursor() as cursor,
+            # Plain tuples, whatever row factory the host gave its pool or connection.
+            connection.cursor(row_factory=self._psycopg.rows.tuple_row) as cursor,
         ):
             # Everything below is per transaction, never per session: a pooler in
             # transaction mode hands this backend connection to other clients
@@ -438,15 +459,16 @@ class PostgresDatabase(Database):
                 f"{status.name}). Open one with `async with connection.transaction():` so "
                 "the library's writes commit or roll back with yours."
             )
-        async with connection.transaction(), connection.cursor() as cursor:
+        async with (
+            connection.transaction(),
+            connection.cursor(row_factory=self._psycopg.rows.tuple_row) as cursor,
+        ):
             executor = _PostgresExecutor(cursor)
-            isolation, path = (
-                await executor.run(
-                    "SELECT current_setting('transaction_isolation'), "
-                    "current_setting('search_path')",
-                    (),
-                )
-            )[0][0]
+            rows, _ = await executor.run(
+                "SELECT current_setting('transaction_isolation'), current_setting('search_path')",
+                (),
+            )
+            isolation, path = rows[0]
             if isolation != "read committed":
                 raise ConfigError(
                     f"The host transaction is {isolation.upper()}; agent-core's audit writes "

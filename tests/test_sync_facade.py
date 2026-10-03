@@ -78,7 +78,8 @@ def test_the_approval_queue_runs_its_whole_life_in_blocking_calls(tmp_path: Path
         used = sync_queue.consume(
             request.id, action="crm.update_contact", payload=payload, principal=REQUESTER
         )
-        assert used.payload == payload
+        assert used.payload is None  # consume checks nothing stored, so returns none
+        assert sync_queue.get(request.id).payload == payload
         assert sync_queue.get(request.id).status.value == "consumed"
         assert sync_queue.expire_due(principal=REQUESTER) == 0
 
