@@ -774,7 +774,7 @@ async def require_postgres_version(session: "Session") -> None:
     version_num = int((await session.execute("SELECT current_setting('server_version_num')"))[0][0])
     if version_num < POSTGRES_MINIMUM_VERSION_NUM:
         raise ConfigError(
-            f"This Postgres server is version {version_num // 10000}; agent-core 0.1.0a5 "
+            f"This Postgres server is version {version_num // 10000}; agent-core 0.1.0a6 "
             f"needs {POSTGRES_MINIMUM_VERSION_NUM // 10000} or later."
         )
 
