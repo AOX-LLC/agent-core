@@ -451,7 +451,7 @@ def replay_key(
 - `tests/test_host_backends.py` proves both directions, with in-memory classes checked by mypy against both protocols.
 - A host `AuditLog` must implement all five methods: `append`, `append_many`, `iter_records`, `head`, `verify`. `append_many` is new in 0.1.0a4; a host log without it no longer matches the protocol.
 - A host `ApprovalQueue.submit` must accept `include_payload`.
-- With an `AuditLog` that is not `SQLAuditLog`, the queue writes its audit events right after its own commit, as best effort. They are not in the same transaction as the approval change. Inside a host transaction (`connection=`), such events are appended at once and are not rolled back with it.
+- With an `AuditLog` that is not `SQLAuditLog`, the queue writes its audit events right after its own commit, as best effort. They are not in the same transaction as the approval change. With `connection=` the queue refuses such a log (`ConfigError`): it must share the queue's `Database`.
 
 ## What stays in project 03's adapter
 

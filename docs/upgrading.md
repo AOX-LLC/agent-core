@@ -72,7 +72,7 @@ Project 03 implements `ApprovalQueue` and `AuditLog` itself and uses agent-core'
 
 6. Handle the new errors if your backend raises or catches them: `AuditTimeRejectedError` (an `AuditError`), and `ApprovalIntegrityError` and `ApprovalPayloadRejectedError` (both `ApprovalError`).
 
-7. If your backend stores a payload, mirror what `SQLApprovalQueue` does on a mismatch. `get` raises `ApprovalIntegrityError`. `list_pending` leaves the request out. `resolve` refuses, audits `approval.resolve_denied` with reason `payload_integrity`, and the request stays pending. `cancel` and `consume` do not check, so a requester can always withdraw.
+7. If your backend stores a payload, mirror what `SQLApprovalQueue` does on a mismatch. `get` raises `ApprovalIntegrityError`. `list_pending` leaves the request out. `resolve` refuses, audits `approval.resolve_denied` with reason `payload_integrity`, and the request stays pending. `cancel`, `consume` and `expire_due` do not check and return `payload=None`, so a requester can always withdraw. Stored text must also pass the rules a submit applies when it is read, and a malformed one hides only its own request.
 
 8. If you call agent-core's installer, the signature has not changed. It needs Postgres 16 now. See the operator section.
 
@@ -169,9 +169,10 @@ Project 04 uses `SQLAuditLog` and `SQLApprovalQueue` on Postgres 17, with wrappe
 
    - **The audit lock lasts as long as your transaction.** An audit write takes the chain's advisory lock, and Postgres releases it only when your transaction ends. Write audit events late in the transaction, and keep it short.
    - **Records are provisional until you commit.** Do not anchor a `head()` taken inside the transaction.
-   - **A refusal is written apart.** A denied `consume`, `resolve` or `cancel` changed nothing, and you will most likely roll back when the error reaches you, which would erase its audit event. So the event is written on a separate pooled connection of the audit log's own pool and committed at once, waiting at most 2 seconds (`DENIAL_LOCK_TIMEOUT`) for the append lock. If the lock, the pool or the database fails, it is written in your transaction instead, and it is lost if you roll back.
-   - **A host pool of size 1 stalls that write.** If your pool has one connection and you hold it, the separate write waits until the pool times out, then falls back to your transaction.
-   - **Another audit log is not rolled back.** With an audit log that is not a `SQLAuditLog` on the same database, events are appended immediately and are not undone with your transaction.
+   - **A refusal is written apart.** A denied `consume`, `resolve` or `cancel` changed nothing, and you will most likely roll back when the error reaches you, which would erase its audit event. So the event is written on a separate pooled connection of the audit log's own pool and committed at once, waiting at most 2 seconds for a pooled connection (`DENIAL_ACQUIRE_TIMEOUT`) and 2 seconds for the append lock (`DENIAL_LOCK_TIMEOUT`). If the pool, the lock or the database fails, a warning is logged and the event is written in your transaction instead, and it is lost if you roll back.
+   - **A host pool of size 1 delays that write.** If your pool has one connection and you hold it, the separate write waits 2 seconds, logs a warning and falls back to your transaction.
+   - **The log must share the queue's database.** With `connection=`, a queue whose audit log is not a `SQLAuditLog` on the same `Database` object raises `ConfigError`: events appended through another log would commit before your transaction does. A `from_pool` Database and a Database opened from a URL count as different, even on one server.
+   - **Other limits.** A separate refusal record carries the audit pool's `db_role`, not your connection's. If the separate commit fails in an ambiguous way, the fallback can leave a second copy of the refusal. Any role that can connect can hold the append lock with an idle transaction and stall every writer: set `idle_in_transaction_session_timeout` on the runtime roles. The lock is one key for the whole database, so all schemas share it.
 
 9. Use `append_many` for batches. One lock and one commit for up to 1000 events; all or nothing; an error names the event's index.
 
@@ -227,7 +228,7 @@ Other changes for the operator:
   Run the installer before starting a4 code against the database.
 - **SQLite needs nothing.** An a3 file gets the `recorded_at` and `payload_json` columns, and the append trigger that also checks `prev_hash`, in place on first use.
 - **`recorded_at` is the trigger's word, not the chain's.** Like `db_role`, it is outside the hash and guaranteed by the database trigger. The table owner could edit it undetected. On SQLite the library writes it from the writer's clock, so it is not independent there.
-- **Old records still verify.** Run `aox-agent-core audit verify` against a saved anchor before and after. Rows written before a4 have no `recorded_at`.
+- **Old records still verify.** Run `aox-agent-core audit verify` against a saved anchor with the a3 release before the upgrade (a4 cannot read an a3 schema until the installer has run), and with a4 after. A row inserted with a wrong `record_hash` makes `verify` fail from that record on; the message names the database role that inserted it. Rows written before a4 have no `recorded_at`.
 
 ## What is not verified
 
