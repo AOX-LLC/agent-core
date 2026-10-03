@@ -47,11 +47,13 @@ class ApprovalQueue(Protocol):
         not yet consumed) for each (requested_by, action, payload hash), and an
         implementation must hold that when calls race, as a unique index does:
 
-        - a repeat with the same required_role, lifetime (ttl_seconds) and delegates
-          returns the existing request and records no event;
-        - a repeat that matches on those three but differs in any of them raises
-          ApprovalConflictError, naming the open request and what differs;
-        - `summary`, `context` and `include_payload` are not compared: the first call's stay;
+        - a repeat with the same summary, required_role, lifetime (ttl_seconds) and
+          delegates returns the existing request and records no event;
+        - a repeat that differs in any of those raises ApprovalConflictError, naming the
+          open request and what differs, and is audited (approval.submit_conflict);
+        - a caller that asks for the payload to be stored (`include_payload`) must find
+          that payload stored, or it is a conflict too;
+        - `context` is not compared: the first call's stays;
         - an open request already past its lifetime does not count: it is closed as expired
           and the new one is queued.
 

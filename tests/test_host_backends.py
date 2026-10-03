@@ -158,6 +158,7 @@ class InMemoryApprovalQueue:
                             != request.expires_at - request.created_at,
                         ),
                         ("required_role", open_request.required_role != request.required_role),
+                        ("summary", open_request.summary != request.summary),
                     )
                     if other
                 )

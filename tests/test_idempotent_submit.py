@@ -3,11 +3,12 @@
 import asyncio
 from datetime import UTC, datetime, timedelta
 from typing import Any
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import psycopg
 import pytest
 
+from aox_agent_core import RunContext
 from aox_agent_core import _postgres_schema as layout
 from aox_agent_core.approvals import (
     ApprovalRequest,
@@ -50,9 +51,9 @@ async def test_an_exact_repeat_returns_the_open_request_and_writes_no_event(
     queue = split_queue(control_database)
     first = await ask(queue, delegates={"svc-runner"})
 
-    again = await ask(queue, delegates={"svc-runner"}, summary="A different summary")
+    again = await ask(queue, delegates={"svc-runner"}, context=RunContext(run_id="run-2"))
 
-    assert again == first  # the first call's summary stays
+    assert again == first  # the first call's context stays
     assert await audit_actions(control_database) == ["approval.requested"]
     assert control_database.raw(f"SELECT count(*) FROM {APPROVALS}") == [(1,)]
 
@@ -63,12 +64,13 @@ async def test_an_exact_repeat_returns_the_open_request_and_writes_no_event(
         ({"required_role": "finance.approver"}, ("required_role",)),
         ({"ttl_seconds": 600}, ("lifetime",)),
         ({"delegates": {"svc-runner"}}, ("delegates",)),
+        ({"summary": "Delete the contact instead"}, ("summary",)),
         (
             {"required_role": "finance.approver", "ttl_seconds": 600, "delegates": {"x"}},
             ("delegates", "lifetime", "required_role"),
         ),
     ],
-    ids=["role", "lifetime", "delegates", "all-three"],
+    ids=["role", "lifetime", "delegates", "summary", "all-three"],
 )
 async def test_a_repeat_with_other_terms_is_a_conflict_and_is_audited(
     control_database: ControlDatabase, overrides: dict[str, Any], differs: tuple[str, ...]
@@ -389,10 +391,10 @@ async def test_sqlite_refuses_to_submit_over_duplicates_until_they_are_cancelled
 
     with pytest.raises(ConfigError, match=duplicate):
         await ask(fresh)
-    await fresh.cancel(first.id, principal=REQUESTER)  # reads and cancels still work
+    await fresh.cancel(UUID(duplicate), principal=REQUESTER)  # reads and cancels still work
     again = await ask(fresh)
 
-    assert again.id not in {first.id}
+    assert again.id == first.id
     assert control_database.raw(
         f"SELECT 1 FROM sqlite_master WHERE name = '{layout.OPEN_REQUEST_INDEX}'"
     )
@@ -439,7 +441,39 @@ async def test_a_row_planted_for_another_principal_cannot_stand_in_for_its_paylo
     with pytest.raises(ApprovalConflictError) as raised:
         await ask(queue, include_payload=True, summary="Delete customer c-1")
 
-    assert (raised.value.existing, raised.value.differs) == (planted, ("payload",))
+    assert (raised.value.existing, raised.value.differs) == (planted, ("payload", "summary"))
+
+
+async def test_a_planted_row_with_another_summary_is_refused_not_adopted(
+    control_database: ControlDatabase,
+) -> None:
+    """For a caller that stores no payloads: only the summary tells the planted row apart."""
+    if control_database.requester_raw is None:
+        pytest.skip("a plain-SQL requester role exists only on Postgres")
+    queue = split_queue(control_database)
+    planted = uuid4()
+    moment = datetime.now(UTC)
+    control_database.requester_raw(
+        raw_request(
+            id=f"'{planted}'",
+            summary="'routine read-only sync'",
+            payload_sha256=f"'{approval_payload_hash(ACTION, PAYLOAD)}'",
+            created_at=f"'{_stamp(moment)}'",
+            expires_at=f"'{_stamp(moment + timedelta(seconds=3_600))}'",
+        )
+    )
+
+    with pytest.raises(ApprovalConflictError) as raised:
+        await ask(queue, summary="Delete customer c-1")
+
+    assert (raised.value.existing, raised.value.differs) == (planted, ("summary",))
+    records = [r async for r in SQLAuditLog(control_database.database).iter_records()]
+    assert [(r.action, r.subject_id, r.payload["differs"]) for r in records] == [
+        ("approval.submit_conflict", str(planted), "summary")
+    ]
+    assert control_database.raw(f"SELECT count(*) FROM {APPROVALS}") == [(1,)]
+    # With the planted summary spelled out, the very same call is the exact repeat.
+    assert (await ask(queue, summary="routine read-only sync")).id == planted
 
 
 async def test_a_planted_row_whose_payload_fails_its_hash_is_an_audited_refusal_not_a_lockout(

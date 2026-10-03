@@ -283,10 +283,10 @@ class SQLApprovalQueue:
 
         One request may be open (pending, or approved and not yet used) for each requester,
         action and payload: a database index enforces it, so it holds when calls race. An
-        exact repeat (same required_role, lifetime and delegates) returns the existing
-        request, with no new audit event; one that differs in any of those raises
-        ApprovalConflictError and is audited as approval.submit_conflict. `summary`,
-        `context` and `include_payload` are not compared: the first submit's stay. An open
+        exact repeat (same summary, required_role, lifetime and delegates, and the payload
+        stored if it asked for it) returns the existing request, with no new audit event;
+        one that differs in any of those raises ApprovalConflictError and is audited as
+        approval.submit_conflict. `context` is not compared: the first submit's stays. An open
         request already past its lifetime is closed as expired, and this one is queued.
 
         With `connection`, a psycopg AsyncConnection already in a transaction, the
@@ -1386,6 +1386,7 @@ def _terms_that_differ(
             ("lifetime", lifetime_differs),
             ("payload", wants_payload and existing.payload != asked.payload),
             ("required_role", existing.required_role != asked.required_role),
+            ("summary", existing.summary != asked.summary),
         )
         if differs
     )
