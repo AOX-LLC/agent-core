@@ -43,7 +43,7 @@ Opt-in binding of `resolved_by` to the deciding database login, the login on eve
 - Binding is only as strong as each login's authentication: under `trust` in `pg_hba.conf`, or with a password shared between approvers, any login can connect as another. If the approver role is itself a login it needs its own mapping (`unmapped_logins` lists it).
 - Login names are written to every audit row and to the mapping table, and both are append-only, so they cannot be erased. Use pseudonymous login names if your retention rules need that.
 - Binding was tested on Postgres 16 with roles in one cluster, not with a pooler or a host whose approvers share a login.
-- Everything still listed under Known limits in 0.1.0a6 and 0.1.0a5 that this section does not say is fixed: the test-isolation limit (roles are cluster-wide), the lock-order race in a host's transaction, the database cannot force an audit event, and the per-listing cost of requests the library hides.
+- Everything still listed under Known limits in 0.1.0a6 and 0.1.0a5 that this section does not say is fixed: the lock-order race in a host's transaction, the database cannot force an audit event, and the per-listing cost of requests the library hides.
 
 ### Planned work, after 0.1.0
 
@@ -77,10 +77,6 @@ Fix release for 0.1.0a5. **0.1.0a5 was tagged but never released** (see below): 
 - The refusal for an open request the library cannot parse (`malformed_row`) no longer says "Cancel it, then submit again": `cancel` cannot read such a row, so that advice failed. It says the table owner must close it, and docs/upgrading.md gives the procedure ("A stored request the library cannot read"). A request whose stored payload fails its hash can be cancelled, and still says so. The row keeps its key until the owner acts: the library cannot close what it cannot read.
 - `expire_due` and `purge_payloads` skip a request another transaction holds (`FOR UPDATE SKIP LOCKED`, taken by the UPDATE after the audit append lock, so the lock order is unchanged) instead of failing the whole sweep with `LockNotAvailable` after `lock_timeout`. The request is picked up by the next sweep. SQLite is unchanged.
 - `install_postgres_schema` reports `InstallReport.backdated_finishes`: finished requests that still hold a payload and whose finish time is before their own creation or decision (at most 1000, by id). 0.1.0a4 let the closing role write `closed_at` and `consumed_at`, so such a row is purgeable at once under any retention floor; the guard has written those times itself since 0.1.0a5. The installer changes nothing about them; check them before the first purge. A backdated time that still falls after the request's creation and decision cannot be told from a real one and is not listed. The 5 minute allowance is the guard's skew bound; rows written under 0.1.0a4, which bounded none of these times, can be listed for honest skew between two hosts, so read the list as candidates. A planted row with an impossible date (such as `2026-02-30`) is skipped, not an installer failure.
-
-### Known limits
-
-- Test isolation (a test-suite issue, not the library; for Phase 5). The Postgres tests create the requester and approver roles, and roles are cluster-wide, not per database. Two test runs, or a test run and a review probe, against the same Postgres server at once can collide on them. On Python 3.14 two of five full local runs failed in the installer and schema tests (3 to 4 failures each, none reproducible alone), while 3.11 passed every run. The collision is the suspected cause and was not confirmed. Run one suite at a time against a test server until the tests use their own role names.
 
 ## [0.1.0a5] - 2026-10-03
 

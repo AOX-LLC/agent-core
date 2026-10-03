@@ -18,6 +18,7 @@ from aox_agent_core.errors import ConfigError, NotTheRequesterError
 from aox_agent_core.storage import PostgresDatabase, open_database
 from databases import (
     APPROVER_ROLE,
+    REQUESTER_ROLE,
     TEST_ACTION_ROLES,
     ControlDatabase,
     postgres_database,
@@ -33,7 +34,7 @@ PAYLOAD = {"contact_id": "c-1001"}
 def pg() -> Iterator[ControlDatabase]:
     with postgres_database() as database:
         database.raw("CREATE TABLE host_orders (id integer PRIMARY KEY)")
-        database.raw("GRANT SELECT, INSERT ON host_orders TO agent_core_requester")
+        database.raw(f"GRANT SELECT, INSERT ON host_orders TO {REQUESTER_ROLE}")
         yield database
 
 
@@ -354,7 +355,7 @@ async def test_a_success_in_the_hosts_transaction_is_not_written_apart(
     log = SQLAuditLog(database, schema=pg.schema)
     queue = queue_on(database, pg, log)
     request = await submit(queue)
-    approver_database = open_database(pg.url.replace("agent_core_requester", APPROVER_ROLE))
+    approver_database = open_database(pg.url.replace(REQUESTER_ROLE, APPROVER_ROLE))
     approver = SQLApprovalQueue(
         approver_database,
         audit_log=SQLAuditLog(approver_database, schema=pg.schema),

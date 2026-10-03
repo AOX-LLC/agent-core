@@ -12,7 +12,13 @@ from opentelemetry.sdk.trace.export import SimpleSpanProcessor
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 
 from aox_agent_core.storage import PostgresDatabase
-from databases import ControlDatabase, postgres_database, sqlite_database
+from databases import (
+    RUN_ID,
+    ControlDatabase,
+    drop_run_leftovers,
+    postgres_database,
+    sqlite_database,
+)
 
 AMBIENT_VARIABLES = (
     "AGENT_CORE_ANTHROPIC_API_KEY",
@@ -33,6 +39,14 @@ AMBIENT_VARIABLES = (
     "ANTHROPIC_SERVICE_ACCOUNT_ID",
     "ANTHROPIC_WORKSPACE_ID",
 )
+
+
+def pytest_report_header(config: pytest.Config) -> str:
+    return f"agent-core test run id: {RUN_ID} (names its Postgres roles and databases)"
+
+
+def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> None:
+    drop_run_leftovers()
 
 
 @pytest.fixture(autouse=True)

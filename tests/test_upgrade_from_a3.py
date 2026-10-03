@@ -27,7 +27,12 @@ TABLES = ("agent_core_audit", "agent_core_approvals", "agent_core_approval_roles
 
 
 def load_a3_schema(database: ControlDatabase) -> None:
-    database.raw(A3_SCHEMA.read_text())
+    # The fixture was dumped under fixed role names; this run's roles carry its own id.
+    database.raw(
+        A3_SCHEMA.read_text()
+        .replace("agent_core_requester", REQUESTER_ROLE)
+        .replace("agent_core_approver", APPROVER_ROLE)
+    )
 
 
 def upgrade(database: ControlDatabase) -> str:

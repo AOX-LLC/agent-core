@@ -43,6 +43,7 @@ from aox_agent_core.storage import (
 )
 from databases import (
     APPROVER_ROLE,
+    OWNER_ROLE,
     REQUESTER_ROLE,
     TEST_ACTION_ROLES,
     ControlDatabase,
@@ -599,7 +600,7 @@ async def test_a_queue_refuses_a_requester_role_that_can_write_the_payload_colum
     if control_database.requester_raw is None:
         pytest.skip("the guard trigger exists only on Postgres")
     control_database.superuser_raw(
-        f"GRANT UPDATE (payload_json) ON {APPROVALS} TO agent_core_requester"
+        f"GRANT UPDATE (payload_json) ON {APPROVALS} TO {REQUESTER_ROLE}"
     )
 
     with pytest.raises(ConfigError, match="payload_json"):
@@ -963,7 +964,7 @@ def test_the_audit_login_is_the_session_login_whatever_the_writer_supplies(
     control_database.requester_raw(raw_insert(1, "0" * 64, db_login="'someone-else'"))
     head = control_database.raw("SELECT record_hash FROM agent_core_audit")[0][0]
     control_database.approver_raw(
-        raw_insert(2, head, db_login="NULL", db_role="'agent_core_requester'")
+        raw_insert(2, head, db_login="NULL", db_role=f"'{REQUESTER_ROLE}'")
     )
 
     assert control_database.raw(
@@ -1285,7 +1286,7 @@ def test_the_installer_refuses_a_mapping_table_made_by_another_role(
     if control_database.superuser_url is None:
         pytest.skip("the installer is Postgres only")
     squatter = probe_role(control_database, "NOLOGIN")
-    control_database.superuser_raw(f"GRANT {squatter} TO agent_core_owner")
+    control_database.superuser_raw(f"GRANT {squatter} TO {OWNER_ROLE}")
     control_database.superuser_raw(f"ALTER TABLE {LOGINS} OWNER TO {squatter}")
 
     with pytest.raises(ConfigError, match="was not made by the approvals table's owner"):

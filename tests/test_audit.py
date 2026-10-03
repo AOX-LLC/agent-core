@@ -27,6 +27,8 @@ from aox_agent_core.errors import AuditIntegrityError, AuditPayloadRejectedError
 from aox_agent_core.storage import open_database
 from databases import (
     APPROVER_ROLE,
+    LEGACY_APP_ROLE,
+    OWNER_ROLE,
     REQUESTER_ROLE,
     ControlDatabase,
     split_queue,
@@ -254,7 +256,7 @@ def test_timestamps_keep_six_fractional_digits() -> None:
 @pytest.mark.parametrize(
     "grants",
     [
-        ("GRANT agent_core_owner TO {role}",),
+        (f"GRANT {OWNER_ROLE} TO {{role}}",),
         (
             f"GRANT SELECT, INSERT ON {audit_sql.AUDIT_TABLE} TO {{role}}",
             f"GRANT UPDATE (payload) ON {audit_sql.AUDIT_TABLE} TO {{role}}",
@@ -379,7 +381,7 @@ async def test_superuser_session_wearing_the_app_role_is_refused(
     if control_database.backend != "postgres":
         pytest.skip("roles exist only on Postgres")
     assert control_database.superuser_url is not None
-    url = f"{control_database.superuser_url}?options=-c%20role%3Dagent_core_app"
+    url = f"{control_database.superuser_url}?options=-c%20role%3D{LEGACY_APP_ROLE}"
 
     with pytest.raises(ConfigError, match="may only INSERT and SELECT"):
         await SQLAuditLog(open_database(url)).append(event(1))

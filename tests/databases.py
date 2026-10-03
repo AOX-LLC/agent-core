@@ -26,13 +26,17 @@ from aox_agent_core.storage import Database, install_postgres_schema, open_datab
 
 ADMIN_URL_ENV = "AGENT_CORE_TEST_POSTGRES_ADMIN_URL"
 REQUIRE_ENV = "AGENT_CORE_REQUIRE_POSTGRES"
-OWNER_ROLE = "agent_core_owner"
-REQUESTER_ROLE = "agent_core_requester"
-APPROVER_ROLE = "agent_core_approver"
+# Roles are server-wide, not per database, so two runs against one server would share
+# them. Every run (every pytest process) names its roles and databases with its own id.
+RUN_ID = uuid4().hex[:8]
+OWNER_ROLE = f"agent_core_owner_{RUN_ID}"
+REQUESTER_ROLE = f"agent_core_requester_{RUN_ID}"
+APPROVER_ROLE = f"agent_core_approver_{RUN_ID}"
 # The role each action in the tests needs, as an approver side would configure it.
 TEST_ACTION_ROLES = {"crm.update_contact": "ops.approver", "crm.delete_contact": "ops.approver"}
 # The single application role of 0.1.0a2, for the upgrade tests.
-LEGACY_APP_ROLE = "agent_core_app"
+LEGACY_APP_ROLE = f"agent_core_app_{RUN_ID}"
+DATABASE_PREFIX = f"agent_core_test_{RUN_ID}_"
 
 _CREATE_ROLES = f"""
 DO $$ BEGIN
@@ -127,7 +131,7 @@ def postgres_database(*, schema: str = "public", install: bool = True) -> Iterat
             pytest.fail(f"{REQUIRE_ENV}=1 but {ADMIN_URL_ENV} is not set")
         pytest.skip(f"set {ADMIN_URL_ENV} to run Postgres tests")
 
-    name = f"agent_core_test_{uuid4().hex[:12]}"
+    name = f"{DATABASE_PREFIX}{uuid4().hex[:12]}"
     with psycopg.connect(admin_url, autocommit=True) as admin:
         admin.execute(_CREATE_ROLES)
         admin.execute(f'CREATE DATABASE "{name}" OWNER {OWNER_ROLE}')
@@ -169,6 +173,25 @@ def postgres_database(*, schema: str = "public", install: bool = True) -> Iterat
             admin.execute(f'DROP DATABASE "{name}" WITH (FORCE)')
             for role in database.roles:
                 admin.execute(f'DROP ROLE IF EXISTS "{role}"')
+
+
+def drop_run_leftovers() -> None:
+    """At the end of the session, drop this run's databases and roles; never another run's."""
+    admin_url = os.environ.get(ADMIN_URL_ENV)
+    if not admin_url:
+        return
+    try:
+        admin = psycopg.connect(admin_url, autocommit=True)
+    except psycopg.OperationalError:
+        return  # the server is gone, and so is whatever this run left on it
+    with admin:
+        names = admin.execute(
+            "SELECT datname FROM pg_database WHERE starts_with(datname, %s)", (DATABASE_PREFIX,)
+        ).fetchall()
+        for (name,) in names:
+            admin.execute(f'DROP DATABASE "{name}" WITH (FORCE)')
+        for role in (OWNER_ROLE, REQUESTER_ROLE, APPROVER_ROLE, LEGACY_APP_ROLE):
+            admin.execute(f'DROP ROLE IF EXISTS "{role}"')
 
 
 def _with(url: str, *, user: str | None = None, database: str | None = None) -> str:

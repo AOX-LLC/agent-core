@@ -19,7 +19,7 @@ from aox_agent_core.audit import sql as audit_sql
 from aox_agent_core.audit.chain import canonical_timestamp
 from aox_agent_core.audit.sql import SQLAuditLog
 from aox_agent_core.errors import AuditPayloadRejectedError, AuditTimeRejectedError
-from databases import ControlDatabase
+from databases import REQUESTER_ROLE, ControlDatabase
 
 REFUSED = (sqlite3.DatabaseError, psycopg.Error)
 
@@ -219,7 +219,7 @@ async def test_the_database_sets_recorded_at_whatever_the_writer_sends(
         f"SELECT recorded_at, db_role FROM {audit_sql.AUDIT_TABLE} WHERE seq = 2"
     )
     assert rows[0][0] > "2020"
-    assert rows[0][1] == "agent_core_requester"
+    assert rows[0][1] == REQUESTER_ROLE
 
 
 @pytest.mark.parametrize(
@@ -266,5 +266,5 @@ async def test_a_row_with_a_bad_hash_names_the_role_that_inserted_it(
     first = await log.append(event(1))
     control_database.requester_raw(raw_insert(2, first.record_hash))
 
-    with pytest.raises(Exception, match="db_role column reads agent_core_requester"):
+    with pytest.raises(Exception, match=f"db_role column reads {REQUESTER_ROLE}"):
         await log.verify()
