@@ -60,7 +60,14 @@ class _Runner:
                 "await the async log or queue instead."
             )
         loop = self._ensure_loop()
-        return asyncio.run_coroutine_threadsafe(_as_coroutine(work), loop).result()
+        future = asyncio.run_coroutine_threadsafe(_as_coroutine(work), loop)
+        try:
+            return future.result()
+        except BaseException:
+            # An interrupt (Ctrl-C) must not leave a long call, such as wait_for_decision,
+            # running on the background loop for days.
+            future.cancel()
+            raise
 
     def _ensure_loop(self) -> asyncio.AbstractEventLoop:
         with self._start_lock:
