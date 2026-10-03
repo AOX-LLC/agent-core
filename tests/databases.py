@@ -176,6 +176,8 @@ class SplitQueue:
         self.submit = requester.submit
         self.get = requester.get
         self.consume = requester.consume
+        self.cancel = requester.cancel
+        self.expire_due = requester.expire_due
         self.resolve = approver.resolve
         self.list_pending = approver.list_pending
 

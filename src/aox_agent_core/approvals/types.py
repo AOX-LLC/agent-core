@@ -41,8 +41,10 @@ class Principal(FrozenModel):
 class ApprovalStatus(StrEnum):
     """Where a request is in its life. CONSUMED means its one permitted run has happened.
 
-    EXPIRED and CANCELLED are reserved: this release never sets them. Expiry is
-    judged from expires_at whenever a request is resolved or used.
+    A pending request becomes CANCELLED when its requester withdraws it, and
+    EXPIRED when expire_due() stores its expiry. Expiry does not wait for that
+    sweep: it is judged from expires_at whenever a request is read, resolved or
+    used, so a pending request past its lifetime reads as EXPIRED either way.
     """
 
     PENDING = "pending"
@@ -113,6 +115,7 @@ class ApprovalRequest(FrozenModel):
     resolved_by: PrincipalId | None = None
     resolved_at: AwareDatetime | None = None
     consumed_at: AwareDatetime | None = None
+    closed_at: AwareDatetime | None = None
     reason: ShortText | None = None
     run_context: RunContext | None = None
     delegates: frozenset[PrincipalId] = frozenset()
@@ -149,6 +152,9 @@ class ApprovalRequest(FrozenModel):
 
         if (self.consumed_at is not None) != (self.status is ApprovalStatus.CONSUMED):
             raise ValueError("consumed_at is set exactly when the status is consumed")
+        is_closed = self.status in {ApprovalStatus.EXPIRED, ApprovalStatus.CANCELLED}
+        if (self.closed_at is not None) != is_closed:
+            raise ValueError("closed_at is set exactly when the status is expired or cancelled")
         return self
 
     def is_expired(self, now: datetime) -> bool:

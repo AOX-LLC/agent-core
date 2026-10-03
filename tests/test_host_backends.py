@@ -35,6 +35,7 @@ from aox_agent_core.audit import (
     compute_record_hash,
 )
 from aox_agent_core.errors import (
+    ApprovalAlreadyResolvedError,
     ApprovalNotFoundError,
     ApprovalNotGrantedError,
     ApprovalPayloadMismatchError,
@@ -200,6 +201,43 @@ class InMemoryApprovalQueue:
         self._requests[request_id] = consumed
         await self._audit("approval.consumed", principal, consumed, context)
         return consumed
+
+    async def cancel(
+        self,
+        request_id: UUID,
+        *,
+        principal: Principal,
+        reason: str | None = None,
+        context: RunContext | None = None,
+    ) -> ApprovalRequest:
+        request = await self.get(request_id)
+        if principal.id != request.requested_by:
+            raise NotTheRequesterError(f"Request {request_id} is not {principal.id}'s to cancel.")
+        if request.status is not ApprovalStatus.PENDING:
+            raise ApprovalAlreadyResolvedError(f"Request {request_id} is {request.status.value}.")
+        cancelled = request.model_copy(
+            update={"status": ApprovalStatus.CANCELLED, "closed_at": datetime.now(UTC)}
+        )
+        self._requests[request_id] = cancelled
+        await self._audit("approval.cancelled", principal, cancelled, context)
+        return cancelled
+
+    async def expire_due(
+        self, *, principal: Principal, now: datetime | None = None, limit: int = 500
+    ) -> int:
+        moment = now or datetime.now(UTC)
+        due = [
+            request
+            for request in self._requests.values()
+            if request.status is ApprovalStatus.PENDING and request.is_expired(moment)
+        ]
+        for request in due:
+            expired = request.model_copy(
+                update={"status": ApprovalStatus.EXPIRED, "closed_at": moment}
+            )
+            self._requests[request.id] = expired
+            await self._audit("approval.expired", principal, expired, None)
+        return len(due)
 
     async def _audit(
         self,

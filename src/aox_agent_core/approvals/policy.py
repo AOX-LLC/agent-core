@@ -44,6 +44,8 @@ class RoleApproverPolicy:
             return _deny(DenialReason.MISSING_ROLE)
         if principal.id == request.requested_by:
             return _deny(DenialReason.SELF_APPROVAL)
+        if request.status is ApprovalStatus.EXPIRED:
+            return _deny(DenialReason.EXPIRED)
         if request.status is not ApprovalStatus.PENDING:
             return _deny(DenialReason.NOT_PENDING)
         if request.is_expired(now):

@@ -168,8 +168,8 @@ RESOLVED = {"resolved_by": "user-17", "resolved_at": NOW + timedelta(minutes=5)}
             "consumed_at": NOW + timedelta(minutes=6),
             **RESOLVED,
         },
-        {"status": ApprovalStatus.EXPIRED},
-        {"status": ApprovalStatus.CANCELLED},
+        {"status": ApprovalStatus.EXPIRED, "closed_at": NOW},
+        {"status": ApprovalStatus.CANCELLED, "closed_at": NOW},
     ],
 )
 def test_approval_request_accepts_consistent_states(state: dict[str, Any]) -> None:
@@ -197,6 +197,9 @@ def test_approval_request_accepts_consistent_states(state: dict[str, Any]) -> No
         },
         {"status": ApprovalStatus.CONSUMED, "decision": Decision.APPROVE, **RESOLVED},
         {"expires_at": NOW + timedelta(seconds=TTL_SECONDS_MAX + 1)},
+        {"status": ApprovalStatus.EXPIRED},
+        {"closed_at": NOW},
+        {"delegates": frozenset(f"svc-{n}" for n in range(17))},
     ],
     ids=[
         "status-decision-mismatch",
@@ -207,6 +210,9 @@ def test_approval_request_accepts_consistent_states(state: dict[str, Any]) -> No
         "consumed-at-while-approved",
         "consumed-without-time",
         "lifetime-over-limit",
+        "expired-without-closed-at",
+        "pending-with-closed-at",
+        "too-many-delegates",
     ],
 )
 def test_approval_request_rejects_impossible_states(state: dict[str, Any]) -> None:

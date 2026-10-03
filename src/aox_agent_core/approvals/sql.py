@@ -93,7 +93,7 @@ PENDING_PAGE_SIZE = 500
 _COLUMNS = (
     "id, action, summary, payload_sha256, requested_by, required_role, created_at, "
     "expires_at, status, decision, resolved_by, resolved_at, consumed_at, reason, run_context, "
-    "delegates"
+    "delegates, closed_at"
 )
 DELEGATES_COLUMN: Final = "delegates"
 
@@ -118,6 +118,9 @@ class _Outcome:
     request: ApprovalRequest | None = None
     error: ApprovalError | None = None
     events: list[AuditEvent] = field(default_factory=list)
+    # How many requests an expiry batch stored as expired, and whether it was full.
+    expired: int = 0
+    batch_full: bool = False
 
 
 class SQLApprovalQueue:
@@ -218,7 +221,7 @@ class SQLApprovalQueue:
             require_current_table(session, APPROVALS_TABLE, RUN_CONTEXT_COLUMN)
             session.execute(
                 f"INSERT INTO {APPROVALS_TABLE} ({_COLUMNS}) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 _row_values(request),
             )
             event = _event(
@@ -247,6 +250,11 @@ class SQLApprovalQueue:
         request = await self.database.run(read)
         if request is None:
             raise ApprovalNotFoundError(f"No approval request {request_id}.")
+        if request.status is ApprovalStatus.PENDING and request.is_expired(self._now()):
+            # Reported as the sweep would store it, without writing anything.
+            return request.model_copy(
+                update={"status": ApprovalStatus.EXPIRED, "closed_at": request.expires_at}
+            )
         return request
 
     async def list_pending(
@@ -477,8 +485,120 @@ class SQLApprovalQueue:
 
         return await self._write(use)
 
+    async def cancel(
+        self,
+        request_id: UUID,
+        *,
+        principal: Principal,
+        reason: str | None = None,
+        context: RunContext | None = None,
+    ) -> ApprovalRequest:
+        """Withdraw a pending request. Only the principal who submitted it may.
+
+        Delegates may consume an approval but never cancel the request. `reason`
+        is a short explanation recorded in the audit event (never personal data).
+        Raises NotTheRequesterError for anyone else, ApprovalAlreadyResolvedError
+        if the request is no longer pending, ApprovalExpiredError if it has
+        expired, and ApprovalNotFoundError if it does not exist; each is audited.
+        """
+        if reason is not None and not 0 < len(reason) <= 500:
+            raise ValueError("reason must be 1 to 500 characters")
+        details = {"cancel_reason": reason} if reason is not None else {}
+
+        def withdraw(session: Session) -> _Outcome:
+            self._require_side(session, "cancel requests", ApprovalSide.REQUESTER)
+            request = _load(session, request_id)
+            if request is None:
+                return _denied(
+                    ApprovalNotFoundError(f"No approval request {request_id}."),
+                    _missing_event("approval.cancel_denied", principal.id, request_id, context),
+                )
+            event_context = context if context is not None else request.run_context
+            now = self._now()
+            refusal = _cancel_refusal(request, principal, now)
+            if refusal is not None:
+                error, denial = refusal
+                return _denied(
+                    error,
+                    _event(
+                        "approval.cancel_denied",
+                        principal.id,
+                        request,
+                        event_context,
+                        reason=denial,
+                    ),
+                )
+            cancelled = request.model_copy(
+                update={"status": ApprovalStatus.CANCELLED, "closed_at": now}
+            )
+            if not _close(session, request, ApprovalStatus.CANCELLED, now):
+                return _denied(
+                    ApprovalAlreadyResolvedError(f"Request {request_id} was resolved meanwhile."),
+                    _event(
+                        "approval.cancel_denied",
+                        principal.id,
+                        request,
+                        event_context,
+                        reason=DenialReason.NOT_PENDING.value,
+                    ),
+                )
+            event = _event("approval.cancelled", principal.id, cancelled, event_context, **details)
+            return _Outcome(request=cancelled, events=[event])
+
+        return await self._write(withdraw)
+
+    async def expire_due(
+        self, *, principal: Principal, now: datetime | None = None, limit: int = 500
+    ) -> int:
+        """Store EXPIRED on every pending request whose lifetime is over; return how many.
+
+        Reads already report such requests as expired, so this only makes the
+        stored state match, with one approval.expired audit event per request
+        naming `principal` as the actor. Either side may run it. It works in
+        batches of `limit`, each its own transaction. On Postgres a request
+        counts as due only once the database's clock agrees, as the guard does.
+        """
+        if limit < 1:
+            raise ValueError(f"limit must be at least 1, got {limit}")
+        moment = now if now is not None else self._now()
+        if moment.tzinfo is None or moment.utcoffset() is None:
+            raise ValueError("now must be a timezone-aware datetime")
+
+        def sweep(session: Session) -> _Outcome:
+            self._prepare(session)
+            if not _table_exists(session):
+                return _Outcome()
+            due = _load_due(session, moment, limit)
+            events = []
+            for request in due:
+                if _close(session, request, ApprovalStatus.EXPIRED, moment):
+                    expired = request.model_copy(
+                        update={"status": ApprovalStatus.EXPIRED, "closed_at": moment}
+                    )
+                    # The sweep belongs to no run; the event carries the request's own.
+                    events.append(
+                        _event("approval.expired", principal.id, expired, request.run_context)
+                    )
+            return _Outcome(events=events, expired=len(events), batch_full=len(due) == limit)
+
+        total = 0
+        while True:
+            outcome = await self._write_outcome(sweep)
+            total += outcome.expired
+            if not outcome.batch_full:
+                return total
+
     async def _write(self, work: Callable[[Session], _Outcome]) -> ApprovalRequest:
-        """Run `work` in a write transaction, audit its events, then return or raise.
+        """Run `work` as _write_outcome does, then return its request or raise its error."""
+        outcome = await self._write_outcome(work)
+        if outcome.error is not None:
+            raise outcome.error
+        if outcome.request is None:
+            raise AssertionError("an approval transaction must return a request or an error")
+        return outcome.request
+
+    async def _write_outcome(self, work: Callable[[Session], _Outcome]) -> _Outcome:
+        """Run `work` in a write transaction and audit its events.
 
         When the audit log is on the same database the events are written in the
         same transaction, so the change and its record commit together or not at
@@ -508,11 +628,7 @@ class SQLApprovalQueue:
         if not shares_database:
             for event in outcome.events:
                 await audit_log.append(event)
-        if outcome.error is not None:
-            raise outcome.error
-        if outcome.request is None:
-            raise AssertionError("an approval transaction must return a request or an error")
-        return outcome.request
+        return outcome
 
 
 def _consume_refusal(
@@ -535,6 +651,8 @@ def _consume_refusal(
             ),
             "payload_mismatch",
         )
+    if request.status is ApprovalStatus.EXPIRED:
+        return ApprovalExpiredError(f"Request {request_id} expired before it was used."), "expired"
     if request.status in {ApprovalStatus.PENDING, ApprovalStatus.REJECTED}:
         return (
             ApprovalNotGrantedError(f"Request {request_id} is {request.status.value}."),
@@ -548,6 +666,60 @@ def _consume_refusal(
     if request.is_expired(now):
         return ApprovalExpiredError(f"Request {request_id} expired before it was used."), "expired"
     return None
+
+
+def _cancel_refusal(
+    request: ApprovalRequest, principal: Principal, now: datetime
+) -> tuple[ApprovalError, str] | None:
+    """Why this principal cannot cancel this request now, or None if it can."""
+    if principal.id != request.requested_by:
+        return (
+            NotTheRequesterError(
+                f"Request {request.id} was made by {request.requested_by}; only they may cancel it."
+            ),
+            DenialReason.NOT_REQUESTER.value,
+        )
+    if request.status is ApprovalStatus.EXPIRED or (
+        request.status is ApprovalStatus.PENDING and request.is_expired(now)
+    ):
+        return ApprovalExpiredError(f"Request {request.id} has expired."), "expired"
+    if request.status is not ApprovalStatus.PENDING:
+        return (
+            ApprovalAlreadyResolvedError(f"Request {request.id} is {request.status.value}."),
+            DenialReason.NOT_PENDING.value,
+        )
+    return None
+
+
+def _close(
+    session: Session, request: ApprovalRequest, status: ApprovalStatus, now: datetime
+) -> bool:
+    """Move a pending request to `status` (expired or cancelled); False if it moved meanwhile."""
+    changed = session.execute_count(
+        f"UPDATE {APPROVALS_TABLE} SET status = ?, closed_at = ? WHERE id = ? AND status = ?",
+        (status.value, canonical_timestamp(now), str(request.id), ApprovalStatus.PENDING.value),
+    )
+    return changed == 1
+
+
+# The database's clock as a canonical timestamp, so the sweep picks only what the
+# guard agrees has expired, even when the application's clock runs ahead.
+_POSTGRES_NOW_TEXT = (
+    "to_char(statement_timestamp() AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"')"
+)
+
+
+def _load_due(session: Session, now: datetime, limit: int) -> list[ApprovalRequest]:
+    """Up to `limit` pending requests whose lifetime ended by `now`, oldest expiry first."""
+    database_clock = (
+        f" AND expires_at <= {_POSTGRES_NOW_TEXT}" if session.dialect is Dialect.POSTGRES else ""
+    )
+    rows = session.execute(
+        f"SELECT {_COLUMNS} FROM {APPROVALS_TABLE} WHERE status = ? AND expires_at <= ?"
+        f"{database_clock} ORDER BY expires_at, id LIMIT ?",
+        (ApprovalStatus.PENDING.value, canonical_timestamp(now), limit),
+    )
+    return [_request_from_row(row) for row in rows]
 
 
 def _denied(error: ApprovalError, event: AuditEvent) -> _Outcome:
@@ -678,6 +850,7 @@ def _row_values(request: ApprovalRequest) -> tuple[Any, ...]:
             else None
         ),
         json.dumps(sorted(request.delegates)),
+        timestamp(request.closed_at),
     )
 
 
