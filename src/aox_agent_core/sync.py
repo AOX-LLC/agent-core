@@ -26,6 +26,11 @@ from pydantic import JsonValue
 
 from aox_agent_core.approvals.queue import ApprovalQueue
 from aox_agent_core.approvals.types import ApprovalRequest, Decision, Principal
+from aox_agent_core.approvals.wait import (
+    DEFAULT_MAX_POLL_INTERVAL,
+    DEFAULT_POLL_INTERVAL,
+    wait_for_decision,
+)
 from aox_agent_core.audit.log import AuditLog
 from aox_agent_core.audit.types import AuditEvent, AuditHead, AuditRecord
 from aox_agent_core.context import RunContext
@@ -55,7 +60,14 @@ class _Runner:
                 "await the async log or queue instead."
             )
         loop = self._ensure_loop()
-        return asyncio.run_coroutine_threadsafe(_as_coroutine(work), loop).result()
+        future = asyncio.run_coroutine_threadsafe(_as_coroutine(work), loop)
+        try:
+            return future.result()
+        except BaseException:
+            # An interrupt (Ctrl-C) must not leave a long call, such as wait_for_decision,
+            # running on the background loop for days.
+            future.cancel()
+            raise
 
     def _ensure_loop(self) -> asyncio.AbstractEventLoop:
         with self._start_lock:
@@ -235,6 +247,25 @@ class SyncApprovalQueue:
     ) -> int:
         return self._runner.run(
             self._queue.purge_payloads(principal=principal, older_than=older_than, limit=limit)
+        )
+
+    def wait_for_decision(
+        self,
+        request_id: UUID,
+        *,
+        timeout: timedelta,
+        poll_interval: timedelta = DEFAULT_POLL_INTERVAL,
+        max_poll_interval: timedelta = DEFAULT_MAX_POLL_INTERVAL,
+    ) -> ApprovalRequest:
+        """Block until the request is decided; see approvals.wait_for_decision."""
+        return self._runner.run(
+            wait_for_decision(
+                self._queue,
+                request_id,
+                timeout=timeout,
+                poll_interval=poll_interval,
+                max_poll_interval=max_poll_interval,
+            )
         )
 
     def close(self) -> None:

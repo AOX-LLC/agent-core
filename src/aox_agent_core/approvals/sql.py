@@ -146,6 +146,7 @@ _DENIAL_ERRORS: Final[Mapping[DenialReason, type[ApprovalError]]] = {
     DenialReason.MISSING_ROLE: NotAuthorizedToResolveError,
     DenialReason.SELF_APPROVAL: NotAuthorizedToResolveError,
     DenialReason.DELEGATE_APPROVAL: NotAuthorizedToResolveError,
+    DenialReason.LOGIN_BINDING: NotAuthorizedToResolveError,
     DenialReason.NOT_PENDING: ApprovalAlreadyResolvedError,
     DenialReason.UNKNOWN_ACTION: NotAuthorizedToResolveError,
     DenialReason.ROLE_MISMATCH: NotAuthorizedToResolveError,
@@ -552,7 +553,9 @@ class SQLApprovalQueue:
         ApprovalAlreadyResolvedError if it is no longer pending,
         ApprovalExpiredError if it has expired, and ApprovalNotFoundError if it
         does not exist. Each of those is audited first, with `context` or, without
-        one, the request's own.
+        one, the request's own. With login binding on (Postgres), a principal other
+        than the one the owner mapped to this connection's login is refused the same
+        way, as DenialReason.LOGIN_BINDING.
         """
 
         async def decide(session: Session) -> _Outcome:
@@ -599,6 +602,28 @@ class SQLApprovalQueue:
                     ),
                 )
 
+            if session.dialect is Dialect.POSTGRES and await layout.login_binding_enabled(
+                session, self._schema
+            ):
+                # Read here, not once at start-up: an operator can turn binding on or off.
+                # The guard enforces this; asking first gives the refusal a name and an audit
+                # event instead of a driver error. The mapping is read inside this transaction.
+                bound = await layout.bound_principal(session, self._schema)
+                if bound != principal.id:
+                    return _denied(
+                        NotAuthorizedToResolveError(
+                            f"Request {request_id} cannot be resolved: this login may record "
+                            "only the principal the owner mapped to it."
+                        ),
+                        _event(
+                            "approval.resolve_denied",
+                            principal.id,
+                            request,
+                            event_context,
+                            decision=decision.value,
+                            reason=DenialReason.LOGIN_BINDING.value,
+                        ),
+                    )
             # A request may be dated up to five minutes ahead (the guard allows it, for clock
             # skew); a decision is never dated before its request.
             decided_at = max(now, request.created_at)

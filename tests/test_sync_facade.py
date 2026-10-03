@@ -124,3 +124,40 @@ def _queue_on(pg: ControlDatabase) -> SQLApprovalQueue:
         audit_log=SQLAuditLog(open_database(pg.url)),
         schema=pg.schema,
     )
+
+
+def test_an_interrupted_blocking_call_cancels_the_work_on_the_background_loop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import asyncio
+    import concurrent.futures
+    import threading
+
+    from aox_agent_core.sync import _Runner
+
+    started = threading.Event()
+    cancelled = threading.Event()
+
+    async def forever() -> None:
+        started.set()
+        try:
+            await asyncio.sleep(3_600)
+        except asyncio.CancelledError:
+            cancelled.set()
+            raise
+
+    def interrupted(self: object, timeout: float | None = None) -> None:
+        # Interrupt only once the work is running; cancelling a coroutine that has not
+        # taken its first step never reaches its except clause.
+        assert started.wait(5)
+        raise KeyboardInterrupt
+
+    runner = _Runner()
+    monkeypatch.setattr(concurrent.futures.Future, "result", interrupted)
+    try:
+        with pytest.raises(KeyboardInterrupt):
+            runner.run(forever())
+        monkeypatch.undo()
+        assert cancelled.wait(5)
+    finally:
+        runner.close()

@@ -27,6 +27,12 @@ from aox_agent_core import _postgres_schema as layout
 from aox_agent_core._canonical import canonical_json
 from aox_agent_core._validation import STORED_RECORD
 from aox_agent_core.audit.chain import canonical_timestamp, compute_record_hash
+from aox_agent_core.audit.report import (
+    MAX_REPORTED_PROBLEMS,
+    ProblemKind,
+    VerifyProblem,
+    VerifyReport,
+)
 from aox_agent_core.audit.types import (
     GENESIS_HASH,
     OCCURRED_AT_MAX_FUTURE,
@@ -75,10 +81,10 @@ MAX_APPEND_BATCH = 1000
 
 COLUMNS = (
     "seq, schema_version, event_id, occurred_at, action, actor_id, subject_id, payload, "
-    "run_context, prev_hash, record_hash, db_role, recorded_at"
+    "run_context, prev_hash, record_hash, db_role, recorded_at, db_login"
 )
-# Columns added in 0.1.0a3 and 0.1.0a4, with their SQLite types.
-ADDED_COLUMNS: Final = {"db_role": "TEXT", "recorded_at": "TEXT"}
+# Columns added in 0.1.0a3, 0.1.0a4 and 0.1.0a7, with their SQLite types.
+ADDED_COLUMNS: Final = {"db_role": "TEXT", "recorded_at": "TEXT", "db_login": "TEXT"}
 
 _TABLE_DDL = f"""
 CREATE TABLE {AUDIT_TABLE} (
@@ -94,7 +100,8 @@ CREATE TABLE {AUDIT_TABLE} (
     prev_hash TEXT NOT NULL,
     record_hash TEXT NOT NULL,
     db_role TEXT,
-    recorded_at TEXT
+    recorded_at TEXT,
+    db_login TEXT
 )"""
 
 # Inserts land only right after the last record: the next seq, linked to the last
@@ -151,6 +158,38 @@ class SQLAuditLog:
         self._scrubber = scrubber if scrubber is not None else PatternScrubber()
         self._table = TableName.on(database, AUDIT_TABLE, schema)
         self._protections_checked = False
+
+    async def verify_report(
+        self,
+        *,
+        expected_head: AuditHead | None = None,
+        max_problems: int = MAX_REPORTED_PROBLEMS,
+    ) -> VerifyReport:
+        """Walk the whole chain like verify(), but report every problem and keep walking.
+
+        Returns a VerifyReport instead of raising AuditIntegrityError at the first bad
+        record, so a bad record does not hide what comes after it. After one, the walk
+        continues from the record's stored hash. It stops after `max_problems` (default
+        1000) and says so. Read-only, in batches; it never repairs anything.
+        """
+        if max_problems < 1:
+            raise ValueError("max_problems must be at least 1")
+        return await self._walk_report(expected_head, max_problems)
+
+    async def _walk_report(
+        self, expected_head: AuditHead | None, max_problems: int
+    ) -> VerifyReport:
+        state = _ReportState(expected_head=expected_head, max_problems=max_problems)
+        after_seq = 0
+        while not state.truncated:
+            rows = await self.database.run(
+                partial(_rows_after, table=self._table, after_seq=after_seq, limit=READ_BATCH_SIZE)
+            )
+            await asyncio.to_thread(state.check_batch, rows)
+            if len(rows) < READ_BATCH_SIZE:
+                break
+            after_seq = _row_seq(rows[-1], default=after_seq + len(rows))
+        return state.report()
 
     async def append(self, event: AuditEvent, *, connection: Any = None) -> AuditRecord:
         """Validate and scrub the event, then add it to the chain in its own transaction.
@@ -304,20 +343,21 @@ class SQLAuditLog:
                     _row_values(record),
                 )
             return stored
-        # One statement for the whole batch. The insert trigger sets db_role and
+        # One statement for the whole batch. The insert trigger sets db_role, db_login and
         # recorded_at, whatever is sent, and checks the chain link of every row.
         rows = await session.execute(
             f"INSERT INTO {self._table.sql} ({COLUMNS}) VALUES "
             + ", ".join(row_marks for _ in records)
-            + " RETURNING seq, db_role, recorded_at",
+            + " RETURNING seq, db_role, recorded_at, db_login",
             [value for record in records for value in _row_values(record)],
         )
-        written = {seq: (role, recorded) for seq, role, recorded in rows}
+        written = {seq: (role, recorded, login) for seq, role, recorded, login in rows}
         return [
             record.model_copy(
                 update={
                     "db_role": written[record.seq][0],
                     "recorded_at": datetime.fromisoformat(written[record.seq][1]),
+                    "db_login": written[record.seq][2],
                 }
             )
             for record in records
@@ -391,7 +431,7 @@ class SQLAuditLog:
                     f"The audit insert trigger on {self._table} is older than this release "
                     f"(revision {revision or 'before 5'}, this release needs "
                     f"{layout.AUDIT_TRIGGER_REVISION}). As the owner role, run "
-                    "install_postgres_schema from 0.1.0a6 with the requester and approver roles."
+                    "install_postgres_schema from 0.1.0a7 with the requester and approver roles."
                 )
         await bring_table_up_to_date(session, AUDIT_TABLE, ADDED_COLUMNS, schema=self._table.schema)
         self._protections_checked = True
@@ -441,6 +481,108 @@ async def audit_table_exists(database: Database, *, schema: str | None = None) -
     return await database.run(
         partial(_table_is_readable, table=TableName.on(database, AUDIT_TABLE, schema))
     )
+
+
+class _ReportState:
+    """The running state of verify_report's walk: what it has seen and what it found."""
+
+    def __init__(self, *, expected_head: AuditHead | None, max_problems: int) -> None:
+        self._expected = expected_head
+        self._max = max_problems
+        self._last_seq = 0
+        # None after a record that could not be read: the next link cannot be judged.
+        self._previous_hash: str | None = GENESIS_HASH
+        self._head = AuditHead(seq=0, record_hash=GENESIS_HASH)
+        self._anchored_hash = GENESIS_HASH if expected_head and expected_head.seq == 0 else None
+        self._problems: list[VerifyProblem] = []
+        self._checked = 0
+        self.truncated = False
+
+    def _add(self, seq: int | None, kind: ProblemKind, detail: str) -> None:
+        if len(self._problems) >= self._max:
+            self.truncated = True
+            return
+        self._problems.append(VerifyProblem(seq=seq, kind=kind, detail=detail))
+
+    def check_batch(self, rows: list[tuple[Any, ...]]) -> None:
+        for row in rows:
+            if self.truncated:
+                return
+            self._checked += 1
+            self._check_row(row)
+
+    def _check_row(self, row: tuple[Any, ...]) -> None:
+        stored_seq = _row_seq(row, default=self._last_seq + 1)
+        try:
+            record = record_from_row(row)
+        except AuditIntegrityError as error:
+            self._add(stored_seq, "malformed", str(error))
+            self._last_seq = stored_seq
+            self._previous_hash = None
+            return
+        if record.seq != self._last_seq + 1:
+            self._add(
+                record.seq,
+                "seq",
+                f"Records {self._last_seq + 1} to {record.seq - 1} are missing."
+                if record.seq > self._last_seq + 1
+                else f"Record {record.seq} follows record {self._last_seq}.",
+            )
+        elif self._previous_hash is not None and record.prev_hash != self._previous_hash:
+            self._add(
+                record.seq, "link", f"Record {record.seq} does not link to record {record.seq - 1}."
+            )
+        try:
+            holds = compute_record_hash(record) == record.record_hash
+        except (ValueError, RecursionError):
+            self._add(record.seq, "hash", f"Record {record.seq} cannot be hashed.")
+        else:
+            if not holds:
+                by = f" (its db_role column reads {record.db_role})" if record.db_role else ""
+                self._add(
+                    record.seq, "hash", f"Record {record.seq} was altered after it was written{by}."
+                )
+        self._last_seq = record.seq
+        self._previous_hash = record.record_hash
+        self._head = AuditHead(seq=record.seq, record_hash=record.record_hash)
+        if self._expected is not None and record.seq == self._expected.seq:
+            self._anchored_hash = record.record_hash
+
+    def report(self) -> VerifyReport:
+        expected = self._expected
+        if expected is not None and not self.truncated:
+            if expected.seq > self._last_seq:
+                self._add(
+                    None,
+                    "anchor",
+                    f"The log ends at record {self._last_seq}, but the anchor was taken at "
+                    f"record {expected.seq}: records were removed from the end.",
+                )
+            elif self._anchored_hash is None:
+                self._add(
+                    expected.seq,
+                    "anchor",
+                    f"Record {expected.seq} could not be read, so it cannot be matched to the "
+                    "anchor.",
+                )
+            elif self._anchored_hash != expected.record_hash:
+                self._add(
+                    expected.seq,
+                    "anchor",
+                    f"Record {expected.seq} no longer matches the anchor: the log was rewritten.",
+                )
+        return VerifyReport(
+            head=self._head,
+            records_checked=self._checked,
+            problems=tuple(self._problems),
+            truncated=self.truncated,
+        )
+
+
+def _row_seq(row: tuple[Any, ...], *, default: int) -> int:
+    """The seq column of a row as an int, or `default` if it is not one."""
+    seq = row[0]
+    return seq if isinstance(seq, int) and not isinstance(seq, bool) else default
 
 
 def _check_anchor(head: AuditHead, expected: AuditHead, anchored_hash: str | None) -> None:
@@ -650,13 +792,14 @@ def _row_values(record: AuditRecord) -> tuple[Any, ...]:
         record.record_hash,
         None,
         canonical_timestamp(record.recorded_at) if record.recorded_at is not None else None,
+        None,
     )
 
 
 def record_from_row(row: tuple[Any, ...]) -> AuditRecord:
     """Rebuild a record from a COLUMNS-ordered row; AuditIntegrityError if it is malformed."""
     seq, schema_version, event_id, occurred_at, action, actor_id, subject_id = row[:7]
-    payload, run_context, prev_hash, record_hash, db_role, recorded_at = row[7:]
+    payload, run_context, prev_hash, record_hash, db_role, recorded_at, db_login = row[7:]
     try:
         return AuditRecord.model_validate(
             {
@@ -672,6 +815,7 @@ def record_from_row(row: tuple[Any, ...]) -> AuditRecord:
                 "prev_hash": prev_hash,
                 "record_hash": record_hash,
                 "db_role": db_role,
+                "db_login": db_login,
                 "recorded_at": (
                     datetime.fromisoformat(recorded_at) if recorded_at is not None else None
                 ),

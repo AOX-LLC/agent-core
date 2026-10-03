@@ -90,6 +90,22 @@ class ControlDatabase:
         return _with(self.superuser_url, user=role)
 
 
+def approver_login(
+    database: ControlDatabase, *, also_member_of: tuple[str, ...] = ()
+) -> tuple[str, str]:
+    """A login role that is a member of the approver role (and of `also_member_of`), with its URL.
+
+    It inherits, so it holds the approver role's privileges as itself. The fixture drops it.
+    """
+    assert database.superuser_url is not None, "roles exist only on Postgres"
+    role = f"agent_core_login_{uuid4().hex[:8]}"
+    database.superuser_raw(f"CREATE ROLE {role} LOGIN INHERIT")
+    database.roles.append(role)
+    for member_of in (APPROVER_ROLE, *also_member_of):
+        database.superuser_raw(f"GRANT {member_of} TO {role}")
+    return role, _with(database.superuser_url, user=role)
+
+
 def sqlite_database(tmp_path: Path) -> ControlDatabase:
     path = tmp_path / "control.sqlite3"
 

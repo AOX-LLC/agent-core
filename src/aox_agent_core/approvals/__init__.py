@@ -14,6 +14,7 @@ from aox_agent_core.approvals.types import (
     PrincipalKind,
     ResolveVerdict,
 )
+from aox_agent_core.approvals.wait import wait_for_decision
 
 __all__ = [
     "TTL_SECONDS_MAX",
@@ -30,4 +31,5 @@ __all__ = [
     "RoleApproverPolicy",
     "SQLApprovalQueue",
     "approval_payload_hash",
+    "wait_for_decision",
 ]

@@ -15,8 +15,10 @@ from aox_agent_core.context import RunContext
 
 # 2 added run_context to every record and to its hash (agent-core 0.1.0a2); 3
 # added db_role, set by the database and kept out of the hash (0.1.0a3). A chain
-# upgraded from 2 keeps its earlier records at 2, and they still verify.
-AUDIT_SCHEMA_VERSION: Final = 3
+# upgraded from 2 keeps its earlier records at 2, and they still verify. 4 added
+# db_login, also set by the database and kept out of the hash (0.1.0a7); records
+# written before it stay at 3 and still verify.
+AUDIT_SCHEMA_VERSION: Final = 4
 GENESIS_HASH: Final = "0" * 64
 MAX_PAYLOAD_BYTES = 8_192
 # How far a caller-supplied occurred_at may lie from the database's clock.
@@ -92,7 +94,7 @@ class UnsealedAuditRecord(FrozenModel):
     Postgres jsonb, so verify() hashes exactly the bytes append() hashed.
     """
 
-    schema_version: Literal[2, 3] = AUDIT_SCHEMA_VERSION
+    schema_version: Literal[2, 3, 4] = AUDIT_SCHEMA_VERSION
     seq: Annotated[int, Field(ge=1)]
     event_id: UUID
     occurred_at: AwareDatetime
@@ -113,6 +115,12 @@ class AuditRecord(UnsealedAuditRecord):
     is who wrote the row. It is outside the hash, so it is always None on SQLite,
     which has no roles, and proves nothing about records copied elsewhere.
 
+    db_login is the login the connection authenticated as (Postgres session_user,
+    0.1.0a7). SET ROLE changes db_role but never db_login, so it names who really
+    wrote the row even after a role switch. The database sets it, whatever the writer
+    supplied; it is outside the hash and None on SQLite and on records written
+    before 0.1.0a7.
+
     recorded_at is when the database wrote the row (0.1.0a4); occurred_at, which
     the hash covers, is when the caller says the event happened. On Postgres a
     trigger sets recorded_at, whatever the writer supplied. Like db_role it is
@@ -124,6 +132,7 @@ class AuditRecord(UnsealedAuditRecord):
     record_hash: Sha256Hex
     db_role: str | None = None
     recorded_at: AwareDatetime | None = None
+    db_login: str | None = None
 
 
 class AuditHead(FrozenModel):

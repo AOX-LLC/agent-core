@@ -4,7 +4,7 @@ agent-core is a small Python library for routed Claude model calls, structured o
 
 ## Status
 
-`v0.1.0a6`, the sixth pre-release (`v0.1.0a5` was tagged but never released). What works:
+`v0.1.0a7`, the seventh pre-release (`v0.1.0a5` was tagged but never released). What works:
 
 - routed Claude calls with cost-based tiers, structured outputs, cost and OpenTelemetry tracing;
 - versioned prompts (`PromptRef`) and PNG, JPEG and PDF attachments;
@@ -12,6 +12,8 @@ agent-core is a small Python library for routed Claude model calls, structured o
 - a `RunContext` that ties calls, audit records and approvals to the host's run;
 - an append-only, hash-chained audit log on SQLite or Postgres, async, with batch appends and, on Postgres, writes inside a host's own transaction;
 - a human-approval queue with a role policy, single-use approvals, one open request per requester, action and payload, an optional stored payload bound to the request's hash that can be purged after a retention period, and, on Postgres, approval transitions enforced by the database;
+- on Postgres, an opt-in login binding: the database can require `resolved_by` to be the principal mapped to the login that decides a request, and each audit record names that login in `db_login`;
+- `wait_for_decision` to wait for an approval without polling every second, and `SQLAuditLog.verify_report` to list every problem in an audit chain rather than stop at the first;
 - an eval runner with JSON and Markdown scorecards.
 
 Not yet: the Bedrock provider is an interface only. The API may still change before `v0.1.0`.
@@ -56,22 +58,22 @@ An attachment's type is read from its first bytes, never from its name, and is c
 
 ## Install
 
-The distribution is named `aox-agent-core`. Replace `vX.Y.Z` with a release tag. The examples use `v0.1.0a6`.
+The distribution is named `aox-agent-core`. Replace `vX.Y.Z` with a release tag. The examples use `v0.1.0a7`.
 
 ```sh
-pip install "aox-agent-core @ git+https://github.com/AOX-LLC/agent-core@v0.1.0a6"
+pip install "aox-agent-core @ git+https://github.com/AOX-LLC/agent-core@v0.1.0a7"
 ```
 
 With extras:
 
 ```sh
-pip install "aox-agent-core[postgres,otel] @ git+https://github.com/AOX-LLC/agent-core@v0.1.0a6"
+pip install "aox-agent-core[postgres,otel] @ git+https://github.com/AOX-LLC/agent-core@v0.1.0a7"
 ```
 
 With uv:
 
 ```sh
-uv add "aox-agent-core @ git+https://github.com/AOX-LLC/agent-core" --tag v0.1.0a6
+uv add "aox-agent-core @ git+https://github.com/AOX-LLC/agent-core" --tag v0.1.0a7
 ```
 
 | Extra      | Adds                                         |
@@ -192,11 +194,11 @@ Submitting is idempotent: at most one request is open (pending, or approved and 
 
 On Postgres, the database enforces who may do what. An operator creates two roles, then runs `storage.install_postgres_schema(owner_url, requester_role="...", approver_role="...")` once as the owner. The requester role (the agent side) submits, consumes and cancels. The approver role (the decision side) approves and rejects. A guard trigger on the approvals table checks every insert and update against a fixed transition table, so a role holding only its own credentials cannot approve a request with plain SQL. A deployment runs two queues, one connected as each role. Before its first statement, a queue checks the setup and raises `ConfigError` if it is wrong. The database cannot know principals, so "the approver is a human holding the required role" and "the consumer is the requester or a delegate" stay library rules. The requester writes `required_role` when it submits, so the approver side decides: `RoleApproverPolicy(roles_by_action={...})` lists the role each action needs, and a request for an unlisted action, or whose stored role differs, is refused and audited. The default policy, with no map, refuses everything. `RoleApproverPolicy(trust_requester_role=True)` takes the requester's role as given, for local development only. Pass `schema="..."` to `SQLAuditLog` and `SQLApprovalQueue` to use a Postgres schema other than `public`.
 
-Each audit record carries `db_role`, the database role that inserted it, set by the database and outside the hash. Both roles may append audit rows, so `db_role` is how to tell who really wrote an `approval.resolved` record.
+Each audit record carries `db_role`, the database role that inserted it, set by the database and outside the hash. Both roles may append audit rows, so `db_role` is how to tell who really wrote an `approval.resolved` record. `db_login` is the login that authenticated, which `SET ROLE` does not change.
 
 SQLite has no roles and is not a trust boundary: anyone who can write the file is fully trusted, and the library's checks are all it has. A SQLite queue acts for both sides.
 
-See [docs/upgrade-0.1.0a3.md](docs/upgrade-0.1.0a3.md) for the role layout, the transition table, setup and the upgrade from `v0.1.0a2`, which let one app role set a request to approved with plain SQL. To go from `v0.1.0a4` to `v0.1.0a6` (or from a3; a5 was never released), see [docs/upgrading.md](docs/upgrading.md): the operator re-runs `install_postgres_schema` as the owner, and an older schema is refused until then. `examples/control_layer_demo.py` walks through the audit log and approvals, and `evals/run_triage_eval.py` runs the synthetic eval suite and prints its scorecard.
+See [docs/upgrade-0.1.0a3.md](docs/upgrade-0.1.0a3.md) for the role layout, the transition table, setup and the upgrade from `v0.1.0a2`, which let one app role set a request to approved with plain SQL. To go from `v0.1.0a6` to `v0.1.0a7`, from `v0.1.0a4` to `v0.1.0a6` (or from a3; a5 was never released), see [docs/upgrading.md](docs/upgrading.md): the operator re-runs `install_postgres_schema` as the owner, and an older schema is refused until then. `examples/control_layer_demo.py` walks through the audit log and approvals, and `evals/run_triage_eval.py` runs the synthetic eval suite and prints its scorecard.
 
 ## Bedrock
 

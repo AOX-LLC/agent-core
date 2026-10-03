@@ -1,3 +1,157 @@
+# Upgrading from 0.1.0a6 to 0.1.0a7
+
+Release 0.1.0a7 follows 0.1.0a6. (0.1.0a5 was tagged but never released; the upgrade from 0.1.0a4 is described further down.) It adds three things and one operator step. The audit table records the login that wrote a row (`db_login`). The approvals guard can bind `resolved_by` to the database login that decides a request; this is off unless the operator turns it on. `wait_for_decision` waits for a request to leave `pending`. `SQLAuditLog.verify_report` lists every problem in a chain instead of stopping at the first.
+
+Unchanged: the recording format stays at 2, there is no new optional extra, and `anthropic` is still a base dependency. `db_login` is outside the audit hash.
+
+The required step is a reinstall: run `install_postgres_schema` from 0.1.0a7 as the owner role before the first 0.1.0a7 process connects. This holds for every Postgres deployment, whether or not you use login binding.
+
+This part of the page has an operator section, one for project 03 (its own backends), one for project 04 (the SQL backends), and a list of what is not verified. Where this page says "not tested", nothing was run.
+
+## Operators (0.1.0a7)
+
+1. **Stop the a6 processes, install, then start a7.** An a6 process that is still running writes audit records at schema version 3, which the new insert trigger refuses, and an a6 process that connects after the install refuses the new guard, so do not leave one running. Run the installer as the owner role, with the same roles as before:
+
+   ```python
+   from aox_agent_core.storage import install_postgres_schema
+
+   report = install_postgres_schema(
+       "postgresql://agent_core_owner@db.example/agent_core",
+       requester_role="agent_core_requester",
+       approver_role="agent_core_approver",
+       schema="public",
+       bind_resolved_by=None,
+   )
+   print(report)
+   ```
+
+   `bind_resolved_by=None` is the default and is shown for clarity. The installer changes, in one run: it adds the column `db_login` to the audit table; replaces the audit insert trigger (revision 6); creates the table `agent_core_approver_logins` and the function `agent_core_bound_principal()`; and replaces the approvals guard function (revision 7, with a `-- agent-core login binding on|off` comment line).
+
+2. **A refused a6 schema.** An a7 queue or audit log refuses an a6 schema with a `ConfigError` before it writes anything. The audit insert trigger carries `-- agent-core audit trigger revision 6` and the guard `-- agent-core guard revision 7`; a connection that finds revision 5 of the trigger or revision 6 of the guard tells the operator to run `install_postgres_schema` from 0.1.0a7. So run the installer before the first a7 process connects, for everyone, bound or not. On SQLite nothing is required of you: the `db_login` column is added in place on first use.
+
+3. **`bind_resolved_by` keeps the installed setting by default.** `None` keeps whatever the schema has now, which is off in a fresh install, so a reinstall never switches binding off by accident. `True` turns binding on and `False` turns it off. Binding is off by default because a host whose approvers share one database login, or reach the database through a pooler login shared by many users, cannot use it: the guard judges the login.
+
+4. **Turn binding on only after every approver has a login and a mapping.** With binding on, a login that has no active mapping cannot decide any request, and a queue connected as such a login refuses to start. The order that avoids an outage:
+
+   1. Create or identify one database login for each approver, as a member of the approver role and not a member of the requester role. It must not be a superuser.
+   2. Map each login to the principal id the application will pass as `resolved_by`, as the owner role and not from the application (the example below).
+   3. Run `install_postgres_schema(...)` again and read `InstallReport.unmapped_logins`: the login roles that are members of the approver role and have no active mapping. With binding on, each of them cannot decide requests. `InstallReport.login_binding` says whether binding is on.
+   4. Run `install_postgres_schema(..., bind_resolved_by=True)`.
+
+   ```python
+   from aox_agent_core.storage import (
+       bind_approver_login,
+       install_postgres_schema,
+       unbind_approver_login,
+   )
+
+   OWNER_URL = "postgresql://agent_core_owner@db.example/agent_core"
+
+   bind_approver_login(OWNER_URL, login="approver_alice", principal="user-17", schema="public")
+
+   report = install_postgres_schema(
+       OWNER_URL,
+       requester_role="agent_core_requester",
+       approver_role="agent_core_approver",
+       schema="public",
+       bind_resolved_by=True,
+   )
+   assert report.login_binding
+   print(report.unmapped_logins)  # logins with no active mapping, if any
+
+   # Later, when approver_alice leaves:
+   unbind_approver_login(OWNER_URL, login="approver_alice", schema="public")
+   ```
+
+   `bind_approver_login` raises `ConfigError` unless the login is a login role, is not a superuser, is a member of the approver role and not of the requester role, and neither the login nor the principal has ever been mapped, active or removed.
+
+5. **What the guard then enforces.** On a decision to approved or rejected, `resolved_by` must equal the principal mapped to `session_user`, the login that authenticated. An unmapped login is refused too. The refusal text is "resolved_by must be the principal mapped to the deciding login". With binding off, nothing changes from 0.1.0a6. The identity judged is `session_user`, not `current_user`: `SET ROLE` changes `current_user` only, so a member who logs in as themselves and switches role, to another approver's login or to the approver group role, is still judged as themselves and can record only their own mapped principal. Only a superuser can change `session_user`, and the guard already refuses superusers.
+
+6. **The mapping table.** `agent_core_approver_logins(login, login_oid, principal, mapped_at, removed_at)` is always installed, bound or not.
+
+   - `login` is the primary key, `principal` is unique and `login_oid` is unique. The OID is the role's OID when it was mapped, so a role dropped and recreated under the same name inherits nothing, and a rename cannot move a mapping.
+   - Rows are never deleted: a trigger refuses DELETE and TRUNCATE. A mapping ends only when `removed_at` is set, once.
+   - Both uniques cover removed rows. In practice a login or a principal is never reused after removal: to bring a person back, create a new role under a new name and map it to a new principal id.
+   - Only the owner can touch the table. The installer revokes everything on it (table and column privileges) from the requester and approver roles, and a queue refuses to start if any other role holds a privilege on it, or if the table or the function was made by a role other than the approvals table's owner. The guard reads it through a SECURITY DEFINER function, `agent_core_bound_principal()`, with its `search_path` pinned and EXECUTE granted only to the approver role. The function returns only the connecting login's own principal.
+
+7. **What a queue checks when binding is on.** `SQLApprovalQueue` raises `ConfigError` (from `side()` or the first call) if the mapping table, the lookup function or the table's triggers are missing; if the requester role, the approver role or any role the connection can switch to can write the mapping table; or, on the approver side only, if the connecting login has no active mapping (the message names the login). `resolve` compares `principal.id` with the mapped principal before it writes and raises `NotAuthorizedToResolveError`, audited as `approval.resolve_denied` with the new `DenialReason.LOGIN_BINDING` (`"login_binding"`). That check is a courtesy for a clear error: the guard is the enforcement, and it also refuses plain SQL.
+
+8. **Limits of binding.**
+
+   - It binds `resolved_by` only. It does not bind the audit event's `actor_id`.
+   - A shared login cannot use it.
+   - The owner and superusers are trusted.
+   - Role OIDs can in theory be reused after OID wraparound.
+   - The requester role still has no route to approved. Binding adds a check and removes none.
+   - It was not tested against a real pooler.
+   - It is only as strong as each login's authentication. Under `trust` in `pg_hba.conf`, or with a password shared between approvers, any login can connect as another.
+   - If the approver role is itself a login (the example deployment connects the approver service as it), it needs its own mapping and is listed in `unmapped_logins` until it has one.
+   - Login names are written to every audit row (`db_login`) and to the mapping table, and neither can be erased: both are append-only. Use pseudonymous login names (`approver_17`), not personal names, if your data-retention rules require that.
+
+9. **Reading `db_login`.** Each audit row now has `db_login`, set by the insert trigger to `session_user` whatever the writer supplied, outside the hash, next to `db_role` (still `current_user`). `SET ROLE` changes `db_role` but never `db_login`, so a row written after a role switch names the real login. Records written before 0.1.0a7 have `db_login` NULL.
+
+## Project 03: its own backends (0.1.0a7)
+
+Almost nothing changes. The `ApprovalQueue` and `AuditLog` protocols are the same.
+
+1. **`AuditRecord.db_login` is a new optional field,** `str | None`, default `None`. A host with its own `AuditLog` that builds `AuditRecord` or inserts rows itself needs no change; set it only if your store can tell you the login. `AUDIT_SCHEMA_VERSION` is now 4. Records at version 2 and 3 still verify.
+2. **`wait_for_decision` is a free function,** not a protocol method. A host-supplied queue needs no new method (see the project 04 section).
+3. **`DenialReason.LOGIN_BINDING` exists** (`"login_binding"`). A host that maps denial reasons to its own errors should map it like the other reasons, to `NotAuthorizedToResolveError`. Only agent-core's own queue produces it.
+4. If it uses agent-core's installer, re-run it as the owner from 0.1.0a7 (see Operators).
+
+## Project 04: the SQL backends (0.1.0a7)
+
+1. **Audit schema 4 and `db_login`.** On Postgres `AuditRecord.db_login` is the login that authenticated the connection (`session_user`) and `db_role` is the role the statement ran as (`current_user`). They differ after a `SET ROLE`. On SQLite `db_login` is `None`, as it is for records written before 0.1.0a7. In a review query, select `db_login` beside `db_role` on the rows you care about, such as `approval.resolved`: `db_login` names who wrote a row, and `db_role` shows which role they acted as. Check the audit table's name and schema in your own installation.
+
+2. **Binding.** If you turn it on (see Operators), `resolve` for an approver whose login is not mapped to `principal.id` raises `NotAuthorizedToResolveError` with `DenialReason.LOGIN_BINDING`, and the denial is audited as `approval.resolve_denied`. Each approver must connect as their own login; an application that connects every approver through one login cannot use binding. The limits are listed in Operators.
+
+3. **`verify_report`.** `SQLAuditLog.verify_report(*, expected_head=None, max_problems=1000) -> VerifyReport` walks the whole chain and does not raise at the first bad record. `VerifyReport` and `VerifyProblem` are importable from `aox_agent_core.audit`.
+
+   ```python
+   report = await audit_log.verify_report(expected_head=saved_head)
+   if not report.ok:
+       for problem in report.problems:
+           print(problem.seq, problem.kind, problem.detail)
+   print(report.records_checked, report.truncated)
+   ```
+
+   - `VerifyReport` has `head`, `records_checked`, `problems` (a tuple) and `truncated`, and a property `ok`. `VerifyProblem` has `seq` (an int or `None`), `kind` (`"malformed"`, `"seq"`, `"link"`, `"hash"` or `"anchor"`) and `detail`.
+   - It keeps walking from a bad record's stored hash, so one altered record is reported once, at its own `seq`. A missing record is one `seq` problem and a cut link is a `link` problem. With `expected_head`, a rewritten chain or a cut tail shows as `anchor`.
+   - It stops at `max_problems` and sets `truncated`. It is read-only.
+   - `verify()` is unchanged and still raises at the first problem.
+   - It is a method of `SQLAuditLog`, not of the `AuditLog` protocol or of `SyncAuditLog`, so a host-supplied log needs nothing.
+   - An empty problem list is no proof against someone who can rebuild every hash. Keep the head somewhere the application cannot write, as before. `aox-agent-core audit verify` stays as the cross-check.
+
+4. **`wait_for_decision`.** `from aox_agent_core.approvals import wait_for_decision`.
+
+   ```python
+   from datetime import timedelta
+
+   from aox_agent_core.approvals import ApprovalWaitTimeoutError, wait_for_decision
+
+   try:
+       request = await wait_for_decision(queue, request_id, timeout=timedelta(hours=72))
+   except ApprovalWaitTimeoutError as timed_out:
+       last = timed_out.last  # the last request read
+   ```
+
+   - Signature: `wait_for_decision(queue, request_id, *, timeout, poll_interval=timedelta(seconds=1), max_poll_interval=timedelta(seconds=30)) -> ApprovalRequest`. It works over any `ApprovalQueue`, because it only calls `get`.
+   - It reads once at once, then polls. The pause starts at `poll_interval` and roughly doubles after each read, with jitter between x0.75 and x1.25, capped at `max_poll_interval` and never longer than the time left. A 72 hour wait does not poll every second.
+   - It returns as soon as the status is not `PENDING`: approved, rejected, cancelled, expired (a lapsed request reads as expired) or consumed. The caller decides what each means, and an approved request still has to be consumed.
+   - It raises `ApprovalWaitTimeoutError` (an `ApprovalError`, with `.request_id` and `.last`) on timeout; `ValueError` for a non-positive `timeout` or `poll_interval`, or a `max_poll_interval` below `poll_interval`; and whatever `get` raises (`ApprovalNotFoundError`, `ApprovalIntegrityError`).
+   - It takes no `connection=` and holds no connection or transaction between reads: each read is its own short transaction. That suits a transaction-mode pooler; this was not tested against one. Cancelling the task cancels only the wait.
+   - `SyncApprovalQueue.wait_for_decision(request_id, *, timeout, poll_interval, max_poll_interval)` blocks the caller with the same arguments.
+
+## What is not verified (0.1.0a7)
+
+- **Postgres versions.** As in earlier releases, CI runs Postgres 16 and 17 only. Postgres 18 was not run.
+- **A real pooler.** Neither login binding nor `wait_for_decision` was run against pgbouncer or any other pooler.
+- **Binding with shared logins.** Binding was not exercised with a host whose approvers share one database login.
+- **A reinstall under load.** The a6 to a7 installer run was not tried on a large or busy database, or with writers active. Plan a window with no writers.
+- **a6 code against an a7 schema.** Not tested.
+
+---
+
 # Upgrading from 0.1.0a4 to 0.1.0a6
 
 0.1.0a5 was tagged but never released: there is no GitHub release and no wheel for it. 0.1.0a6 is the fix release and contains everything 0.1.0a5 had. Go from 0.1.0a4 straight to 0.1.0a6, in one step. This page describes that step. Nothing here asks you to install 0.1.0a5.
@@ -398,7 +552,7 @@ Other changes for the operator:
 Still not verified for 0.1.0a6:
 
 - **A sweep with a small `limit`.** `expire_due` and `purge_payloads` skip requests another transaction holds. If the oldest `limit` due requests are all held, a batch changes nothing and the run stops; the requests behind them wait for the next run.
-- **A real pooler.** The design fits a transaction-mode pooler. It has not been run against pgbouncer or any other pooler, and a pgbouncer CI job is planned for 0.1.0a7.
+- **A real pooler.** The design fits a transaction-mode pooler. It has not been run against pgbouncer or any other pooler, and a pgbouncer CI job is planned for after 0.1.0 (it was moved out of 0.1.0a7).
 - **Postgres 18 and later.** CI runs 16 on Python 3.11 to 3.14 and 17 on Python 3.12 in a separate job.
 - **0.1.0a6 on a large or busy database.** The upgrade was tested on small databases only, not on production-sized ones or with writers active.
 - **An a4 database upgraded in place under load.** Plan a window with no writers.

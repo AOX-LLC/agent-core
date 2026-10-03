@@ -173,6 +173,27 @@ def _conflict_error(
     return ApprovalConflictError(message, existing=existing, differs=differs)
 
 
+class ApprovalWaitTimeoutError(ApprovalError):
+    """wait_for_decision's timeout passed with the request still pending.
+
+    `request_id` is the request and `last` its last state read (still pending): the
+    request itself is unchanged, so the caller may wait again, cancel it or give up.
+    """
+
+    def __init__(self, message: str, *, request_id: UUID, last: Any) -> None:
+        super().__init__(message)
+        self.request_id = request_id
+        self.last = last
+
+    def __reduce__(self) -> tuple[Any, ...]:
+        return (_wait_timeout_error, (self.args[0], self.request_id, self.last), self.__dict__)
+
+
+def _wait_timeout_error(message: str, request_id: UUID, last: Any) -> ApprovalWaitTimeoutError:
+    """Rebuild an ApprovalWaitTimeoutError, for pickling and copying."""
+    return ApprovalWaitTimeoutError(message, request_id=request_id, last=last)
+
+
 class ApprovalPayloadRejectedError(ApprovalError):
     """A payload offered for storage with a request is too large, has a forbidden
     key, a float, or text that looks like a secret."""

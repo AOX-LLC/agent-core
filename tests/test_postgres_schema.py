@@ -390,13 +390,16 @@ def test_the_database_records_who_wrote_each_audit_row(pg: ControlDatabase) -> N
     assert pg.requester_raw is not None
     pg.requester_raw(
         "INSERT INTO agent_core_audit (seq, schema_version, event_id, occurred_at, action, "
-        "actor_id, payload, prev_hash, record_hash, db_role) VALUES (1, 3, "
+        "actor_id, payload, prev_hash, record_hash, db_role, db_login) VALUES (1, 4, "
         f"'{uuid4()}', '{stamp(NOW)}', 'approval.resolved', 'user-17', '{{}}', '{'0' * 64}', "
-        f"'{'0' * 64}', '{APPROVER_ROLE}')"
+        f"'{'0' * 64}', '{APPROVER_ROLE}', '{APPROVER_ROLE}')"
     )
 
-    assert pg.raw("SELECT actor_id, db_role FROM agent_core_audit") == [("user-17", REQUESTER_ROLE)]
+    assert pg.raw("SELECT actor_id, db_role, db_login FROM agent_core_audit") == [
+        ("user-17", REQUESTER_ROLE, REQUESTER_ROLE)
+    ]
     assert refused(pg.superuser_raw, f"UPDATE agent_core_audit SET db_role = '{APPROVER_ROLE}'")
+    assert refused(pg.superuser_raw, f"UPDATE agent_core_audit SET db_login = '{APPROVER_ROLE}'")
 
 
 # The installer
@@ -585,7 +588,7 @@ async def test_an_a2_schema_is_upgraded_in_place() -> None:
         records = [record async for record in log.iter_records()]
         assert [(record.schema_version, record.db_role) for record in records] == [
             (2, None),
-            (3, REQUESTER_ROLE),
+            (4, REQUESTER_ROLE),
         ]
         assert (await log.verify()).seq == 2
         assert status_of(database, legacy_id) == "approved"
@@ -637,7 +640,7 @@ async def test_an_a2_schema_is_upgraded_in_place() -> None:
         database.requester_raw(
             "INSERT INTO agent_core_audit (seq, schema_version, event_id, occurred_at, action, "
             "actor_id, subject_id, payload, prev_hash, record_hash) VALUES "
-            f"({next_seq}, 3, '{uuid4()}', '{stamp(NOW)}', 'approval.resolved', 'user-17', "
+            f"({next_seq}, 4, '{uuid4()}', '{stamp(NOW)}', 'approval.resolved', 'user-17', "
             f'\'{legacy_id}\', \'{{"approval_action":"crm.update_contact","decision":'
             f"\"approve\"}}', '{head_hash}', '{'0' * 64}')"
         )
@@ -808,7 +811,7 @@ def test_closing_is_refused_when_the_audit_log_lives_elsewhere(
         pg.requester_raw(
             "INSERT INTO agent_core_audit (seq, schema_version, event_id, occurred_at, action, "
             "actor_id, subject_id, payload, prev_hash, record_hash) VALUES "
-            f"(1, 3, '{uuid4()}', '{stamp(NOW)}', 'approval.resolved', 'user-17', "
+            f"(1, 4, '{uuid4()}', '{stamp(NOW)}', 'approval.resolved', 'user-17', "
             f"'{uuid4()}', '{{}}', '{'0' * 64}', '{'0' * 64}')"
         )
 
@@ -917,7 +920,7 @@ def test_the_installer_lists_finished_requests_whose_finish_time_a_client_backda
     assert again.backdated_finishes == report.backdated_finishes
 
 
-async def test_an_approvals_guard_of_revision_5_is_refused_until_the_installer_is_run_again(
+async def test_an_approvals_guard_of_revision_6_is_refused_until_the_installer_is_run_again(
     control_database: ControlDatabase,
 ) -> None:
     if control_database.superuser_url is None:
@@ -926,13 +929,13 @@ async def test_an_approvals_guard_of_revision_5_is_refused_until_the_installer_i
     definition = control_database.superuser_raw(
         f"SELECT pg_get_functiondef('{schema}.agent_core_approvals_guard()'::regprocedure)"
     )[0][0]
-    assert "-- agent-core guard revision 6" in definition
+    assert "-- agent-core guard revision 7" in definition
     control_database.superuser_raw(
-        definition.replace("-- agent-core guard revision 6", "-- agent-core guard revision 5")
+        definition.replace("-- agent-core guard revision 7", "-- agent-core guard revision 6")
     )
 
     queue = split_queue(control_database)
-    with pytest.raises(ConfigError, match=r"revision 5; this release needs 6"):
+    with pytest.raises(ConfigError, match=r"revision 6; this release needs 7"):
         await queue.submit(
             action="crm.update_contact",
             summary="s",
@@ -941,7 +944,7 @@ async def test_an_approvals_guard_of_revision_5_is_refused_until_the_installer_i
             required_role="ops.approver",
             ttl_seconds=60,
         )
-    with pytest.raises(ConfigError, match=r"revision 5; this release needs 6"):
+    with pytest.raises(ConfigError, match=r"revision 6; this release needs 7"):
         await queue.approver.purge_payloads(
             principal=Principal(id="svc-retention", kind=PrincipalKind.SERVICE),
             older_than=timedelta(days=2),

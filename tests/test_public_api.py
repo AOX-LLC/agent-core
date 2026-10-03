@@ -83,6 +83,7 @@ EXPECTED_EXPORTS = {
         "RoleApproverPolicy",
         "SQLApprovalQueue",
         "approval_payload_hash",
+        "wait_for_decision",
     ],
     "aox_agent_core.audit": [
         "AUDIT_SCHEMA_VERSION",
@@ -97,6 +98,8 @@ EXPECTED_EXPORTS = {
         "AuditRecord",
         "SQLAuditLog",
         "UnsealedAuditRecord",
+        "VerifyProblem",
+        "VerifyReport",
         "compute_record_hash",
     ],
     "aox_agent_core.evals": [
@@ -127,9 +130,11 @@ EXPECTED_EXPORTS = {
         "PostgresDatabase",
         "SQLiteDatabase",
         "Session",
+        "bind_approver_login",
         "driver_errors",
         "install_postgres_schema",
         "open_database",
+        "unbind_approver_login",
     ],
 }
 
