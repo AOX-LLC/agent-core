@@ -41,6 +41,7 @@ EXPECTED_PARENTS: dict[type[Exception], type[Exception]] = {
     errors.ApprovalPayloadMismatchError: ApprovalError,
     errors.ApprovalIntegrityError: ApprovalError,
     errors.ApprovalConflictError: ApprovalError,
+    errors.ApprovalWaitTimeoutError: ApprovalError,
     errors.ApprovalPayloadRejectedError: ApprovalError,
     errors.AuditError: AgentCoreError,
     errors.AuditIntegrityError: AuditError,

@@ -153,7 +153,7 @@ async def test_the_upgraded_audit_trigger_refuses_a_record_that_does_not_follow_
             return (
                 "INSERT INTO agent_core_audit (seq, schema_version, event_id, occurred_at, action, "
                 "actor_id, payload, prev_hash, record_hash) VALUES "
-                f"({seq}, 3, '{uuid4()}', '{datetime.now(UTC).strftime('%Y-%m-%dT%H:%M:%S.%fZ')}', "
+                f"({seq}, 4, '{uuid4()}', '{datetime.now(UTC).strftime('%Y-%m-%dT%H:%M:%S.%fZ')}', "
                 f"'model.call', 'svc-triage', '{{}}', '{prev_hash}', '{'b' * 64}')"
             )
 
@@ -170,7 +170,7 @@ async def test_an_a3_approvals_table_is_refused_by_the_queue_until_the_installer
         load_a3_schema(database)
         queue = split_queue(database)
 
-        with pytest.raises(ConfigError, match=r"install_postgres_schema from 0\.1\.0a6"):
+        with pytest.raises(ConfigError, match=r"install_postgres_schema from 0\.1\.0a7"):
             await queue.submit(
                 action="crm.update_contact",
                 summary="s",
