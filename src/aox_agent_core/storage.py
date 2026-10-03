@@ -1104,7 +1104,8 @@ async def _record_roles(
 _UNMAPPED_LOGINS = """
 SELECT r.rolname FROM pg_roles r
 WHERE r.rolcanlogin AND NOT r.rolsuper AND pg_has_role(r.oid, ?, 'MEMBER') AND r.rolname <> ?
-  AND NOT EXISTS (SELECT 1 FROM {table} m WHERE m.login = r.rolname AND m.removed_at IS NULL)
+  AND NOT EXISTS (SELECT 1 FROM {table} m
+                  WHERE m.login_oid = r.oid AND m.login = r.rolname AND m.removed_at IS NULL)
 ORDER BY r.rolname
 """
 
@@ -1140,12 +1141,12 @@ def bind_approver_login(
         requester_role, approver_role = await _installed_roles(session, schema)
         rows = await session.execute(
             "SELECT r.rolcanlogin, r.rolsuper, pg_has_role(r.oid, ?, 'MEMBER'), "
-            "pg_has_role(r.oid, ?, 'MEMBER') FROM pg_roles r WHERE r.rolname = ?",
+            "pg_has_role(r.oid, ?, 'MEMBER'), r.oid FROM pg_roles r WHERE r.rolname = ?",
             (approver_role, requester_role, login),
         )
         if not rows:
             raise ConfigError(f"There is no role {login!r}.")
-        can_login, is_super, is_approver, is_requester = rows[0]
+        can_login, is_super, is_approver, is_requester, login_oid = rows[0]
         if not can_login or is_super or not is_approver or is_requester:
             raise ConfigError(
                 f"{login!r} must be a login role, not a superuser, a member of the approver "
@@ -1165,7 +1166,8 @@ def bind_approver_login(
                 "after a mapping is removed; use a new principal id for a new login."
             )
         await session.execute(
-            f"INSERT INTO {table} (login, principal) VALUES (?, ?)", (login, principal)
+            f"INSERT INTO {table} (login, login_oid, principal) VALUES (?, ?, ?)",
+            (login, login_oid, principal),
         )
 
     _run_as_owner(owner_url, bind)

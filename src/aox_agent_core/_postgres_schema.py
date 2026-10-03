@@ -339,6 +339,9 @@ def logins_ddl(schema: str, approver_role: str) -> tuple[str, ...]:
     return (
         f"""CREATE TABLE IF NOT EXISTS {table} (
             login TEXT PRIMARY KEY CHECK (login <> ''),
+            -- The role's OID at the time it was mapped: a role dropped and created again
+            -- under the same name has a new OID and inherits nothing.
+            login_oid OID NOT NULL UNIQUE,
             principal TEXT NOT NULL UNIQUE
                 CHECK (principal ~ '^[A-Za-z0-9][A-Za-z0-9._:-]{{0,127}}$'),
             mapped_at TIMESTAMPTZ NOT NULL DEFAULT now(),
@@ -356,8 +359,9 @@ def logins_ddl(schema: str, approver_role: str) -> tuple[str, ...]:
                 RETURN NEW;
             END IF;
             IF OLD.removed_at IS NOT NULL OR NEW.removed_at IS NULL
-               OR ROW(NEW.login, NEW.principal, NEW.mapped_at)
-                  IS DISTINCT FROM ROW(OLD.login, OLD.principal, OLD.mapped_at) THEN
+               OR ROW(NEW.login, NEW.login_oid, NEW.principal, NEW.mapped_at)
+                  IS DISTINCT FROM
+                  ROW(OLD.login, OLD.login_oid, OLD.principal, OLD.mapped_at) THEN
                 RAISE EXCEPTION 'a login mapping changes only by being removed, once';
             END IF;
             NEW.removed_at := now();
@@ -371,7 +375,8 @@ def logins_ddl(schema: str, approver_role: str) -> tuple[str, ...]:
         f"REVOKE ALL ON {table} FROM PUBLIC",
         f"""CREATE OR REPLACE FUNCTION {function}() RETURNS text
         LANGUAGE sql STABLE SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $$
-            SELECT principal FROM {table} WHERE login = session_user::text AND removed_at IS NULL
+            SELECT m.principal FROM {table} m JOIN pg_roles r ON r.oid = m.login_oid
+            WHERE r.rolname = session_user::text AND m.login = r.rolname AND m.removed_at IS NULL
         $$""",
         f"REVOKE ALL ON FUNCTION {function}() FROM PUBLIC",
         f"GRANT EXECUTE ON FUNCTION {function}() TO {approver}",

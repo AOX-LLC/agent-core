@@ -1193,3 +1193,52 @@ async def test_a_bound_queue_resolves_as_its_login_and_refuses_another_principal
     assert [r.payload["reason"] for r in denied] == ["login_binding"]
     assert {r.db_login for r in records if r.action.startswith("approval.resolve")} == {login}
     assert (await log.verify()).seq == len(records)
+
+
+def test_a_role_dropped_and_created_again_under_the_same_name_inherits_no_mapping(
+    control_database: ControlDatabase,
+) -> None:
+    """The mapping is bound to the role's OID, not only its name."""
+    if control_database.superuser_url is None:
+        pytest.skip("logins and the guard exist only on Postgres")
+    login, _ = approver_login(control_database)
+    bind_logins(control_database, (login, "user-17"))
+    control_database.superuser_raw(f"DROP ROLE {login}")
+    control_database.superuser_raw(f"CREATE ROLE {login} LOGIN INHERIT")
+    control_database.superuser_raw(f"GRANT {APPROVER_ROLE} TO {login}")
+    assert control_database.superuser_url is not None
+    url = control_database.superuser_url.replace("postgres@", f"{login}@", 1)
+    row = pending_row(control_database)
+
+    with pytest.raises(psycopg.Error, match=MISMATCH):
+        runner_as(url, decide_sql(row, "user-17"))
+    assert status_of(control_database, row) == "pending"
+    # and the name cannot be mapped again either: a login is never reused.
+    with pytest.raises(ConfigError, match="never mapped twice"):
+        bind_approver_login(
+            control_database.owner_url or "",
+            login=login,
+            principal="user-31",
+            schema=control_database.schema,
+        )
+
+
+def test_renaming_roles_cannot_move_a_mapping_to_another_login(
+    control_database: ControlDatabase,
+) -> None:
+    if control_database.superuser_url is None:
+        pytest.skip("logins and the guard exist only on Postgres")
+    mapped, mapped_url = approver_login(control_database)
+    other, other_url = approver_login(control_database)
+    bind_logins(control_database, (mapped, "user-17"))
+    # Move the name: the old role goes away under a new name, another role takes its name.
+    control_database.superuser_raw(f"ALTER ROLE {mapped} RENAME TO {mapped}_old")
+    control_database.superuser_raw(f"ALTER ROLE {other} RENAME TO {mapped}")
+    control_database.roles.extend([f"{mapped}_old", mapped])
+    row = pending_row(control_database)
+
+    with pytest.raises(psycopg.Error, match=MISMATCH):
+        runner_as(other_url.replace(f"{other}@", f"{mapped}@", 1), decide_sql(row, "user-17"))
+    with pytest.raises(psycopg.Error, match=MISMATCH):
+        runner_as(mapped_url.replace(f"{mapped}@", f"{mapped}_old@", 1), decide_sql(row, "user-17"))
+    assert status_of(control_database, row) == "pending"
