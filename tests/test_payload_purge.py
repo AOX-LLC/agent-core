@@ -1,6 +1,7 @@
 """purge_payloads: finished requests lose their stored payload, never their hash."""
 
 import asyncio
+import contextlib
 from datetime import UTC, datetime, timedelta
 from typing import Any
 from uuid import UUID
@@ -478,12 +479,13 @@ async def test_sqlite_drops_the_a5_purge_index_and_builds_the_new_one_on_first_u
         ttl_seconds=60,
     )
     await database.aclose()
-    with sqlite3.connect(path) as raw:
+    with contextlib.closing(sqlite3.connect(path)) as raw:
         raw.execute(
             f"CREATE INDEX {layout.LEGACY_PURGEABLE_INDEX} ON agent_core_approvals "
             f"(({layout.FINISHED_AT_EXPRESSION}), id) WHERE {layout.PURGEABLE_PREDICATE}"
         )
         raw.execute(f"DROP INDEX {layout.PURGEABLE_INDEX}")
+        raw.commit()
     reopened = open_database(f"sqlite:///{path}")
 
     await SQLApprovalQueue(reopened, audit_log=SQLAuditLog(reopened)).submit(
@@ -496,7 +498,7 @@ async def test_sqlite_drops_the_a5_purge_index_and_builds_the_new_one_on_first_u
     )
     await reopened.aclose()
 
-    with sqlite3.connect(path) as raw:
+    with contextlib.closing(sqlite3.connect(path)) as raw:
         names = {
             row[0]
             for row in raw.execute(
