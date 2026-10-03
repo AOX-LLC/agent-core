@@ -187,8 +187,10 @@ def split_queue(
 ) -> SplitQueue:
     """Both sides of the approval queue on `database`, built with the same options."""
 
+    schema = database.schema if database.backend == "postgres" else None
+
     def side(connection: Database) -> SQLApprovalQueue:
-        log = SQLAuditLog(connection, scrubber=scrubber)
-        return SQLApprovalQueue(connection, audit_log=log, **options)
+        log = SQLAuditLog(connection, scrubber=scrubber, schema=schema)
+        return SQLApprovalQueue(connection, audit_log=log, schema=schema, **options)
 
     return SplitQueue(side(database.database), side(database.approver_database))

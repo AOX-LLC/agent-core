@@ -16,6 +16,7 @@ import sqlite3
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
+from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
 from typing import Any, TypeVar
@@ -205,6 +206,34 @@ def open_database(url: str | SecretStr) -> Database:
     raise ConfigError(f"Unsupported database URL scheme {scheme!r}; use sqlite or postgresql.")
 
 
+@dataclass(frozen=True)
+class TableName:
+    """One of the library's tables: bare on SQLite, schema-qualified on Postgres."""
+
+    name: str
+    schema: str | None = None
+
+    @classmethod
+    def on(cls, database: "Database", name: str, schema: str | None) -> "TableName":
+        """The table `name` in `schema` (public by default) on Postgres; on SQLite,
+        where there are no schemas, ConfigError if a schema is given."""
+        if database.dialect is Dialect.SQLITE:
+            if schema is not None:
+                raise ConfigError("SQLite has no schemas; leave schema unset.")
+            return cls(name)
+        chosen = schema if schema is not None else layout.DEFAULT_SCHEMA
+        layout.identifier(chosen, what="schema")
+        return cls(name, chosen)
+
+    @property
+    def sql(self) -> str:
+        """The name as it goes into SQL, and into to_regclass()."""
+        return f'"{self.schema}".{self.name}' if self.schema is not None else self.name
+
+    def __str__(self) -> str:
+        return f"{self.schema}.{self.name}" if self.schema is not None else self.name
+
+
 def table_columns(session: Session, table: str, *, schema: str | None = None) -> set[str]:
     """The column names of a table, in `schema` on Postgres; empty if there is no table."""
     if not TABLE_NAME.fullmatch(table) or (schema is not None and not TABLE_NAME.fullmatch(schema)):
@@ -224,13 +253,18 @@ def table_columns(session: Session, table: str, *, schema: str | None = None) ->
 
 
 def require_current_table(
-    session: Session, table: str, column: str, *, columns: set[str] | None = None
+    session: Session,
+    table: str,
+    column: str,
+    *,
+    columns: set[str] | None = None,
+    schema: str | None = None,
 ) -> None:
     """Raise ConfigError if `table` exists but predates `column`, added in 0.1.0a2.
 
     A table made by 0.1.0a1 is refused rather than migrated in place.
     """
-    columns = columns if columns is not None else table_columns(session, table)
+    columns = columns if columns is not None else table_columns(session, table, schema=schema)
     if columns and column not in columns:
         raise ConfigError(
             f"Table {table} was created by agent-core 0.1.0a1 and has no {column} column; "

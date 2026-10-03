@@ -49,6 +49,7 @@ from aox_agent_core.storage import (
     Database,
     Dialect,
     Session,
+    TableName,
     bring_table_up_to_date,
     require_current_table,
 )
@@ -140,12 +141,14 @@ class SQLApprovalQueue:
         audit_log: AuditLog,
         policy: ApproverPolicy | None = None,
         clock: Callable[[], datetime] | None = None,
+        schema: str | None = None,
     ) -> None:
         self.database = database
+        self._table = TableName.on(database, APPROVALS_TABLE, schema)
         self._audit_log = audit_log
         self._policy = policy if policy is not None else RoleApproverPolicy()
         self._clock = clock if clock is not None else _utc_now
-        self._schema = layout.DEFAULT_SCHEMA
+        self._schema = self._table.schema or layout.DEFAULT_SCHEMA
         self._side: ApprovalSide | None = None
 
     async def side(self) -> ApprovalSide:
@@ -218,9 +221,11 @@ class SQLApprovalQueue:
         def insert(session: Session) -> _Outcome:
             self._require_side(session, "submit requests", ApprovalSide.REQUESTER)
             _ensure_table(session)
-            require_current_table(session, APPROVALS_TABLE, RUN_CONTEXT_COLUMN)
+            require_current_table(
+                session, APPROVALS_TABLE, RUN_CONTEXT_COLUMN, schema=self._table.schema
+            )
             session.execute(
-                f"INSERT INTO {APPROVALS_TABLE} ({_COLUMNS}) "
+                f"INSERT INTO {self._table.sql} ({_COLUMNS}) "
                 "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 _row_values(request),
             )
@@ -245,7 +250,7 @@ class SQLApprovalQueue:
 
         def read(session: Session) -> ApprovalRequest | None:
             self._prepare(session)
-            return _load(session, request_id)
+            return _load(session, self._table, request_id)
 
         request = await self.database.run(read)
         if request is None:
@@ -295,7 +300,12 @@ class SQLApprovalQueue:
             self._prepare(session)
             while len(eligible) < limit:
                 page = _load_pending_page(
-                    session, now=now, after=resume_after, narrowed_to=narrowed_to, limit=page_size
+                    session,
+                    self._table,
+                    now=now,
+                    after=resume_after,
+                    narrowed_to=narrowed_to,
+                    limit=page_size,
                 )
                 eligible.extend(
                     request
@@ -336,7 +346,7 @@ class SQLApprovalQueue:
 
         def decide(session: Session) -> _Outcome:
             self._require_side(session, "decide requests", ApprovalSide.APPROVER)
-            request = _load(session, request_id)
+            request = _load(session, self._table, request_id)
             if request is None:
                 return _denied(
                     ApprovalNotFoundError(f"No approval request {request_id}."),
@@ -379,7 +389,7 @@ class SQLApprovalQueue:
                 }
             )
             changed = session.execute_count(
-                f"UPDATE {APPROVALS_TABLE} SET status = ?, decision = ?, resolved_by = ?, "
+                f"UPDATE {self._table.sql} SET status = ?, decision = ?, resolved_by = ?, "
                 "resolved_at = ?, reason = ? WHERE id = ? AND status = ?",
                 (
                     status.value,
@@ -434,7 +444,7 @@ class SQLApprovalQueue:
 
         def use(session: Session) -> _Outcome:
             self._require_side(session, "consume approvals", ApprovalSide.REQUESTER)
-            request = _load(session, request_id)
+            request = _load(session, self._table, request_id)
             if request is None:
                 return _denied(
                     ApprovalNotFoundError(f"No approval request {request_id}."),
@@ -460,7 +470,7 @@ class SQLApprovalQueue:
                 {**request.model_dump(), "status": ApprovalStatus.CONSUMED, "consumed_at": now}
             )
             changed = session.execute_count(
-                f"UPDATE {APPROVALS_TABLE} SET status = ?, consumed_at = ? "
+                f"UPDATE {self._table.sql} SET status = ?, consumed_at = ? "
                 "WHERE id = ? AND status = ?",
                 (
                     ApprovalStatus.CONSUMED.value,
@@ -507,7 +517,7 @@ class SQLApprovalQueue:
 
         def withdraw(session: Session) -> _Outcome:
             self._require_side(session, "cancel requests", ApprovalSide.REQUESTER)
-            request = _load(session, request_id)
+            request = _load(session, self._table, request_id)
             if request is None:
                 return _denied(
                     ApprovalNotFoundError(f"No approval request {request_id}."),
@@ -531,7 +541,7 @@ class SQLApprovalQueue:
             cancelled = request.model_copy(
                 update={"status": ApprovalStatus.CANCELLED, "closed_at": now}
             )
-            if not _close(session, request, ApprovalStatus.CANCELLED, now):
+            if not _close(session, self._table, request, ApprovalStatus.CANCELLED, now):
                 return _denied(
                     ApprovalAlreadyResolvedError(f"Request {request_id} was resolved meanwhile."),
                     _event(
@@ -566,12 +576,12 @@ class SQLApprovalQueue:
 
         def sweep(session: Session) -> _Outcome:
             self._prepare(session)
-            if not _table_exists(session):
+            if not _table_exists(session, self._table):
                 return _Outcome()
-            due = _load_due(session, moment, limit)
+            due = _load_due(session, self._table, moment, limit)
             events = []
             for request in due:
-                if _close(session, request, ApprovalStatus.EXPIRED, moment):
+                if _close(session, self._table, request, ApprovalStatus.EXPIRED, moment):
                     expired = request.model_copy(
                         update={"status": ApprovalStatus.EXPIRED, "closed_at": moment}
                     )
@@ -692,11 +702,15 @@ def _cancel_refusal(
 
 
 def _close(
-    session: Session, request: ApprovalRequest, status: ApprovalStatus, now: datetime
+    session: Session,
+    table: TableName,
+    request: ApprovalRequest,
+    status: ApprovalStatus,
+    now: datetime,
 ) -> bool:
     """Move a pending request to `status` (expired or cancelled); False if it moved meanwhile."""
     changed = session.execute_count(
-        f"UPDATE {APPROVALS_TABLE} SET status = ?, closed_at = ? WHERE id = ? AND status = ?",
+        f"UPDATE {table.sql} SET status = ?, closed_at = ? WHERE id = ? AND status = ?",
         (status.value, canonical_timestamp(now), str(request.id), ApprovalStatus.PENDING.value),
     )
     return changed == 1
@@ -709,13 +723,15 @@ _POSTGRES_NOW_TEXT = (
 )
 
 
-def _load_due(session: Session, now: datetime, limit: int) -> list[ApprovalRequest]:
+def _load_due(
+    session: Session, table: TableName, now: datetime, limit: int
+) -> list[ApprovalRequest]:
     """Up to `limit` pending requests whose lifetime ended by `now`, oldest expiry first."""
     database_clock = (
         f" AND expires_at <= {_POSTGRES_NOW_TEXT}" if session.dialect is Dialect.POSTGRES else ""
     )
     rows = session.execute(
-        f"SELECT {_COLUMNS} FROM {APPROVALS_TABLE} WHERE status = ? AND expires_at <= ?"
+        f"SELECT {_COLUMNS} FROM {table.sql} WHERE status = ? AND expires_at <= ?"
         f"{database_clock} ORDER BY expires_at, id LIMIT ?",
         (ApprovalStatus.PENDING.value, canonical_timestamp(now), limit),
     )
@@ -761,7 +777,7 @@ def _ensure_table(session: Session) -> None:
         session.execute(_PENDING_INDEX_DDL.replace("CREATE INDEX", "CREATE INDEX IF NOT EXISTS", 1))
 
 
-def _table_exists(session: Session) -> bool:
+def _table_exists(session: Session, table: TableName) -> bool:
     """Whether the table exists; ConfigError if it is a 0.1.0a1 table without run_context."""
     # Reads before the first submit see "no table", which means "no requests".
     if session.dialect is Dialect.SQLITE:
@@ -772,25 +788,22 @@ def _table_exists(session: Session) -> bool:
             )
         )
     else:
-        exists = bool(
-            session.execute("SELECT to_regclass(?) IS NOT NULL", (APPROVALS_TABLE,))[0][0]
-        )
+        exists = bool(session.execute("SELECT to_regclass(?) IS NOT NULL", (table.sql,))[0][0])
     if exists:
-        require_current_table(session, APPROVALS_TABLE, RUN_CONTEXT_COLUMN)
+        require_current_table(session, APPROVALS_TABLE, RUN_CONTEXT_COLUMN, schema=table.schema)
     return exists
 
 
-def _load(session: Session, request_id: UUID) -> ApprovalRequest | None:
-    if not _table_exists(session):
+def _load(session: Session, table: TableName, request_id: UUID) -> ApprovalRequest | None:
+    if not _table_exists(session, table):
         return None
-    rows = session.execute(
-        f"SELECT {_COLUMNS} FROM {APPROVALS_TABLE} WHERE id = ?", (str(request_id),)
-    )
+    rows = session.execute(f"SELECT {_COLUMNS} FROM {table.sql} WHERE id = ?", (str(request_id),))
     return _request_from_row(rows[0]) if rows else None
 
 
 def _load_pending_page(
     session: Session,
+    table: TableName,
     *,
     now: datetime,
     after: ApprovalRequest | None,
@@ -802,7 +815,7 @@ def _load_pending_page(
     With `narrowed_to`, only requests that principal could resolve under the
     default policy: a role it holds, and not its own.
     """
-    if not _table_exists(session):
+    if not _table_exists(session, table):
         return []
     # Canonical timestamps are fixed-width UTC strings, so they compare as text.
     conditions = ["status = ?", "expires_at > ?"]
@@ -818,7 +831,7 @@ def _load_pending_page(
         conditions.append("requested_by <> ?")
         parameters += [*roles, narrowed_to.id]
     rows = session.execute(
-        f"SELECT {_COLUMNS} FROM {APPROVALS_TABLE} WHERE {' AND '.join(conditions)} "
+        f"SELECT {_COLUMNS} FROM {table.sql} WHERE {' AND '.join(conditions)} "
         "ORDER BY created_at, id LIMIT ?",
         (*parameters, limit),
     )
