@@ -10,7 +10,7 @@ This part of the page has an operator section, one for project 03 (its own backe
 
 ## Operators (0.1.0a7)
 
-1. **Install first, then deploy a7.** Run the installer as the owner role, with the same roles as before:
+1. **Stop the a6 processes, install, then start a7.** An a6 process that is still running writes audit records at schema version 3, which the new insert trigger refuses, and an a6 process that connects after the install refuses the new guard, so do not leave one running. Run the installer as the owner role, with the same roles as before:
 
    ```python
    from aox_agent_core.storage import install_postgres_schema
@@ -72,7 +72,7 @@ This part of the page has an operator section, one for project 03 (its own backe
    - `login` is the primary key, `principal` is unique and `login_oid` is unique. The OID is the role's OID when it was mapped, so a role dropped and recreated under the same name inherits nothing, and a rename cannot move a mapping.
    - Rows are never deleted: a trigger refuses DELETE and TRUNCATE. A mapping ends only when `removed_at` is set, once.
    - Both uniques cover removed rows. In practice a login or a principal is never reused after removal: to bring a person back, create a new role under a new name and map it to a new principal id.
-   - Only the owner can touch the table. It is granted to neither the requester nor the approver role. The guard reads it through a SECURITY DEFINER function, `agent_core_bound_principal()`, with its `search_path` pinned and EXECUTE granted only to the approver role. The function returns only the connecting login's own principal.
+   - Only the owner can touch the table. The installer revokes everything on it (table and column privileges) from the requester and approver roles, and a queue refuses to start if any other role holds a privilege on it, or if the table or the function was made by a role other than the approvals table's owner. The guard reads it through a SECURITY DEFINER function, `agent_core_bound_principal()`, with its `search_path` pinned and EXECUTE granted only to the approver role. The function returns only the connecting login's own principal.
 
 7. **What a queue checks when binding is on.** `SQLApprovalQueue` raises `ConfigError` (from `side()` or the first call) if the mapping table, the lookup function or the table's triggers are missing; if the requester role, the approver role or any role the connection can switch to can write the mapping table; or, on the approver side only, if the connecting login has no active mapping (the message names the login). `resolve` compares `principal.id` with the mapped principal before it writes and raises `NotAuthorizedToResolveError`, audited as `approval.resolve_denied` with the new `DenialReason.LOGIN_BINDING` (`"login_binding"`). That check is a courtesy for a clear error: the guard is the enforcement, and it also refuses plain SQL.
 
@@ -84,6 +84,9 @@ This part of the page has an operator section, one for project 03 (its own backe
    - Role OIDs can in theory be reused after OID wraparound.
    - The requester role still has no route to approved. Binding adds a check and removes none.
    - It was not tested against a real pooler.
+   - It is only as strong as each login's authentication. Under `trust` in `pg_hba.conf`, or with a password shared between approvers, any login can connect as another.
+   - If the approver role is itself a login (the example deployment connects the approver service as it), it needs its own mapping and is listed in `unmapped_logins` until it has one.
+   - Login names are written to every audit row (`db_login`) and to the mapping table, and neither can be erased: both are append-only. Use pseudonymous login names (`approver_17`), not personal names, if your data-retention rules require that.
 
 9. **Reading `db_login`.** Each audit row now has `db_login`, set by the insert trigger to `session_user` whatever the writer supplied, outside the hash, next to `db_role` (still `current_user`). `SET ROLE` changes `db_role` but never `db_login`, so a row written after a role switch names the real login. Records written before 0.1.0a7 have `db_login` NULL.
 
