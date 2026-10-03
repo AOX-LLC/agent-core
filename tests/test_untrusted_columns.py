@@ -21,7 +21,12 @@ from aox_agent_core.approvals.sql import approval_payload_hash
 from aox_agent_core.audit import AuditEvent
 from aox_agent_core.audit.chain import canonical_timestamp
 from aox_agent_core.audit.sql import SQLAuditLog
-from aox_agent_core.errors import ApprovalConflictError, ApprovalError, AuditIntegrityError
+from aox_agent_core.errors import (
+    ApprovalConflictError,
+    ApprovalError,
+    AuditIntegrityError,
+    ConfigError,
+)
 from databases import ControlDatabase, split_queue
 from test_approval_payload import ACTION, raw_request
 from test_approvals import APPROVER, REQUESTER
@@ -402,3 +407,187 @@ async def test_the_index_holds_for_every_open_status_and_lets_finished_rows_go(
         f"WHERE id = '{first}'"
     )
     control_database.requester_raw(raw_request(payload_sha256=sha))  # the key is free again
+
+
+# payload_json and payload_purged_at: only the approver role purges, only a finished row, only
+# after the retention floor, and nothing else changes with it.
+
+
+def payload_row(
+    control_database: ControlDatabase, status: str, *, aged: timedelta | None = None
+) -> str:
+    """A request in `status` holding a payload, planted past the guard, finished `aged` ago."""
+    request_id = str(uuid4())
+    moment = datetime.now(UTC) - (aged or timedelta(0))
+    created = moment - timedelta(hours=1)
+    columns: dict[str, str] = {
+        "id": request_id,
+        "action": ACTION,
+        "summary": "s",
+        "payload_sha256": uuid4().hex * 2,
+        "requested_by": "agent-intake",
+        "required_role": "ops.approver",
+        "created_at": canonical_timestamp(created),
+        "expires_at": canonical_timestamp(created + timedelta(hours=2)),
+        "status": status,
+        "payload_json": '{"a":1}',
+    }
+    if status in {"approved", "rejected", "consumed"}:
+        columns |= {
+            "decision": "reject" if status == "rejected" else "approve",
+            "resolved_by": "user-17",
+            "resolved_at": canonical_timestamp(moment),
+        }
+    if status == "consumed":
+        columns["consumed_at"] = canonical_timestamp(moment)
+    if status in {"cancelled", "expired"}:
+        columns["closed_at"] = canonical_timestamp(moment)
+    values = ", ".join(quoted(value) for value in columns.values())
+    control_database.superuser_raw(
+        "SET session_replication_role = replica; "
+        f"INSERT INTO {APPROVALS} ({', '.join(columns)}) VALUES ({values})"
+    )
+    return request_id
+
+
+def purge_sql(request_id: str, *, also: str = "") -> str:
+    purged_at = stamp(datetime.now(UTC))
+    return (
+        f"UPDATE {APPROVALS} SET payload_json = NULL, payload_purged_at = {purged_at}"
+        f"{also} WHERE id = '{request_id}'"
+    )
+
+
+def refused(run: Callable[[str], Any], sql: str) -> bool:
+    try:
+        run(sql)
+    except psycopg.Error:
+        return True
+    return False
+
+
+@pytest.mark.parametrize("status", ["pending", "approved"])
+def test_nobody_can_null_the_payload_of_a_request_still_open(
+    control_database: ControlDatabase, status: str
+) -> None:
+    if control_database.requester_raw is None or control_database.approver_raw is None:
+        pytest.skip("the guard trigger exists only on Postgres")
+    row = payload_row(control_database, status, aged=timedelta(days=30))
+
+    assert refused(control_database.requester_raw, purge_sql(row))
+    assert refused(
+        control_database.requester_raw,
+        f"UPDATE {APPROVALS} SET payload_json = NULL WHERE id = '{row}'",
+    )
+    assert refused(control_database.approver_raw, purge_sql(row))
+    assert refused(
+        control_database.approver_raw,
+        f"UPDATE {APPROVALS} SET payload_json = NULL WHERE id = '{row}'",
+    )
+    kept = control_database.raw(f"SELECT payload_json FROM {APPROVALS} WHERE id = '{row}'")
+    assert kept == [('{"a":1}',)]
+
+
+@pytest.mark.parametrize("status", ["consumed", "rejected", "cancelled", "expired"])
+def test_the_approver_purges_a_finished_request_past_the_floor_and_nobody_else_does(
+    control_database: ControlDatabase, status: str
+) -> None:
+    if control_database.requester_raw is None or control_database.approver_raw is None:
+        pytest.skip("the guard trigger exists only on Postgres")
+    row = payload_row(control_database, status, aged=timedelta(days=3))
+
+    assert refused(control_database.requester_raw, purge_sql(row))
+    control_database.approver_raw(purge_sql(row))
+
+    after = control_database.raw(
+        f"SELECT payload_json, payload_purged_at IS NOT NULL, status FROM {APPROVALS} "
+        f"WHERE id = '{row}'"
+    )
+    assert after == [(None, True, status)]
+
+
+@pytest.mark.parametrize("status", ["consumed", "rejected", "cancelled", "expired"])
+def test_a_purge_inside_the_retention_floor_is_refused(
+    control_database: ControlDatabase, status: str
+) -> None:
+    if control_database.approver_raw is None:
+        pytest.skip("the guard trigger exists only on Postgres")
+    just_now = payload_row(control_database, status)
+    an_hour = payload_row(control_database, status, aged=timedelta(hours=1))
+
+    assert refused(control_database.approver_raw, purge_sql(just_now))
+    assert refused(control_database.approver_raw, purge_sql(an_hour))
+    kept = control_database.raw(f"SELECT count(*) FROM {APPROVALS} WHERE payload_json IS NOT NULL")
+    assert kept == [(2,)]
+
+
+def test_a_purge_that_changes_anything_else_is_refused(
+    control_database: ControlDatabase,
+) -> None:
+    if control_database.approver_raw is None:
+        pytest.skip("the guard trigger exists only on Postgres")
+    row = payload_row(control_database, "consumed", aged=timedelta(days=3))
+
+    for also in (", reason = 'because'", ", status = 'cancelled'", ", payload_sha256 = 'f'"):
+        assert refused(control_database.approver_raw, purge_sql(row, also=also)), also
+    # The right payload_purged_at only: a stamp far from the database's clock is refused too.
+    far_stamp = stamp(NOW - timedelta(days=9))
+    far = f"UPDATE {APPROVALS} SET payload_json = NULL, payload_purged_at = {far_stamp}"
+    assert refused(control_database.approver_raw, f"{far} WHERE id = '{row}'")
+    control_database.approver_raw(purge_sql(row))
+
+
+def test_the_marker_cannot_be_forged_set_without_a_purge_or_undone(
+    control_database: ControlDatabase,
+) -> None:
+    if control_database.requester_raw is None or control_database.approver_raw is None:
+        pytest.skip("the guard trigger exists only on Postgres")
+    stored = payload_row(control_database, "cancelled", aged=timedelta(days=3))
+    never = str(uuid4())
+    control_database.superuser_raw(
+        "SET session_replication_role = replica; "
+        + raw_request(
+            id=quoted(never), status=quoted("cancelled"), closed_at=stamp(NOW - timedelta(days=3))
+        )
+    )
+    mark = f"UPDATE {APPROVALS} SET payload_purged_at = {stamp(datetime.now(UTC))}"
+
+    # Marked without purging, or on a request that never stored a payload.
+    assert refused(control_database.approver_raw, f"{mark} WHERE id = '{stored}'")
+    assert refused(control_database.approver_raw, f"{mark} WHERE id = '{never}'")
+    assert refused(control_database.requester_raw, f"{mark} WHERE id = '{stored}'")
+    # A request cannot be inserted already purged.
+    assert refused(
+        control_database.requester_raw, raw_request(payload_purged_at=stamp(datetime.now(UTC)))
+    )
+    # Purged is permanent: the payload cannot be put back, nor the mark cleared.
+    control_database.approver_raw(purge_sql(stored))
+    assert refused(
+        control_database.approver_raw,
+        f"UPDATE {APPROVALS} SET payload_json = '{{\"a\":1}}' WHERE id = '{stored}'",
+    )
+    assert refused(
+        control_database.approver_raw,
+        f"UPDATE {APPROVALS} SET payload_purged_at = NULL WHERE id = '{stored}'",
+    )
+    assert refused(control_database.approver_raw, purge_sql(stored))
+
+
+async def test_a_queue_refuses_a_requester_role_that_can_write_the_payload_columns(
+    control_database: ControlDatabase,
+) -> None:
+    if control_database.requester_raw is None:
+        pytest.skip("the guard trigger exists only on Postgres")
+    control_database.superuser_raw(
+        f"GRANT UPDATE (payload_json) ON {APPROVALS} TO agent_core_requester"
+    )
+
+    with pytest.raises(ConfigError, match="payload_json"):
+        await split_queue(control_database).submit(
+            action=ACTION,
+            summary="s",
+            payload={},
+            requested_by=REQUESTER,
+            required_role="ops.approver",
+            ttl_seconds=60,
+        )

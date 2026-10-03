@@ -88,13 +88,15 @@ CREATE TABLE {APPROVALS_TABLE} (
     run_context TEXT,
     closed_at TEXT,
     delegates TEXT NOT NULL DEFAULT '[]',
-    payload_json TEXT
+    payload_json TEXT,
+    payload_purged_at TEXT
 )"""
 # Columns added in 0.1.0a3 and 0.1.0a4, with their SQLite types.
 ADDED_COLUMNS: Final = {
     "closed_at": "TEXT",
     "delegates": "TEXT NOT NULL DEFAULT '[]'",
     "payload_json": "TEXT",
+    "payload_purged_at": "TEXT",
 }
 
 _PENDING_INDEX_DDL = (
@@ -121,11 +123,19 @@ PENDING_PAGE_SIZE = 500
 _COLUMNS = (
     "id, action, summary, payload_sha256, requested_by, required_role, created_at, "
     "expires_at, status, decision, resolved_by, resolved_at, consumed_at, reason, run_context, "
-    "delegates, closed_at, payload_json"
+    "delegates, closed_at, payload_json, payload_purged_at"
 )
+_ROW_MARKS: Final = ", ".join("?" for _ in _COLUMNS.split(","))
 _COLUMN_INDEX: Final = {name.strip(): i for i, name in enumerate(_COLUMNS.split(","))}
 DELEGATES_COLUMN: Final = "delegates"
 PAYLOAD_COLUMN: Final = "payload_json"
+_FINISHED_STATUSES: Final = ("consumed", "rejected", "cancelled", "expired")
+# When a finished request finished: consumed, decided (rejected) or closed (cancelled, expired).
+_FINISHED_AT: Final = (
+    "CASE status WHEN 'consumed' THEN consumed_at WHEN 'rejected' THEN resolved_at "
+    "ELSE closed_at END"
+)
+_CANONICAL_STAMP: Final = r"'^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:]{8}[.][0-9]{6}Z$'"
 # Seconds an independent audit write waits for the append lock before falling back.
 DENIAL_LOCK_TIMEOUT: Final = "2s"
 # Seconds an independent audit write waits for a pooled connection before falling back.
@@ -161,6 +171,7 @@ class _Outcome:
     events: list[AuditEvent] = field(default_factory=list)
     # How many requests an expiry batch stored as expired, and whether it was full.
     expired: int = 0
+    purged: int = 0
     batch_full: bool = False
 
 
@@ -311,7 +322,7 @@ class SQLApprovalQueue:
             for _ in range(SUBMIT_ATTEMPTS):
                 inserted = await session.execute_count(
                     f"INSERT INTO {self._table.sql} ({_COLUMNS}) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+                    f"VALUES ({_ROW_MARKS}) "
                     f"ON CONFLICT ({', '.join(layout.OPEN_REQUEST_COLUMNS)}) "
                     f"WHERE status IN ({_OPEN_STATUS_LIST}) DO NOTHING",
                     _row_values(request),
@@ -835,6 +846,89 @@ class SQLApprovalQueue:
             if not outcome.batch_full:
                 return total
 
+    async def purge_payloads(
+        self,
+        *,
+        principal: Principal,
+        older_than: timedelta,
+        limit: int = 500,
+        connection: Any = None,
+    ) -> int:
+        """Drop the stored payload of finished requests older than `older_than`; return how many.
+
+        Only requests that are consumed, rejected, cancelled or expired, and whose finish
+        time (consumed_at, resolved_at or closed_at) is further back than `older_than`
+        by the database's clock (the application's on SQLite), lose their payload_json.
+        payload_sha256 is never touched, so what was approved stays provable; the request
+        reads with payload None and payload_purged_at set, which tells it from one that
+        never stored a payload. One approval.payload_purged event per request, naming
+        `principal`, in the same transaction. Works in batches of `limit`, each its own
+        transaction, and a second run finds nothing more.
+
+        Approver side only (ConfigError otherwise): the decision side holds the right,
+        the requester role has no UPDATE on the column. On Postgres `older_than` may not
+        be shorter than the retention floor the installer wrote into the guard
+        (install_postgres_schema(payload_retention_floor=...), 24 hours by default),
+        else ValueError, and the guard refuses anything shorter whatever the library
+        says. Nothing else purges a payload: count it in your retention plan.
+        """
+        if older_than <= timedelta(0):
+            raise ValueError("older_than must be positive")
+        if limit < 1:
+            raise ValueError(f"limit must be at least 1, got {limit}")
+        moment = self._now()
+
+        async def sweep(session: Session) -> _Outcome:
+            await self._require_side(session, "purge payloads", ApprovalSide.APPROVER)
+            if not await _table_exists(session, self._table):
+                return _Outcome()
+            if session.dialect is Dialect.POSTGRES:
+                floor = await layout.payload_retention_floor_seconds(session, self._schema)
+                if older_than.total_seconds() < floor:
+                    raise ValueError(
+                        f"older_than is shorter than this schema's payload retention floor of "
+                        f"{floor} seconds."
+                    )
+            candidates, rows_read, unreadable = await _load_purgeable(
+                session, self._table, moment, older_than, limit
+            )
+            if unreadable:
+                _LOG.warning(
+                    "%d finished approval request(s) are stored in a form this library will not "
+                    "read and were not purged (first id %s).",
+                    len(unreadable),
+                    unreadable[0],
+                )
+            events = []
+            for request in candidates:
+                changed = await session.execute_count(
+                    f"UPDATE {self._table.sql} SET payload_json = NULL, payload_purged_at = ? "
+                    "WHERE id = ? AND status = ? AND payload_json IS NOT NULL "
+                    "AND payload_purged_at IS NULL",
+                    (canonical_timestamp(moment), str(request.id), request.status.value),
+                )
+                if changed == 1:
+                    events.append(
+                        _event(
+                            "approval.payload_purged",
+                            principal.id,
+                            request,
+                            request.run_context,
+                            payload_sha256=request.payload_sha256,
+                            request_status=request.status.value,
+                        )
+                    )
+            return _Outcome(
+                events=events, purged=len(events), batch_full=rows_read == limit and bool(events)
+            )
+
+        total = 0
+        while True:
+            outcome = await self._write_outcome(sweep, connection=connection, stored_context=True)
+            total += outcome.purged
+            if not outcome.batch_full:
+                return total
+
     async def _write(
         self,
         work: Callable[[Session], Awaitable[_Outcome]],
@@ -1128,6 +1222,43 @@ async def _load_due(
     return readable, len(rows), unreadable
 
 
+async def _load_purgeable(
+    session: Session, table: TableName, now: datetime, older_than: timedelta, limit: int
+) -> tuple[list[ApprovalRequest], int, list[str]]:
+    """Up to `limit` finished requests holding a payload that finished more than `older_than`
+    ago, oldest first: by the database's clock on Postgres, the application's on SQLite.
+
+    Returns the requests this library can read, how many rows it read, and the ids of the
+    rows it cannot read, which a purge leaves as they are.
+    """
+    statuses = ", ".join(f"'{status}'" for status in _FINISHED_STATUSES)
+    if session.dialect is Dialect.POSTGRES:
+        cutoff = (
+            "to_char((statement_timestamp() - make_interval(secs => ?)) AT TIME ZONE 'UTC', "
+            '\'YYYY-MM-DD"T"HH24:MI:SS.US"Z"\')'
+        )
+        parameters: tuple[Any, ...] = (older_than.total_seconds(), limit)
+        shaped = f" AND ({_FINISHED_AT}) ~ {_CANONICAL_STAMP}"
+    else:
+        cutoff = "?"
+        parameters = (canonical_timestamp(now - older_than), limit)
+        shaped = ""
+    rows = await session.execute(
+        f"SELECT {_COLUMNS} FROM {table.sql} WHERE status IN ({statuses}) "
+        "AND payload_json IS NOT NULL AND payload_purged_at IS NULL"
+        f"{shaped} AND ({_FINISHED_AT}) <= {cutoff} ORDER BY ({_FINISHED_AT}), id LIMIT ?",
+        parameters,
+    )
+    readable: list[ApprovalRequest] = []
+    unreadable: list[str] = []
+    for row in rows:
+        try:
+            readable.append(_request_from_row(row))
+        except _StoredRowError:
+            unreadable.append(row[0])
+    return readable, len(rows), unreadable
+
+
 async def _load_open(
     session: Session, table: TableName, request: ApprovalRequest, scrubber: Scrubber
 ) -> ApprovalRequest | None:
@@ -1336,6 +1467,12 @@ def _with_payload(
     row, the requester with plain SQL included, anything else is an integrity error:
     the approver is shown nothing the hash does not bind.
     """
+    if request.payload_purged_at is not None and payload_text is not None:
+        # Purged means gone: a payload beside the mark was put there after it.
+        raise _StoredRowError(
+            f"Request {request.id} is marked purged but still holds a payload.",
+            reason="payload_integrity",
+        )
     if payload_text is None:
         return request
     try:
@@ -1456,6 +1593,7 @@ def _row_values(request: ApprovalRequest) -> tuple[Any, ...]:
         json.dumps(sorted(request.delegates)),
         timestamp(request.closed_at),
         (canonical_json(request.payload).decode("utf-8") if request.payload is not None else None),
+        timestamp(request.payload_purged_at),
     )
 
 

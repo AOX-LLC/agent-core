@@ -23,6 +23,7 @@ from collections.abc import Awaitable, Callable, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import AbstractAsyncContextManager, AsyncExitStack, asynccontextmanager
 from dataclasses import dataclass
+from datetime import timedelta
 from enum import StrEnum
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol, TypeVar
@@ -639,6 +640,7 @@ def install_postgres_schema(
     schema: str = "public",
     close_unaudited_approvals: bool = False,
     close_duplicates: bool = False,
+    payload_retention_floor: timedelta = timedelta(hours=24),
 ) -> InstallReport:
     """Create or upgrade the audit and approval tables in `schema`, as the owner role.
 
@@ -657,6 +659,11 @@ def install_postgres_schema(
     approval.resolved audit event approves (what plain SQL could have approved
     under 0.1.0a2). With close_unaudited_approvals=True it also cancels those,
     in the same transaction, and lists them as closed.
+
+    `payload_retention_floor` is the shortest retention the guard allows
+    SQLApprovalQueue.purge_payloads: a stored payload may be purged only from a finished
+    request whose finish time is further back than this by the database's clock. It is
+    written into the guard, so running the installer again with another value changes it.
 
     The schema allows one open (pending or approved) request per requester, action and
     payload hash, by a unique index. A database that already holds duplicates (what
@@ -694,7 +701,12 @@ def install_postgres_schema(
         # Checked before the guard is written: a run with other role names must not
         # get as far as rewriting it with them.
         await _record_roles(session, schema, requester_role, approver_role)
-        for statement in layout.approvals_guard_ddl(schema, requester_role, approver_role):
+        for statement in layout.approvals_guard_ddl(
+            schema,
+            requester_role,
+            approver_role,
+            payload_retention_floor_seconds=int(payload_retention_floor.total_seconds()),
+        ):
             await session.execute(statement)
         for role, role_layout in (
             (requester_role, layout.REQUESTER_LAYOUT),
@@ -724,6 +736,13 @@ def install_postgres_schema(
                     f"GRANT USAGE ON SCHEMA {layout.identifier(schema, what='schema')} "
                     f"TO {layout.identifier(role, what='role')}"
                 )
+        # A schema from before 0.1.0a5 already holds the approver's other grants, so the
+        # loop above skips it: the purge columns are added to it here.
+        await session.execute(
+            f"GRANT UPDATE ({', '.join(layout.PURGE_COLUMNS)}) ON "
+            f"{layout.identifier(schema, what='schema')}.{layout.APPROVALS_TABLE} "
+            f"TO {layout.identifier(approver_role, what='role')}"
+        )
         unaudited = await _unaudited_approvals(session, schema, approver_role)
         if close_unaudited_approvals and unaudited:
             await _refuse_closing_without_local_audit(session, schema, approver_role)

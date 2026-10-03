@@ -18,7 +18,7 @@ import asyncio
 import inspect
 import threading
 from collections.abc import Awaitable, Callable, Collection, Iterator, Mapping, Sequence
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import TypeVar
 from uuid import UUID
 
@@ -229,6 +229,13 @@ class SyncApprovalQueue:
         self, *, principal: Principal, now: datetime | None = None, limit: int = 500
     ) -> int:
         return self._runner.run(self._queue.expire_due(principal=principal, now=now, limit=limit))
+
+    def purge_payloads(
+        self, *, principal: Principal, older_than: timedelta, limit: int = 500
+    ) -> int:
+        return self._runner.run(
+            self._queue.purge_payloads(principal=principal, older_than=older_than, limit=limit)
+        )
 
     def close(self) -> None:
         """Close the queue's database, if it has one, and stop the background loop."""

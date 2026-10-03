@@ -22,9 +22,12 @@ only its own credentials cannot step outside them with plain SQL:
     approved  expired    requester or approver   as above: an approval that lapsed unused
     approved  consumed   requester               consumed_at set, not expired
 
-Every other change is refused, as are DELETE and TRUNCATE, and no update may
-touch a request's identity, payload hash, requester, required role, lifetime,
-run context or delegates.
+One more change is allowed, to the stored payload alone: the approver role may purge
+it (payload_json to NULL, payload_purged_at set) on a finished request (consumed,
+rejected, cancelled or expired) whose finish time is further back than the installed
+retention floor by the database's clock. Every other change is refused, as are DELETE and
+TRUNCATE, and no update may touch a request's identity, payload hash, requester,
+required role, lifetime, run context or delegates.
 """
 
 import re
@@ -89,7 +92,16 @@ APPROVER_LAYOUT: Final[Mapping[str, Mapping[str, frozenset[str] | None]]] = {
     APPROVALS_TABLE: {
         "SELECT": None,
         "UPDATE": frozenset(
-            {"status", "decision", "resolved_by", "resolved_at", "reason", "closed_at"}
+            {
+                "status",
+                "decision",
+                "resolved_by",
+                "resolved_at",
+                "reason",
+                "closed_at",
+                "payload_json",
+                "payload_purged_at",
+            }
         ),
     },
 }
@@ -100,6 +112,12 @@ PUBLIC_LAYOUT: Final[Mapping[str, Mapping[str, frozenset[str] | None]]] = {
 }
 # Decision columns the requester role must never be able to write.
 DECISION_COLUMNS: Final = ("decision", "resolved_by", "resolved_at", "reason")
+# Columns only the approver role may change: a stored payload is purged by the decision side.
+PURGE_COLUMNS: Final = ("payload_json", "payload_purged_at")
+# Everything the requester role must never be able to write on an approval request.
+REQUESTER_FORBIDDEN_COLUMNS: Final = (*DECISION_COLUMNS, *PURGE_COLUMNS)
+# The shortest retention the installed guard allows a purge, unless the installer is told otherwise.
+DEFAULT_PAYLOAD_RETENTION_FLOOR_SECONDS: Final = 24 * 60 * 60
 
 
 # Characters of the Unicode categories Cc, Cf, Zl and Zp that free text may not carry; a
@@ -236,10 +254,12 @@ def approvals_tables_ddl(schema: str) -> tuple[str, ...]:
             run_context TEXT,
             closed_at TEXT,
             delegates TEXT NOT NULL DEFAULT '[]',
-            payload_json TEXT
+            payload_json TEXT,
+            payload_purged_at TEXT
         )""",
         f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS closed_at TEXT",
         f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS payload_json TEXT",
+        f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS payload_purged_at TEXT",
         f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS delegates TEXT NOT NULL DEFAULT '[]'",
         f"""CREATE INDEX IF NOT EXISTS agent_core_approvals_pending
         ON {table} (status, created_at, id)""",
@@ -262,7 +282,12 @@ def open_request_index_ddl(schema: str) -> str:
     )
 
 
-def approvals_guard_ddl(schema: str, requester_role: str, approver_role: str) -> tuple[str, ...]:
+def approvals_guard_ddl(
+    schema: str,
+    requester_role: str,
+    approver_role: str,
+    payload_retention_floor_seconds: int = DEFAULT_PAYLOAD_RETENTION_FLOOR_SECONDS,
+) -> tuple[str, ...]:
     """The guard function and its triggers.
 
     The role names are written into the guard itself, so it never depends on what
@@ -273,12 +298,15 @@ def approvals_guard_ddl(schema: str, requester_role: str, approver_role: str) ->
     # identifier() admits only [a-z0-9_], so the names are safe inside quotes.
     identifier(requester_role, what="role")
     identifier(approver_role, what="role")
+    if payload_retention_floor_seconds < 0:
+        raise ConfigError("The payload retention floor cannot be negative.")
     guard_body = _with_timestamp_checks(
         _GUARD_BODY.replace("'<requester>'", f"'{requester_role}'")
         .replace("'<approver>'", f"'{approver_role}'")
         .replace("<max_payload>", str(MAX_STORED_PAYLOAD_BYTES))
         .replace("<unsafe_text>", UNSAFE_TEXT_PATTERN)
         .replace("<revision>", str(GUARD_REVISION))
+        .replace("<retention_floor>", str(int(payload_retention_floor_seconds)))
     )
     return (
         f"""CREATE OR REPLACE FUNCTION {quoted_schema}.{APPROVALS_TABLE}_guard()
@@ -317,6 +345,7 @@ def _with_timestamp_checks(body: str) -> str:
 # is a member of every role, so it is neither, and is refused.
 _GUARD_BODY = """
 -- agent-core guard revision <revision>
+-- agent-core payload retention floor <retention_floor> seconds
 DECLARE
     requester_role text := '<requester>';
     approver_role text := '<approver>';
@@ -333,6 +362,8 @@ DECLARE
     as_approver boolean;
     db_now timestamptz := statement_timestamp();
     is_expired boolean;
+    is_purge boolean;
+    finished_at text;
 BEGIN
     IF TG_OP IN ('DELETE', 'TRUNCATE') THEN
         RAISE EXCEPTION 'approval requests are never deleted';
@@ -401,7 +432,8 @@ BEGIN
         END IF;
         IF NEW.status <> 'pending' OR NEW.decision IS NOT NULL OR NEW.resolved_by IS NOT NULL
            OR NEW.resolved_at IS NOT NULL OR NEW.consumed_at IS NOT NULL
-           OR NEW.closed_at IS NOT NULL OR NEW.reason IS NOT NULL THEN
+           OR NEW.closed_at IS NOT NULL OR NEW.reason IS NOT NULL
+           OR NEW.payload_purged_at IS NOT NULL THEN
             RAISE EXCEPTION 'a new approval request must be pending and undecided';
         END IF;
         IF NEW.created_at::timestamptz > db_now + interval '5 minutes'
@@ -413,13 +445,47 @@ BEGIN
     END IF;
 
     IF ROW(NEW.id, NEW.action, NEW.summary, NEW.payload_sha256, NEW.requested_by,
-           NEW.required_role, NEW.created_at, NEW.expires_at, NEW.run_context, NEW.delegates,
-           NEW.payload_json)
+           NEW.required_role, NEW.created_at, NEW.expires_at, NEW.run_context, NEW.delegates)
        IS DISTINCT FROM
        ROW(OLD.id, OLD.action, OLD.summary, OLD.payload_sha256, OLD.requested_by,
-           OLD.required_role, OLD.created_at, OLD.expires_at, OLD.run_context, OLD.delegates,
-           OLD.payload_json) THEN
+           OLD.required_role, OLD.created_at, OLD.expires_at, OLD.run_context, OLD.delegates) THEN
         RAISE EXCEPTION 'an approval request''s identity and payload never change';
+    END IF;
+
+    -- The stored payload changes in one way only: purged, by the approver role, once the
+    -- request is finished and past the retention floor. The hash it was bound to stays.
+    is_purge := OLD.payload_json IS NOT NULL AND NEW.payload_json IS NULL;
+    IF (NEW.payload_json IS DISTINCT FROM OLD.payload_json
+        OR NEW.payload_purged_at IS DISTINCT FROM OLD.payload_purged_at) AND NOT is_purge THEN
+        RAISE EXCEPTION 'an approval request''s identity and payload never change';
+    END IF;
+    IF is_purge THEN
+        IF NOT as_approver THEN
+            RAISE EXCEPTION 'only the approver role may purge a stored payload';
+        END IF;
+        IF OLD.status NOT IN ('consumed', 'rejected', 'cancelled', 'expired')
+           OR NEW.status IS DISTINCT FROM OLD.status THEN
+            RAISE EXCEPTION 'only the payload of a finished request may be purged';
+        END IF;
+        finished_at := CASE OLD.status WHEN 'consumed' THEN OLD.consumed_at
+                                       WHEN 'rejected' THEN OLD.resolved_at
+                                       ELSE OLD.closed_at END;
+        IF finished_at IS NULL OR NOT_CANONICAL(finished_at)
+           OR finished_at::timestamptz + make_interval(secs => <retention_floor>) > db_now THEN
+            RAISE EXCEPTION 'a payload may be purged only after the retention floor';
+        END IF;
+        IF NEW.payload_purged_at IS NULL OR OLD.payload_purged_at IS NOT NULL
+           OR NOT_CANONICAL(NEW.payload_purged_at)
+           OR NEW.payload_purged_at::timestamptz NOT BETWEEN db_now - interval '5 minutes'
+                                                         AND db_now + interval '5 minutes'
+           OR ROW(NEW.decision, NEW.resolved_by, NEW.resolved_at, NEW.reason, NEW.consumed_at,
+                  NEW.closed_at)
+              IS DISTINCT FROM
+              ROW(OLD.decision, OLD.resolved_by, OLD.resolved_at, OLD.reason, OLD.consumed_at,
+                  OLD.closed_at) THEN
+            RAISE EXCEPTION 'a purge sets payload_json to NULL and payload_purged_at only';
+        END IF;
+        RETURN NEW;
     END IF;
     is_expired := OLD.expires_at::timestamptz <= db_now;
 
@@ -726,15 +792,33 @@ async def check_connection(session: "Session", schema: str) -> str:
     return ConnectionSide.REQUESTER if is_requester else ConnectionSide.APPROVER
 
 
-async def _guard_revision(session: "Session", table: str) -> int | None:
-    """The revision comment inside the installed guard function, or None if it has none."""
+async def _guard_source(session: "Session", table: str) -> str:
     rows = await session.execute(
         "SELECT p.prosrc FROM pg_trigger t JOIN pg_proc p ON p.oid = t.tgfoid "
         "WHERE t.tgrelid = to_regclass(?) AND t.tgname = ?",
         (table, APPROVALS_GUARD_TRIGGER),
     )
-    found = re.search(r"-- agent-core guard revision (\d+)", rows[0][0]) if rows else None
+    return str(rows[0][0]) if rows else ""
+
+
+async def _guard_revision(session: "Session", table: str) -> int | None:
+    """The revision comment inside the installed guard function, or None if it has none."""
+    found = re.search(r"-- agent-core guard revision (\d+)", await _guard_source(session, table))
     return int(found[1]) if found else None
+
+
+async def payload_retention_floor_seconds(session: "Session", schema: str) -> int:
+    """The shortest retention, in seconds, the installed guard allows a purge."""
+    table = f"{identifier(schema, what='schema')}.{APPROVALS_TABLE}"
+    found = re.search(
+        r"-- agent-core payload retention floor (\d+) seconds", await _guard_source(session, table)
+    )
+    if found is None:
+        raise ConfigError(
+            f"The approvals guard in {schema} carries no payload retention floor. As the owner "
+            "role, run install_postgres_schema from 0.1.0a5."
+        )
+    return int(found[1])
 
 
 async def _require_open_request_index(session: "Session", schema: str, table: str) -> None:
@@ -792,9 +876,14 @@ async def _check_connecting_roles(session: "Session", table: str, *, as_requeste
                 await session.execute(
                     "SELECT "
                     + " OR ".join(
-                        "has_column_privilege(?, ?, ?, 'UPDATE')" for _ in DECISION_COLUMNS
+                        "has_column_privilege(?, ?, ?, 'UPDATE')"
+                        for _ in REQUESTER_FORBIDDEN_COLUMNS
                     ),
-                    tuple(value for column in DECISION_COLUMNS for value in (role, table, column)),
+                    tuple(
+                        value
+                        for column in REQUESTER_FORBIDDEN_COLUMNS
+                        for value in (role, table, column)
+                    ),
                 )
             )[0][0]
             what = "update a decision column"
@@ -851,19 +940,26 @@ async def _check_layout(
     decision_rights = (
         await session.execute(
             "SELECT "
-            + ", ".join("has_column_privilege(?, ?, ?, 'UPDATE')" for _ in DECISION_COLUMNS),
+            + ", ".join(
+                "has_column_privilege(?, ?, ?, 'UPDATE')" for _ in REQUESTER_FORBIDDEN_COLUMNS
+            ),
             tuple(
-                value for column in DECISION_COLUMNS for value in (requester_role, table, column)
+                value
+                for column in REQUESTER_FORBIDDEN_COLUMNS
+                for value in (requester_role, table, column)
             ),
         )
     )[0]
     writable = [
-        column for column, can in zip(DECISION_COLUMNS, decision_rights, strict=True) if can
+        column
+        for column, can in zip(REQUESTER_FORBIDDEN_COLUMNS, decision_rights, strict=True)
+        if can
     ]
     if writable:
         raise ConfigError(
             f"The requester role {requester_role} can update {', '.join(writable)} on the "
-            "approvals table, so it could record a decision. Revoke that grant."
+            "approvals table, so it could record a decision or destroy a payload. Revoke that "
+            "grant."
         )
     if (
         await session.execute("SELECT has_table_privilege(?, ?, 'INSERT')", (approver_role, table))

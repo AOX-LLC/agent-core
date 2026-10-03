@@ -8,6 +8,7 @@ host's own. mypy checks the in-memory classes below against both protocols.
 from collections.abc import AsyncIterator, Collection, Mapping, Sequence
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import Any
 from uuid import UUID, uuid4
 
 import pytest
@@ -34,8 +35,10 @@ from aox_agent_core.audit import (
     UnsealedAuditRecord,
     compute_record_hash,
 )
+from aox_agent_core.audit.sql import SQLAuditLog
 from aox_agent_core.errors import (
     ApprovalAlreadyResolvedError,
+    ApprovalConflictError,
     ApprovalNotFoundError,
     ApprovalNotGrantedError,
     ApprovalPayloadMismatchError,
@@ -136,6 +139,35 @@ class InMemoryApprovalQueue:
             delegates=frozenset(delegates),
             payload=dict(payload) if include_payload else None,
         )
+        for open_request in self._requests.values():
+            if (
+                open_request.status in {ApprovalStatus.PENDING, ApprovalStatus.APPROVED}
+                and not open_request.is_expired(now)
+                and (open_request.requested_by, open_request.action, open_request.payload_sha256)
+                == (request.requested_by, request.action, request.payload_sha256)
+            ):
+                # The protocol's idempotent submit: a repeat returns the open request, or
+                # conflicts when its required_role, lifetime or delegates differ.
+                differs = tuple(
+                    name
+                    for name, other in (
+                        ("delegates", open_request.delegates != request.delegates),
+                        (
+                            "lifetime",
+                            open_request.expires_at - open_request.created_at
+                            != request.expires_at - request.created_at,
+                        ),
+                        ("required_role", open_request.required_role != request.required_role),
+                    )
+                    if other
+                )
+                if differs:
+                    raise ApprovalConflictError(
+                        f"Request {open_request.id} is open with a different {', '.join(differs)}.",
+                        existing=open_request.id,
+                        differs=differs,
+                    )
+                return open_request
         self._requests[request.id] = request
         await self._audit("approval.requested", requested_by, request, context)
         return request
@@ -247,6 +279,32 @@ class InMemoryApprovalQueue:
             await self._audit("approval.expired", principal, expired, None)
         return len(due)
 
+    async def purge_payloads(
+        self, *, principal: Principal, older_than: timedelta, limit: int = 500
+    ) -> int:
+        cutoff = datetime.now(UTC) - older_than
+        finished = (
+            ApprovalStatus.CONSUMED,
+            ApprovalStatus.REJECTED,
+            ApprovalStatus.CANCELLED,
+            ApprovalStatus.EXPIRED,
+        )
+        due = [
+            request
+            for request in self._requests.values()
+            if request.status in finished
+            and request.payload is not None
+            and (request.consumed_at or request.closed_at or request.resolved_at or cutoff)
+            <= cutoff
+        ][:limit]
+        for request in due:
+            purged = request.model_copy(
+                update={"payload": None, "payload_purged_at": datetime.now(UTC)}
+            )
+            self._requests[request.id] = purged
+            await self._audit("approval.payload_purged", principal, purged, None)
+        return len(due)
+
     async def _audit(
         self,
         action: str,
@@ -346,3 +404,31 @@ async def test_the_sql_queue_audits_denials_to_a_host_log(tmp_path: Path) -> Non
         {"reason": "not_found"},
         RUN,
     )
+
+
+async def test_a_hosts_own_queue_can_match_the_idempotent_submit_and_the_purge(
+    tmp_path: Path,
+) -> None:
+    async with open_database(f"sqlite:///{tmp_path / 'host.sqlite3'}") as database:
+        queue = InMemoryApprovalQueue(SQLAuditLog(database))
+        terms: dict[str, Any] = {
+            "action": "crm.update_contact",
+            "summary": "s",
+            "payload": PAYLOAD,
+            "requested_by": REQUESTER,
+            "required_role": "ops.approver",
+            "ttl_seconds": 600,
+            "include_payload": True,
+        }
+        first = await queue.submit(**terms)
+
+        assert (await queue.submit(**terms)).id == first.id
+        with pytest.raises(ApprovalConflictError) as raised:
+            await queue.submit(**{**terms, "ttl_seconds": 60})
+        assert raised.value.differs == ("lifetime",)
+
+        await queue.cancel(first.id, principal=REQUESTER)
+        assert await queue.purge_payloads(principal=REQUESTER, older_than=timedelta(0)) == 1
+        purged = await queue.get(first.id)
+        assert (purged.payload, purged.payload_sha256) == (None, first.payload_sha256)
+        assert purged.payload_purged_at is not None

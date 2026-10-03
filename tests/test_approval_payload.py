@@ -224,7 +224,9 @@ async def test_neither_role_can_change_a_stored_payload(control_database: Contro
 
     with pytest.raises(psycopg.errors.InsufficientPrivilege):
         control_database.requester_raw(update)
-    with pytest.raises(psycopg.errors.InsufficientPrivilege):
+    # The approver may purge a finished request's payload, so it has the column; the guard
+    # refuses every other change to it.
+    with pytest.raises(psycopg.Error, match="never change"):
         control_database.approver_raw(update)
     with pytest.raises(psycopg.Error, match="never change"):
         control_database.raw(update)  # even the owner, while the guard is on

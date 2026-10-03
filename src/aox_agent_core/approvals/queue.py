@@ -1,7 +1,7 @@
 """The approval queue: submit, resolve, and check before acting."""
 
 from collections.abc import Collection, Mapping, Sequence
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Protocol
 from uuid import UUID
 
@@ -132,5 +132,18 @@ class ApprovalQueue(Protocol):
 
         Reads must treat such requests as expired whether or not this has run. An
         approval that lapsed unused is EXPIRED and keeps its decision.
+        """
+        ...
+
+    async def purge_payloads(
+        self, *, principal: Principal, older_than: timedelta, limit: int = 500
+    ) -> int:
+        """Drop the stored payload of finished requests older than `older_than`; return how many.
+
+        Only requests that are consumed, rejected, cancelled or expired are touched, and
+        payload_sha256 is never changed. A purged request reads with payload None and
+        payload_purged_at set, so "purged" differs from "never stored". One audit event
+        per purged request. An implementation applies this retention rule itself; an
+        approver-side operation, so the decision side holds the right.
         """
         ...

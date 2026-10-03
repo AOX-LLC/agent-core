@@ -120,6 +120,11 @@ class ApprovalRequest(FrozenModel):
     so what an approver sees there is what the hash binds. It is None when the
     requester did not store it, and on what consume(), cancel() and expire_due()
     work on: they check nothing about a stored payload, so they return none.
+
+    `payload_purged_at` tells a payload that was dropped from one never stored: after
+    purge_payloads() on a finished request the payload is gone, this holds when, and
+    payload_sha256 still binds what it was. A request that never stored a payload has
+    both None.
     """
 
     id: UUID
@@ -140,6 +145,7 @@ class ApprovalRequest(FrozenModel):
     run_context: RunContext | None = None
     delegates: frozenset[PrincipalId] = frozenset()
     payload: dict[str, JsonValue] | None = None
+    payload_purged_at: AwareDatetime | None = None
 
     @model_validator(mode="after")
     def _few_delegates(self) -> Self:
@@ -168,6 +174,17 @@ class ApprovalRequest(FrozenModel):
             raise ValueError("resolved_by and resolved_at are set exactly when there is a decision")
         if self.resolved_by is not None and self.resolved_by == self.requested_by:
             raise ValueError("a request cannot be resolved by the principal who made it")
+        if self.payload_purged_at is not None and (
+            self.payload is not None
+            or self.status
+            not in {
+                ApprovalStatus.CONSUMED,
+                ApprovalStatus.REJECTED,
+                ApprovalStatus.CANCELLED,
+                ApprovalStatus.EXPIRED,
+            }
+        ):
+            raise ValueError("only a finished request has its payload purged, and then has none")
         if self.resolved_at is not None and self.resolved_at < self.created_at:
             raise ValueError("resolved_at is earlier than created_at")
 
