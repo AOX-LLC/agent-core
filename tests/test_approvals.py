@@ -574,3 +574,45 @@ async def test_list_pending_pages_with_an_after_cursor(control_database: Control
     assert pages == [created[0:2], created[2:4], created[4:5]]
     with pytest.raises(ApprovalNotFoundError):
         await queue.list_pending(APPROVER, after=uuid4())
+
+
+# The approver side decides which role each action needs
+
+
+async def test_an_approver_side_role_map_overrides_what_the_requester_asked_for(
+    control_database: ControlDatabase,
+) -> None:
+    policy = RoleApproverPolicy(roles_by_action={"crm.update_contact": "finance.approver"})
+    queue = split_queue(control_database, policy=policy, clock=Clock())
+    weak = await submitted(queue)  # asks for ops.approver, which APPROVER holds
+    unlisted = await queue.submit(
+        action="crm.delete_contact",
+        summary="s",
+        payload=PAYLOAD,
+        requested_by=REQUESTER,
+        required_role="ops.approver",
+        ttl_seconds=3_600,
+    )
+    finance = Principal(
+        id="user-30", kind=PrincipalKind.HUMAN, roles=frozenset({"finance.approver"})
+    )
+    proper = await queue.submit(
+        action="crm.update_contact",
+        summary="s",
+        payload=PAYLOAD,
+        requested_by=REQUESTER,
+        required_role="finance.approver",
+        ttl_seconds=3_600,
+    )
+
+    with pytest.raises(NotAuthorizedToResolveError, match="role_mismatch"):
+        await queue.resolve(weak.id, decision=Decision.APPROVE, principal=APPROVER)
+    with pytest.raises(NotAuthorizedToResolveError, match="unknown_action"):
+        await queue.resolve(unlisted.id, decision=Decision.APPROVE, principal=APPROVER)
+    assert await queue.list_pending(APPROVER) == []
+    approved = await queue.resolve(proper.id, decision=Decision.APPROVE, principal=finance)
+
+    assert approved.status is ApprovalStatus.APPROVED
+    reasons = [reason for _, _, reason in await audit_actions(control_database)]
+    assert "role_mismatch" in reasons
+    assert "unknown_action" in reasons

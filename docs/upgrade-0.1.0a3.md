@@ -156,6 +156,7 @@ The database enforces:
 The library enforces:
 
 - that the approver is a human who holds `required_role` (the database cannot know principals, because every agent shares the requester role);
+- with `RoleApproverPolicy(roles_by_action={...})` on the approver side, which role each action needs. The requester chooses `required_role` when it submits, so without that map a requester can ask for a weaker role than an action deserves;
 - that `consume` is called by the requester or one of the request's delegates, else `NotTheRequesterError`;
 - that `cancel` is called by the requester, never a delegate;
 - the action and payload match on `consume`.

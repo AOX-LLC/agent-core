@@ -103,6 +103,9 @@ _DENIAL_ERRORS: Final[Mapping[DenialReason, type[ApprovalError]]] = {
     DenialReason.MISSING_ROLE: NotAuthorizedToResolveError,
     DenialReason.SELF_APPROVAL: NotAuthorizedToResolveError,
     DenialReason.NOT_PENDING: ApprovalAlreadyResolvedError,
+    DenialReason.UNKNOWN_ACTION: NotAuthorizedToResolveError,
+    DenialReason.ROLE_MISMATCH: NotAuthorizedToResolveError,
+    DenialReason.NOT_REQUESTER: NotAuthorizedToResolveError,
     DenialReason.EXPIRED: ApprovalExpiredError,
 }
 

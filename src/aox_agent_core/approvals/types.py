@@ -169,6 +169,8 @@ class DenialReason(StrEnum):
     SELF_APPROVAL = "self_approval"
     NOT_PENDING = "not_pending"
     NOT_REQUESTER = "not_requester"
+    UNKNOWN_ACTION = "unknown_action"
+    ROLE_MISMATCH = "role_mismatch"
     EXPIRED = "expired"
 
 
