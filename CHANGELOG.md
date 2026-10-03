@@ -27,7 +27,7 @@ Recordings are format 2. No live recording was made in the release run; the reco
 ### Changed in 0.1.0
 
 - Documentation: the README is rewritten for the release, with a trust-model section, and docs/upgrading.md gains the step to 0.1.0.
-- Tests: each test run names its Postgres roles and databases with a run id, so concurrent runs can share one server.
+- Tests: two full suites can now run at once against one Postgres server (both passed, 1145 tests each, in 7 minutes). Each run names its Postgres roles and databases with its own run id and drops them at the end. Two other test-suite causes of the earlier flaky Postgres failures were fixed: the schema tests took their clock at import, and the guard accepts a decision time only within five minutes of the database clock, so any run longer than that failed them (reproduced by ageing the clock 10 minutes); and one test counted advisory locks across the whole server rather than its own database. Colliding role names were not shown to cause a failure on their own. The library is unchanged.
 - Added `examples/approval_flow.py`, an approval flow from request to use.
 - Added docs/api.md, an API reference with a generated outline.
 
