@@ -659,10 +659,13 @@ class InstallReport:
     closed_duplicates lists the pending requests the run cancelled, when asked, because
     another open request already held their requester, action and payload hash.
     backdated_finishes lists finished requests that still hold a payload and whose finish
-    time is before their own creation or approval (at most 1000, by id). 0.1.0a4 let the
-    role that closed a request write that time, so each of these is purgeable at once under
-    any retention floor, whenever it really finished; since 0.1.0a5 the database writes the
-    time. The installer changes nothing about them: check them before the first purge.
+    time is more than 5 minutes (the guard's clock skew) before their own creation or
+    decision (at most 1000, by id). 0.1.0a4 let the role that closed a request write that
+    time, so each of these is purgeable at once under any retention floor, whenever it
+    really finished; since 0.1.0a5 the database writes the time. The installer changes
+    nothing about them: check them before the first purge. An empty list does not show that
+    nothing was backdated: a time moved back but still after the request's own history is
+    not detectable here.
     """
 
     schema: str
@@ -696,9 +699,9 @@ class InstallReport:
             lines += [f"  {request_id}" for request_id in self.closed_duplicates]
         if self.backdated_finishes:
             lines.append(
-                "Finished requests holding a payload whose finish time is before they were "
-                "created or approved (a client wrote it, before 0.1.0a5): a purge would take "
-                "them at once, so check them first:"
+                "Finished requests holding a payload whose finish time is more than 5 minutes "
+                "before they were created or decided (0.1.0a4 let a client write it): a purge "
+                "would take them at once, so check them first:"
             )
             lines += [f"  {request_id}" for request_id in self.backdated_finishes]
         return "\n".join(lines)

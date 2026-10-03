@@ -11,7 +11,7 @@ import time
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime, timedelta
 from typing import Any
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import psycopg
 import pytest
@@ -721,3 +721,58 @@ def test_a_rejection_is_stamped_by_the_database_whatever_the_client_wrote(
     )
     kept = _finished_at(control_database, approved, "resolved_at")
     assert abs(kept - claimed) < timedelta(seconds=1)
+
+
+async def test_a_rejection_of_a_request_dated_ahead_is_stamped_no_earlier_than_its_creation(
+    control_database: ControlDatabase,
+) -> None:
+    """The guard allows created_at up to 5 minutes ahead; the library will not read a decision
+    dated before its request, so the stamp is GREATEST(database clock, created_at)."""
+    if control_database.requester_raw is None or control_database.approver_raw is None:
+        pytest.skip("the guard trigger exists only on Postgres")
+    ahead = datetime.now(UTC) + timedelta(minutes=4)
+    row = str(uuid4())
+    control_database.requester_raw(
+        raw_request(
+            id=quoted(row),
+            created_at=stamp(ahead),
+            expires_at=stamp(ahead + timedelta(hours=1)),
+        )
+    )
+
+    control_database.approver_raw(
+        f"UPDATE {APPROVALS} SET status = 'rejected', decision = 'reject', "
+        f"resolved_by = 'user-17', resolved_at = {stamp(ahead + timedelta(seconds=1))} "
+        f"WHERE id = '{row}'"
+    )
+
+    assert _finished_at(control_database, row, "resolved_at") >= _finished_at(
+        control_database, row, "created_at"
+    )
+    read = await split_queue(control_database).get(UUID(row))
+    assert read.status is ApprovalStatus.REJECTED
+
+
+async def test_resolve_returns_the_resolved_at_the_database_stored(
+    control_database: ControlDatabase,
+) -> None:
+    """An application clock 3 minutes ahead (the guard allows 5): a rejection is stored with the
+    database's time, and the request resolve returns says the same."""
+    if control_database.approver_raw is None:
+        pytest.skip("the guard stamps a rejection on Postgres only")
+    submitter = split_queue(control_database)
+    queue = split_queue(control_database, clock=lambda: datetime.now(UTC) + timedelta(minutes=3))
+    request = await submitter.submit(
+        action=ACTION,
+        summary="s",
+        payload={"a": 1},
+        requested_by=REQUESTER,
+        required_role="ops.approver",
+        ttl_seconds=600,
+    )
+
+    rejected = await queue.resolve(request.id, decision=Decision.REJECT, principal=APPROVER)
+
+    stored = _finished_at(control_database, str(request.id), "resolved_at")
+    assert rejected.resolved_at == stored
+    assert abs(datetime.now(UTC) - stored) < timedelta(seconds=30)

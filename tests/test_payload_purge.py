@@ -456,3 +456,51 @@ async def test_the_purge_skips_a_request_another_transaction_holds(
 
     assert await purger.purge_payloads(principal=SWEEPER, older_than=timedelta(days=2)) == 1
     assert (await queue.get(held.id)).payload is None
+
+
+async def test_sqlite_drops_the_a5_purge_index_and_builds_the_new_one_on_first_use(
+    tmp_path: Any,
+) -> None:
+    import sqlite3
+
+    from aox_agent_core.approvals.sql import SQLApprovalQueue
+    from aox_agent_core.storage import open_database
+
+    path = tmp_path / "control.sqlite3"
+    database = open_database(f"sqlite:///{path}")
+    queue = SQLApprovalQueue(database, audit_log=SQLAuditLog(database))
+    await queue.submit(
+        action=ACTION,
+        summary="s",
+        payload={"a": 1},
+        requested_by=REQUESTER,
+        required_role="ops.approver",
+        ttl_seconds=60,
+    )
+    await database.aclose()
+    with sqlite3.connect(path) as raw:
+        raw.execute(
+            f"CREATE INDEX {layout.LEGACY_PURGEABLE_INDEX} ON agent_core_approvals "
+            f"(({layout.FINISHED_AT_EXPRESSION}), id) WHERE {layout.PURGEABLE_PREDICATE}"
+        )
+        raw.execute(f"DROP INDEX {layout.PURGEABLE_INDEX}")
+    reopened = open_database(f"sqlite:///{path}")
+
+    await SQLApprovalQueue(reopened, audit_log=SQLAuditLog(reopened)).submit(
+        action=ACTION,
+        summary="s2",
+        payload={"a": 2},
+        requested_by=REQUESTER,
+        required_role="ops.approver",
+        ttl_seconds=60,
+    )
+    await reopened.aclose()
+
+    with sqlite3.connect(path) as raw:
+        names = {
+            row[0]
+            for row in raw.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'index' AND name LIKE '%purge%'"
+            )
+        }
+    assert names == {layout.PURGEABLE_INDEX}

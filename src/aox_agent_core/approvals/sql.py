@@ -948,8 +948,8 @@ class SQLApprovalQueue:
             if candidates:
                 await self._lock_after_reading(session, connection)
             events = []
-            skipping, markers = _skipping_locked_rows(self._table, session)
             for request in candidates:
+                skipping, skip_parameters = _skipping_locked_rows(self._table, session, request.id)
                 changed = await session.execute_count(
                     f"UPDATE {self._table.sql} SET payload_json = NULL, payload_purged_at = ? "
                     "WHERE id = ? AND status = ? AND payload_json IS NOT NULL "
@@ -958,7 +958,7 @@ class SQLApprovalQueue:
                         canonical_timestamp(moment),
                         str(request.id),
                         request.status.value,
-                        *(str(request.id) for _ in markers),
+                        *skip_parameters,
                     ),
                 )
                 if changed == 1:
@@ -1243,16 +1243,19 @@ def _cancel_refusal(
     return None
 
 
-def _skipping_locked_rows(table: TableName, session: Session) -> tuple[str, tuple[str, ...]]:
-    """The extra condition that makes an UPDATE of one request skip it, not wait, while another
-    transaction holds its row (Postgres; SQLite has no row locks), and the id markers it takes.
+def _skipping_locked_rows(
+    table: TableName, session: Session, request_id: UUID
+) -> tuple[str, tuple[str, ...]]:
+    """The extra condition, and its parameters, that make an UPDATE of one request skip it,
+    not wait, while another transaction holds its row (Postgres; SQLite has no row locks).
 
     The lock is still taken by the UPDATE, after the audit append lock the sweeps take first,
     so the lock order is unchanged. A skipped request is counted as not changed.
     """
     if session.dialect is not Dialect.POSTGRES:
         return "", ()
-    return f" AND id IN (SELECT id FROM {table.sql} WHERE id = ? FOR UPDATE SKIP LOCKED)", ("id",)
+    clause = f" AND id IN (SELECT id FROM {table.sql} WHERE id = ? FOR UPDATE SKIP LOCKED)"
+    return clause, (str(request_id),)
 
 
 async def _close(
@@ -1268,13 +1271,15 @@ async def _close(
     approval that lapsed too). Returns the closed_at that was stored, which on Postgres is
     the database's own stamp and not `now`; None if the request moved meanwhile, or, with
     `skip_locked` (a sweep), another transaction holds its row."""
-    skipping, markers = _skipping_locked_rows(table, session) if skip_locked else ("", ())
+    skipping, skip_parameters = (
+        _skipping_locked_rows(table, session, request.id) if skip_locked else ("", ())
+    )
     parameters: tuple[str, ...] = (
         status.value,
         canonical_timestamp(now),
         str(request.id),
         request.status.value,
-        *(str(request.id) for _ in markers),
+        *skip_parameters,
     )
     rows = await session.execute(
         f"UPDATE {table.sql} SET status = ?, closed_at = ? WHERE id = ? AND status = ?"
@@ -1434,7 +1439,7 @@ def _refused_repeat(
         if not isinstance(error, ApprovalConflictError):
             error = ApprovalConflictError(
                 f"Request {subject} is already open for this requester, action and payload, "
-                f"and cannot be used ({reason}). {_WAY_OUT[reason]}",
+                f"and cannot be used ({reason}). {_WAY_OUT.get(reason, _WAY_OUT['malformed_row'])}",
                 existing=subject,
                 differs=differs,
             )
