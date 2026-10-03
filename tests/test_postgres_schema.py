@@ -15,6 +15,14 @@ from uuid import uuid4
 import psycopg
 import pytest
 
+from aox_agent_core.audit import (
+    GENESIS_HASH,
+    AuditEvent,
+    AuditRecord,
+    UnsealedAuditRecord,
+    compute_record_hash,
+)
+from aox_agent_core.audit.sql import SQLAuditLog
 from aox_agent_core.errors import ConfigError
 from aox_agent_core.storage import Grant, install_postgres_schema
 from databases import (
@@ -511,6 +519,22 @@ def test_tables_from_0_1_0a1_are_refused() -> None:
             )
 
 
+def a2_audit_record() -> AuditRecord:
+    unsealed = UnsealedAuditRecord(
+        schema_version=2,
+        seq=1,
+        event_id=uuid4(),
+        occurred_at=NOW,
+        action="model.call",
+        actor_id="svc-triage",
+        subject_id=None,
+        payload={},
+        run_context=None,
+        prev_hash=GENESIS_HASH,
+    )
+    return AuditRecord(**unsealed.model_dump(), record_hash=compute_record_hash(unsealed))
+
+
 def load_a2_schema(database: ControlDatabase) -> None:
     for statement in A2_SCHEMA.read_text().split(";\n\n"):
         body = "\n".join(
@@ -520,7 +544,7 @@ def load_a2_schema(database: ControlDatabase) -> None:
             database.raw(body.replace("APP_ROLE", LEGACY_APP_ROLE))
 
 
-def test_an_a2_schema_is_upgraded_in_place() -> None:
+async def test_an_a2_schema_is_upgraded_in_place() -> None:
     with postgres_database(install=False) as database:
         assert database.owner_url is not None
         assert database.legacy_raw is not None
@@ -535,10 +559,28 @@ def test_an_a2_schema_is_upgraded_in_place() -> None:
             f"'approve', 'user-17', '{stamp(NOW)}')"
         )
 
+        legacy_record = a2_audit_record()
+        database.legacy_raw(
+            "INSERT INTO agent_core_audit (seq, schema_version, event_id, occurred_at, action, "
+            "actor_id, subject_id, payload, run_context, prev_hash, record_hash) VALUES "
+            f"(1, 2, '{legacy_record.event_id}', '{stamp(legacy_record.occurred_at)}', "
+            f"'model.call', 'svc-triage', NULL, '{{}}', NULL, '{GENESIS_HASH}', "
+            f"'{legacy_record.record_hash}')"
+        )
+
         report = install_postgres_schema(
             database.owner_url, requester_role=REQUESTER_ROLE, approver_role=APPROVER_ROLE
         )
 
+        # The a2 record and a new one share one chain, each at its own version.
+        log = SQLAuditLog(database.database)
+        await log.append(AuditEvent(action="model.call", actor_id="svc-triage"))
+        records = [record async for record in log.iter_records()]
+        assert [(record.schema_version, record.db_role) for record in records] == [
+            (2, None),
+            (3, REQUESTER_ROLE),
+        ]
+        assert (await log.verify()).seq == 2
         assert status_of(database, legacy_id) == "approved"
         assert {grant.role for grant in report.outside_layout} == {LEGACY_APP_ROLE}
         assert (

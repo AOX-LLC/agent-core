@@ -14,7 +14,7 @@ import os
 import re
 import sqlite3
 from abc import ABC, abstractmethod
-from collections.abc import Callable, Iterator, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from enum import StrEnum
 from pathlib import Path
@@ -223,19 +223,52 @@ def table_columns(session: Session, table: str, *, schema: str | None = None) ->
     }
 
 
-def require_current_table(session: Session, table: str, column: str) -> None:
+def require_current_table(
+    session: Session, table: str, column: str, *, columns: set[str] | None = None
+) -> None:
     """Raise ConfigError if `table` exists but predates `column`, added in 0.1.0a2.
 
-    The library never alters an existing table, so a table made by 0.1.0a1 is
-    refused rather than migrated in place.
+    A table made by 0.1.0a1 is refused rather than migrated in place.
     """
-    columns = table_columns(session, table)
+    columns = columns if columns is not None else table_columns(session, table)
     if columns and column not in columns:
         raise ConfigError(
             f"Table {table} was created by agent-core 0.1.0a1 and has no {column} column; "
             "this version does not change existing tables. Keep that database, and check "
             "its records with 0.1.0a1, then point this version at a new database."
         )
+
+
+def bring_table_up_to_date(
+    session: Session,
+    table: str,
+    additions: Mapping[str, str],
+    *,
+    schema: str | None = None,
+) -> None:
+    """Refuse a 0.1.0a1 table; add the columns 0.1.0a3 added, or ask for the installer.
+
+    `additions` maps each column added in 0.1.0a3 to its SQLite type. On SQLite,
+    where the library owns its tables, missing columns are added in place. On
+    Postgres the application role cannot alter tables, so a missing column means
+    the schema predates 0.1.0a3 and the installer must upgrade it.
+    """
+    columns = table_columns(session, table, schema=schema)
+    if not columns:
+        return
+    require_current_table(session, table, "run_context", columns=columns)
+    missing = [column for column in additions if column not in columns]
+    if not missing:
+        return
+    if session.dialect is Dialect.POSTGRES:
+        raise ConfigError(
+            f"Table {table} was created by agent-core 0.1.0a2 and has no {', '.join(missing)} "
+            "column. As the owner role, run install_postgres_schema from 0.1.0a3 with the "
+            "requester and approver roles: it upgrades the schema in place and keeps every row."
+        )
+    for column in missing:
+        # Column names and types are the library's own constants.
+        session.execute(f"ALTER TABLE {table} ADD COLUMN {column} {additions[column]}")
 
 
 def driver_errors() -> tuple[type[Exception], ...]:

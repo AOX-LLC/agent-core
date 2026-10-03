@@ -36,7 +36,7 @@ from aox_agent_core.audit.types import (
 )
 from aox_agent_core.errors import AuditIntegrityError, AuditPayloadRejectedError, ConfigError
 from aox_agent_core.replay.scrub import PatternScrubber, Scrubber
-from aox_agent_core.storage import Database, Dialect, Session, require_current_table
+from aox_agent_core.storage import Database, Dialect, Session, bring_table_up_to_date
 
 AUDIT_TABLE: Final = "agent_core_audit"
 RUN_CONTEXT_COLUMN: Final = "run_context"
@@ -57,8 +57,10 @@ READ_BATCH_SIZE = 500
 
 COLUMNS = (
     "seq, schema_version, event_id, occurred_at, action, actor_id, subject_id, payload, "
-    "run_context, prev_hash, record_hash"
+    "run_context, prev_hash, record_hash, db_role"
 )
+# Columns added in 0.1.0a3, with their SQLite types.
+ADDED_IN_A3: Final = {"db_role": "TEXT"}
 
 _TABLE_DDL = f"""
 CREATE TABLE {AUDIT_TABLE} (
@@ -72,7 +74,8 @@ CREATE TABLE {AUDIT_TABLE} (
     payload TEXT NOT NULL,
     run_context TEXT,
     prev_hash TEXT NOT NULL,
-    record_hash TEXT NOT NULL
+    record_hash TEXT NOT NULL,
+    db_role TEXT
 )"""
 
 SQLITE_SCHEMA: Final = (
@@ -154,11 +157,14 @@ class SQLAuditLog:
             prev_hash=head.record_hash,
         )
         record = AuditRecord(**unsealed.model_dump(), record_hash=compute_record_hash(unsealed))
-        session.execute(
-            f"INSERT INTO {AUDIT_TABLE} ({COLUMNS}) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        # On Postgres the insert trigger sets db_role to the inserting role, whatever
+        # is sent; SQLite has no roles and leaves it empty.
+        rows = session.execute(
+            f"INSERT INTO {AUDIT_TABLE} ({COLUMNS}) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+            + (" RETURNING db_role" if session.dialect is Dialect.POSTGRES else ""),
             _row_values(record),
         )
-        return record
+        return record.model_copy(update={"db_role": rows[0][0]}) if rows else record
 
     async def iter_records(self, *, after_seq: int = 0) -> AsyncIterator[AuditRecord]:
         """Yield records with seq greater than after_seq, in order, read in batches."""
@@ -220,7 +226,7 @@ class SQLAuditLog:
         else:
             _check_postgres_role(session)
             _require_triggers(session, _postgres_triggers(session), POSTGRES_TRIGGERS)
-        require_current_table(session, AUDIT_TABLE, RUN_CONTEXT_COLUMN)
+        bring_table_up_to_date(session, AUDIT_TABLE, ADDED_IN_A3)
         self._protections_checked = True
 
 
@@ -362,7 +368,7 @@ def _rows_after(session: Session, after_seq: int, limit: int | None) -> list[tup
     # limit is formatted in, not bound, and int() keeps that safe.
     if not _table_is_readable(session):
         return []
-    require_current_table(session, AUDIT_TABLE, RUN_CONTEXT_COLUMN)
+    bring_table_up_to_date(session, AUDIT_TABLE, ADDED_IN_A3)
     limit_clause = f" LIMIT {int(limit)}" if limit is not None else ""
     return session.execute(
         f"SELECT {COLUMNS} FROM {AUDIT_TABLE} WHERE seq > ? ORDER BY seq{limit_clause}",
@@ -387,13 +393,14 @@ def _row_values(record: AuditRecord) -> tuple[Any, ...]:
         ),
         record.prev_hash,
         record.record_hash,
+        None,
     )
 
 
 def record_from_row(row: tuple[Any, ...]) -> AuditRecord:
     """Rebuild a record from a COLUMNS-ordered row; AuditIntegrityError if it is malformed."""
     seq, schema_version, event_id, occurred_at, action, actor_id, subject_id = row[:7]
-    payload, run_context, prev_hash, record_hash = row[7:]
+    payload, run_context, prev_hash, record_hash, db_role = row[7:]
     try:
         return AuditRecord.model_validate(
             {
@@ -408,6 +415,7 @@ def record_from_row(row: tuple[Any, ...]) -> AuditRecord:
                 "run_context": json.loads(run_context) if run_context is not None else None,
                 "prev_hash": prev_hash,
                 "record_hash": record_hash,
+                "db_role": db_role,
             },
             context={STORED_RECORD: True},
         )
