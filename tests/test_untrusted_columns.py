@@ -591,3 +591,78 @@ async def test_a_queue_refuses_a_requester_role_that_can_write_the_payload_colum
             required_role="ops.approver",
             ttl_seconds=60,
         )
+
+
+# A finish time the client writes cannot get a payload purged early: the guard writes it.
+
+
+def _finished_at(database: ControlDatabase, row: str, column: str) -> datetime:
+    value = database.raw(f"SELECT {column} FROM {APPROVALS} WHERE id = '{row}'")[0][0]
+    return datetime.fromisoformat(value)
+
+
+@pytest.mark.parametrize(
+    "claimed", [datetime(2000, 1, 1, tzinfo=UTC), datetime(2099, 1, 1, tzinfo=UTC)]
+)
+def test_a_cancel_or_close_is_stamped_by_the_database_whatever_the_client_wrote(
+    control_database: ControlDatabase, claimed: datetime
+) -> None:
+    if control_database.requester_raw is None or control_database.approver_raw is None:
+        pytest.skip("the guard trigger exists only on Postgres")
+    cancelled = str(uuid4())
+    control_database.requester_raw(
+        raw_request(id=quoted(cancelled), payload_json=quoted('{"a":1}'))
+    )
+    control_database.requester_raw(
+        f"UPDATE {APPROVALS} SET status = 'cancelled', closed_at = {stamp(claimed)} "
+        f"WHERE id = '{cancelled}'"
+    )
+
+    stored = _finished_at(control_database, cancelled, "closed_at")
+    assert abs(datetime.now(UTC) - stored) < timedelta(minutes=1)
+    # So the approver's purge, which waits out the floor, is refused.
+    assert refused(control_database.approver_raw, purge_sql(cancelled))
+
+
+def test_an_expiry_by_the_approver_is_stamped_by_the_database_too(
+    control_database: ControlDatabase,
+) -> None:
+    if control_database.approver_raw is None:
+        pytest.skip("the guard trigger exists only on Postgres")
+    lapsed = str(uuid4())
+    created = datetime.now(UTC) - timedelta(hours=3)
+    control_database.superuser_raw(
+        "SET session_replication_role = replica; "
+        + raw_request(
+            id=quoted(lapsed),
+            payload_json=quoted('{"a":1}'),
+            created_at=stamp(created),
+            expires_at=stamp(created + timedelta(hours=1)),
+        )
+    )
+
+    backdated = stamp(datetime(2000, 1, 1, tzinfo=UTC))
+    control_database.approver_raw(
+        f"UPDATE {APPROVALS} SET status = 'expired', closed_at = {backdated} WHERE id = '{lapsed}'"
+    )
+
+    assert abs(datetime.now(UTC) - _finished_at(control_database, lapsed, "closed_at")) < timedelta(
+        minutes=1
+    )
+    assert refused(control_database.approver_raw, purge_sql(lapsed))
+
+
+def test_a_consume_is_stamped_by_the_database_whatever_the_client_wrote(
+    control_database: ControlDatabase,
+) -> None:
+    if control_database.requester_raw is None or control_database.approver_raw is None:
+        pytest.skip("the guard trigger exists only on Postgres")
+    approved = payload_row(control_database, "approved")
+    control_database.requester_raw(
+        f"UPDATE {APPROVALS} SET status = 'consumed', "
+        f"consumed_at = {stamp(datetime(2000, 1, 1, tzinfo=UTC))} WHERE id = '{approved}'"
+    )
+
+    stored = _finished_at(control_database, approved, "consumed_at")
+    assert abs(datetime.now(UTC) - stored) < timedelta(minutes=1)
+    assert refused(control_database.approver_raw, purge_sql(approved))

@@ -9,6 +9,7 @@ The hierarchy is public API: consumers catch these classes, so a class is never
 renamed or moved to a different parent without a major version.
 """
 
+from typing import Any
 from uuid import UUID
 
 
@@ -158,6 +159,16 @@ class ApprovalConflictError(ApprovalError):
         super().__init__(message)
         self.existing = existing
         self.differs = differs
+
+    def __reduce__(self) -> tuple[Any, ...]:
+        return (_conflict_error, (self.args[0], self.existing, self.differs))
+
+
+def _conflict_error(
+    message: str, existing: UUID, differs: tuple[str, ...]
+) -> ApprovalConflictError:
+    """Rebuild an ApprovalConflictError, for pickling and copying."""
+    return ApprovalConflictError(message, existing=existing, differs=differs)
 
 
 class ApprovalPayloadRejectedError(ApprovalError):

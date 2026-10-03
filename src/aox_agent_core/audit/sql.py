@@ -266,18 +266,19 @@ class SQLAuditLog:
         For a caller that will append later in the same transaction and also changes other
         rows there: taking the lock first keeps the order (append lock, then rows) the same
         for everyone, which is what stops two such transactions from deadlocking. It is held
-        until the transaction ends, and waited for at most this log's lock_timeout. A no-op
+        until the transaction ends, and waited for at most this log's lock_timeout. That
+        setting stays for the rest of the transaction, so a wait for a row held by another
+        transaction is bounded too; use it only in a transaction the library owns. A no-op
         on SQLite, whose write transactions already exclude each other.
         """
         await self._ensure_protected(session)
         if session.dialect is Dialect.POSTGRES:
-            previous = await self._take_lock(session, self._lock_timeout)
-            await session.execute("SELECT set_config('lock_timeout', ?, true)", (previous,))
+            await self._take_lock(session, self._lock_timeout)
 
     async def _take_lock(self, session: Session, wait: str) -> str:
         """Take this schema's append lock, waiting at most `wait`; return the old setting."""
         previous = str((await session.execute("SELECT current_setting('lock_timeout')"))[0][0])
-        await session.execute(f"SET LOCAL lock_timeout = '{wait}'")
+        await session.execute("SELECT set_config('lock_timeout', ?, true)", (wait,))
         name = layout.audit_lock_name(self._table.schema or layout.DEFAULT_SCHEMA)
         try:
             await session.execute("SELECT pg_advisory_xact_lock(hashtextextended(?, 0))", (name,))

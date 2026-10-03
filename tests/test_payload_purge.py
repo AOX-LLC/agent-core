@@ -193,3 +193,60 @@ async def test_the_installed_floor_bounds_a_purge(control_database: ControlDatab
     assert (
         await queue.approver.purge_payloads(principal=SWEEPER, older_than=timedelta(hours=1)) == 1
     )
+
+
+def test_the_installer_gives_the_approver_the_purge_columns_once_not_on_every_run(
+    control_database: ControlDatabase,
+) -> None:
+    if control_database.owner_url is None:
+        pytest.skip("grants are Postgres")
+    can = (
+        "SELECT has_column_privilege('{role}', 'public.agent_core_approvals', "
+        "'payload_json', 'UPDATE')"
+    )
+    assert control_database.raw(can.format(role=APPROVER_ROLE)) == [(True,)]
+    assert control_database.raw(can.format(role=REQUESTER_ROLE)) == [(False,)]
+
+    # An operator who revoked the right (a legal hold, say) keeps it revoked on a re-run.
+    control_database.raw(
+        f"REVOKE UPDATE (payload_json, payload_purged_at) ON {APPROVALS} FROM {APPROVER_ROLE}"
+    )
+    install_postgres_schema(
+        control_database.owner_url, requester_role=REQUESTER_ROLE, approver_role=APPROVER_ROLE
+    )
+    assert control_database.raw(can.format(role=APPROVER_ROLE)) == [(False,)]
+
+
+async def test_a_library_transaction_does_not_wait_unbounded_for_a_row_either(
+    control_database: ControlDatabase,
+) -> None:
+    if control_database.requester_raw is None or control_database.owner_url is None:
+        pytest.skip("row locks held by another role are Postgres")
+    import time
+
+    import psycopg
+
+    from aox_agent_core.approvals import RoleApproverPolicy
+    from aox_agent_core.approvals.sql import SQLApprovalQueue
+    from databases import TEST_ACTION_ROLES
+
+    queue = split_queue(control_database)
+    request = await make(queue, 1)
+    log = SQLAuditLog(
+        control_database.approver_database,
+        schema=control_database.schema,
+        lock_timeout=timedelta(milliseconds=300),
+    )
+    approver = SQLApprovalQueue(
+        control_database.approver_database,
+        audit_log=log,
+        schema=control_database.schema,
+        policy=RoleApproverPolicy(roles_by_action=TEST_ACTION_ROLES),
+    )
+
+    with psycopg.connect(control_database.url) as holder:
+        holder.execute(f"SELECT 1 FROM {APPROVALS} WHERE id = '{request.id}' FOR UPDATE")
+        started = time.monotonic()
+        with pytest.raises(psycopg.errors.LockNotAvailable):
+            await approver.resolve(request.id, decision=Decision.APPROVE, principal=APPROVER)
+        assert time.monotonic() - started < 3

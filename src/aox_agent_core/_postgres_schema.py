@@ -25,9 +25,11 @@ only its own credentials cannot step outside them with plain SQL:
 One more change is allowed, to the stored payload alone: the approver role may purge
 it (payload_json to NULL, payload_purged_at set) on a finished request (consumed,
 rejected, cancelled or expired) whose finish time is further back than the installed
-retention floor by the database's clock. Every other change is refused, as are DELETE and
-TRUNCATE, and no update may touch a request's identity, payload hash, requester,
-required role, lifetime, run context or delegates.
+retention floor by the database's clock. The guard writes closed_at and consumed_at itself,
+from its own clock, whatever the statement carried, so a finish time cannot be backdated.
+Every other change is refused, as are DELETE and TRUNCATE, and no update may touch a
+request's identity, payload hash, requester, required role, lifetime, run context or
+delegates.
 """
 
 import re
@@ -62,6 +64,16 @@ APPROVALS_TABLE: Final = "agent_core_approvals"
 OPEN_REQUEST_INDEX: Final = "agent_core_approvals_one_open"
 OPEN_REQUEST_COLUMNS: Final = ("requested_by", "action", "payload_sha256")
 OPEN_REQUEST_STATUSES: Final = ("pending", "approved")
+# What purge_payloads scans for: finished requests that still hold a payload, by finish time.
+PURGEABLE_INDEX: Final = "agent_core_approvals_purgeable"
+FINISHED_AT_EXPRESSION: Final = (
+    "CASE status WHEN 'consumed' THEN consumed_at WHEN 'rejected' THEN resolved_at "
+    "ELSE closed_at END"
+)
+PURGEABLE_PREDICATE: Final = (
+    "status IN ('consumed', 'rejected', 'cancelled', 'expired') "
+    "AND payload_json IS NOT NULL AND payload_purged_at IS NULL"
+)
 ROLES_TABLE: Final = "agent_core_approval_roles"
 
 AUDIT_UPDATE_DELETE_TRIGGER: Final = "agent_core_audit_no_update_delete"
@@ -276,6 +288,8 @@ def approvals_tables_ddl(schema: str) -> tuple[str, ...]:
         f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS delegates TEXT NOT NULL DEFAULT '[]'",
         f"""CREATE INDEX IF NOT EXISTS agent_core_approvals_pending
         ON {table} (status, created_at, id)""",
+        f"""CREATE INDEX IF NOT EXISTS {PURGEABLE_INDEX}
+        ON {table} (({FINISHED_AT_EXPRESSION}), id) WHERE {PURGEABLE_PREDICATE}""",
         f"""CREATE TABLE IF NOT EXISTS {roles} (
             singleton BOOLEAN PRIMARY KEY DEFAULT TRUE CHECK (singleton),
             requester_role TEXT NOT NULL,
@@ -377,6 +391,10 @@ DECLARE
     is_expired boolean;
     is_purge boolean;
     finished_at text;
+    -- When a request is closed or used, the database writes the time itself: a client
+    -- cannot backdate it to slip under the payload retention floor, or future-date it.
+    db_stamp text := to_char(statement_timestamp() AT TIME ZONE 'UTC',
+                             'YYYY-MM-DD"T"HH24:MI:SS.US"Z"');
 BEGIN
     IF TG_OP IN ('DELETE', 'TRUNCATE') THEN
         RAISE EXCEPTION 'approval requests are never deleted';
@@ -547,6 +565,7 @@ BEGIN
               ROW(OLD.decision, OLD.resolved_by, OLD.resolved_at, OLD.reason, OLD.consumed_at) THEN
             RAISE EXCEPTION 'closing a request sets closed_at only';
         END IF;
+        NEW.closed_at := db_stamp;
         RETURN NEW;
     END IF;
 
@@ -563,6 +582,7 @@ BEGIN
               ROW(OLD.decision, OLD.resolved_by, OLD.resolved_at, OLD.reason, OLD.consumed_at) THEN
             RAISE EXCEPTION 'closing a request sets closed_at only';
         END IF;
+        NEW.closed_at := db_stamp;
         RETURN NEW;
     END IF;
 
@@ -583,6 +603,7 @@ BEGIN
               ROW(OLD.decision, OLD.resolved_by, OLD.resolved_at, OLD.reason, OLD.closed_at) THEN
             RAISE EXCEPTION 'consuming an approval sets consumed_at only';
         END IF;
+        NEW.consumed_at := db_stamp;
         RETURN NEW;
     END IF;
 

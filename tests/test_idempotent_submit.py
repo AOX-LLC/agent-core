@@ -16,6 +16,7 @@ from aox_agent_core.approvals import (
     Principal,
     PrincipalKind,
 )
+from aox_agent_core.approvals.sql import approval_payload_hash
 from aox_agent_core.audit.sql import SQLAuditLog
 from aox_agent_core.errors import ApprovalConflictError, ConfigError
 from aox_agent_core.storage import install_postgres_schema
@@ -395,3 +396,130 @@ async def test_sqlite_refuses_to_submit_over_duplicates_until_they_are_cancelled
     assert control_database.raw(
         f"SELECT 1 FROM sqlite_master WHERE name = '{layout.OPEN_REQUEST_INDEX}'"
     )
+
+
+# What a repeat may be handed back, and a planted row that cannot be used
+
+
+async def test_a_caller_that_asks_for_the_payload_to_be_stored_finds_it_stored(
+    control_database: ControlDatabase,
+) -> None:
+    queue = split_queue(control_database)
+    bare = await ask(queue)  # no payload stored
+
+    with pytest.raises(ApprovalConflictError) as raised:
+        await ask(queue, include_payload=True)
+    assert raised.value.differs == ("payload",)
+    assert (await queue.get(bare.id)).payload is None
+
+    await queue.cancel(bare.id, principal=REQUESTER)
+    stored = await ask(queue, include_payload=True)
+    # Asking for less than is stored is fine: the approver sees at least what was asked.
+    assert (await ask(queue)).id == stored.id
+
+
+async def test_a_row_planted_for_another_principal_cannot_stand_in_for_its_payload(
+    control_database: ControlDatabase,
+) -> None:
+    if control_database.requester_raw is None:
+        pytest.skip("a plain-SQL requester role exists only on Postgres")
+    queue = split_queue(control_database)
+    planted = uuid4()
+    moment = datetime.now(UTC)
+    control_database.requester_raw(
+        raw_request(
+            id=f"'{planted}'",
+            summary="'routine read-only sync'",
+            payload_sha256=f"'{approval_payload_hash(ACTION, PAYLOAD)}'",
+            created_at=f"'{_stamp(moment)}'",
+            expires_at=f"'{_stamp(moment + timedelta(seconds=3_600))}'",
+        )
+    )
+
+    with pytest.raises(ApprovalConflictError) as raised:
+        await ask(queue, include_payload=True, summary="Delete customer c-1")
+
+    assert (raised.value.existing, raised.value.differs) == (planted, ("payload",))
+
+
+async def test_a_planted_row_whose_payload_fails_its_hash_is_an_audited_refusal_not_a_lockout(
+    control_database: ControlDatabase,
+) -> None:
+    if control_database.requester_raw is None:
+        pytest.skip("a plain-SQL requester role exists only on Postgres")
+    queue = split_queue(control_database)
+    planted = uuid4()
+    control_database.requester_raw(
+        raw_request(
+            id=f"'{planted}'",
+            payload_json="'{\"a\": 1}'",
+            payload_sha256=f"'{approval_payload_hash(ACTION, PAYLOAD)}'",
+        )
+    )
+
+    with pytest.raises(ApprovalConflictError) as raised:
+        await ask(queue)
+    assert raised.value.existing == planted
+
+    records = [r async for r in SQLAuditLog(control_database.database).iter_records()]
+    assert [(r.action, r.subject_id, r.payload["reason"]) for r in records] == [
+        ("approval.submit_conflict", str(planted), "payload_integrity")
+    ]
+    await queue.cancel(planted, principal=REQUESTER)  # the id is on the error; cancel works
+    assert (await ask(queue)).id != planted
+
+
+async def test_a_planted_unreadable_row_that_has_lapsed_does_not_block_either(
+    control_database: ControlDatabase,
+) -> None:
+    if control_database.requester_raw is None:
+        pytest.skip("a plain-SQL requester role exists only on Postgres")
+    queue = split_queue(control_database)
+    created = datetime.now(UTC) - timedelta(hours=3)
+    planted = uuid4()
+    control_database.superuser_raw(
+        "SET session_replication_role = replica; "
+        + raw_request(
+            id=f"'{planted}'",
+            payload_json="'{\"a\": 1}'",
+            payload_sha256=f"'{approval_payload_hash(ACTION, PAYLOAD)}'",
+            created_at=f"'{_stamp(created)}'",
+            expires_at=f"'{_stamp(created + timedelta(hours=1))}'",
+        )
+    )
+
+    fresh = await ask(queue)
+
+    assert fresh.id != planted
+    stored = control_database.raw(f"SELECT status FROM {APPROVALS} WHERE id = '{planted}'")
+    assert stored == [("expired",)]
+
+
+def test_the_purge_scan_has_an_index_to_use(control_database: ControlDatabase) -> None:
+    if control_database.superuser_url is None:
+        pytest.skip("the plan is read on Postgres")
+    where = layout.PURGEABLE_PREDICATE
+    finished = layout.FINISHED_AT_EXPRESSION
+    with psycopg.connect(control_database.superuser_url) as connection:
+        connection.execute("SET enable_seqscan = off")  # a table this small would not use it
+        plan = connection.execute(
+            f"EXPLAIN SELECT id FROM {APPROVALS} WHERE {where} "
+            f"AND ({finished}) <= '2030-01-01T00:00:00.000000Z' ORDER BY ({finished}), id LIMIT 500"
+        ).fetchall()
+    assert layout.PURGEABLE_INDEX in str(plan)
+
+
+def test_errors_with_extra_fields_survive_pickling_and_copying() -> None:
+    import copy
+    import pickle
+
+    from aox_agent_core.errors import AuditLockTimeoutError
+
+    conflict = ApprovalConflictError("m", existing=uuid4(), differs=("lifetime",))
+    for clone in (pickle.loads(pickle.dumps(conflict)), copy.copy(conflict)):  # noqa: S301
+        assert (str(clone), clone.existing, clone.differs) == (
+            "m",
+            conflict.existing,
+            ("lifetime",),
+        )
+    assert str(pickle.loads(pickle.dumps(AuditLockTimeoutError("t")))) == "t"  # noqa: S301

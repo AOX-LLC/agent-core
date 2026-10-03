@@ -694,6 +694,7 @@ def install_postgres_schema(
         await _refuse_tables_from_0_1_0a1(session, schema)
         if not await session.execute("SELECT 1 FROM pg_namespace WHERE nspname = ?", (schema,)):
             await session.execute(f"CREATE SCHEMA {layout.identifier(schema, what='schema')}")
+        approvals_before = await table_columns(session, layout.APPROVALS_TABLE, schema=schema)
         for statement in (*layout.audit_ddl(schema), *layout.approvals_tables_ddl(schema)):
             await session.execute(statement)
         closed_duplicates = await _settle_open_duplicates(session, schema, close=close_duplicates)
@@ -737,12 +738,14 @@ def install_postgres_schema(
                     f"TO {layout.identifier(role, what='role')}"
                 )
         # A schema from before 0.1.0a5 already holds the approver's other grants, so the
-        # loop above skips it: the purge columns are added to it here.
-        await session.execute(
-            f"GRANT UPDATE ({', '.join(layout.PURGE_COLUMNS)}) ON "
-            f"{layout.identifier(schema, what='schema')}.{layout.APPROVALS_TABLE} "
-            f"TO {layout.identifier(approver_role, what='role')}"
-        )
+        # loop above skips it: the purge columns are added to it here, once. A later run
+        # does not give back what an operator revoked.
+        if approvals_before and "payload_purged_at" not in approvals_before:
+            await session.execute(
+                f"GRANT UPDATE ({', '.join(layout.PURGE_COLUMNS)}) ON "
+                f"{layout.identifier(schema, what='schema')}.{layout.APPROVALS_TABLE} "
+                f"TO {layout.identifier(approver_role, what='role')}"
+            )
         unaudited = await _unaudited_approvals(session, schema, approver_role)
         if close_unaudited_approvals and unaudited:
             await _refuse_closing_without_local_audit(session, schema, approver_role)

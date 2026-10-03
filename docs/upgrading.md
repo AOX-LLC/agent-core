@@ -26,7 +26,7 @@ Everything below was taken from the 0.1.0a5 change set. Where this page says "no
    print(report)
    ```
 
-   Both new keywords are shown at their defaults. The installer changes, in one run: it adds the column `approvals.payload_purged_at`; builds the unique index `agent_core_approvals_one_open`; replaces the approvals guard function (`approved -> expired`, the purge rule, the delegate rule, the `resolved_at` bound, the free-text rule, the revision comment and the floor comment); replaces the audit insert trigger (schema-keyed lock, revision comment); and grants the approver role column UPDATE on `payload_json` and `payload_purged_at`.
+   Both new keywords are shown at their defaults. The installer changes, in one run: it adds the column `approvals.payload_purged_at`; builds the unique index `agent_core_approvals_one_open` and the purge index `agent_core_approvals_purgeable`; replaces the approvals guard function (`approved -> expired`, the database stamping `closed_at` and `consumed_at` itself, the purge rule, the delegate rule, the `resolved_at` bound, the free-text rule, the revision comment and the floor comment); replaces the audit insert trigger (schema-keyed lock, revision comment); and grants the approver role column UPDATE on `payload_json` and `payload_purged_at`.
 
 2. **A refused a4 schema.** An a5 queue or audit log refuses an a4 schema with a `ConfigError` before it writes anything. The insert trigger carries `-- agent-core audit trigger revision 5` and the guard `-- agent-core guard revision 5`; a connection that finds an older one tells the operator to run `install_postgres_schema` from 0.1.0a5 again. So run the installer before the first a5 process connects.
 
@@ -36,7 +36,7 @@ Everything below was taken from the 0.1.0a5 change set. Where this page says "no
 
 5. **`payload_retention_floor`.** The shortest `older_than` the database accepts for a purge. The default is 24 hours. It is written into the guard as `-- agent-core payload retention floor <n> seconds`, so changing it means running the installer again with the new value. The library raises `ValueError` for an `older_than` shorter than the floor. SQLite has no floor.
 
-6. **Purging needs the approver role.** The approver role gets column UPDATE on `(payload_json, payload_purged_at)`; the installer adds the grant on upgrade. The requester role must not have that grant, and a connect check refuses a requester role that does. Whatever runs `purge_payloads` therefore connects as the approver role. See the project 04 section for the schedule.
+6. **Purging needs the approver role.** The approver role gets column UPDATE on `(payload_json, payload_purged_at)`; the installer adds the grant once, when it upgrades a schema that predates the column, and a later run does not give back what you revoked. The requester role must not have that grant, and a connect check refuses a requester role that does. Whatever runs `purge_payloads` therefore connects as the approver role. See the project 04 section for the schedule.
 
 7. **SQLite needs nothing from you.** A file is upgraded in place on first use: the `payload_purged_at` column is added and the unique index is built. While the file holds duplicate open requests the library refuses, with a `ConfigError` that lists the ids, at the first submit. `cancel()` and reads still work, so the extras can be cancelled and the submit retried.
 

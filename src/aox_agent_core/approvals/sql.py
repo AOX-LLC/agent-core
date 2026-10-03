@@ -132,10 +132,7 @@ DELEGATES_COLUMN: Final = "delegates"
 PAYLOAD_COLUMN: Final = "payload_json"
 _FINISHED_STATUSES: Final = ("consumed", "rejected", "cancelled", "expired")
 # When a finished request finished: consumed, decided (rejected) or closed (cancelled, expired).
-_FINISHED_AT: Final = (
-    "CASE status WHEN 'consumed' THEN consumed_at WHEN 'rejected' THEN resolved_at "
-    "ELSE closed_at END"
-)
+_FINISHED_AT: Final = layout.FINISHED_AT_EXPRESSION
 _CANONICAL_STAMP: Final = r"'^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:]{8}[.][0-9]{6}Z$'"
 # Seconds an independent audit write waits for the append lock before falling back.
 DENIAL_LOCK_TIMEOUT: Final = "2s"
@@ -330,16 +327,33 @@ class SQLApprovalQueue:
                 )
                 if inserted == 1:
                     return _Outcome(request=request, events=[*events, _requested_event(request)])
-                existing = await _load_open(session, self._table, request, self._scrubber)
-                if existing is None:
+                row = await _open_row(session, self._table, request)
+                if row is None:
                     continue  # closed since the insert met it: look again
+                try:
+                    existing, payload_text = _parse_row(row)
+                except _StoredRowError as stored:
+                    return _refused_repeat(
+                        stored, row[0], requested_by.id, context, ("row",), stored.reason, events
+                    )
                 if await _is_due(session, self._table, existing, now):
-                    expired = await self._expire_lapsed(session, existing, requested_by.id, now)
-                    events += expired
+                    events += await self._expire_lapsed(session, existing, requested_by.id, now)
                     continue
-                differs = _terms_that_differ(existing, request)
+                try:
+                    existing = _with_payload(existing, payload_text, self._scrubber)
+                except _StoredRowError as stored:
+                    return _refused_repeat(
+                        stored,
+                        row[0],
+                        requested_by.id,
+                        context,
+                        ("payload",),
+                        stored.reason,
+                        events,
+                    )
+                differs = _terms_that_differ(existing, request, wants_payload=include_payload)
                 if differs:
-                    refusal = _denied(
+                    return _refused_repeat(
                         ApprovalConflictError(
                             f"Request {existing.id} is already open for this requester, action "
                             f"and payload, with a different {', '.join(differs)}. Cancel it, or "
@@ -347,16 +361,13 @@ class SQLApprovalQueue:
                             existing=existing.id,
                             differs=differs,
                         ),
-                        _event(
-                            "approval.submit_conflict",
-                            requested_by.id,
-                            existing,
-                            context,
-                            differs=",".join(differs),
-                        ),
+                        str(existing.id),
+                        requested_by.id,
+                        context,
+                        differs,
+                        "conflict",
+                        events,
                     )
-                    refusal.events = [*events, *refusal.events]
-                    return refusal
                 return _Outcome(request=existing, events=events)
             raise ApprovalError(
                 "Could not queue the request: the open request for this requester, action and "
@@ -388,9 +399,12 @@ class SQLApprovalQueue:
     ) -> list[AuditEvent]:
         """Store EXPIRED on an open request past its lifetime; its audit events (none if
         another transaction closed it first)."""
-        if not await _close(session, self._table, existing, ApprovalStatus.EXPIRED, now):
+        closed_at = await _close(session, self._table, existing, ApprovalStatus.EXPIRED, now)
+        if closed_at is None:
             return []
-        expired = existing.model_copy(update={"status": ApprovalStatus.EXPIRED, "closed_at": now})
+        expired = existing.model_copy(
+            update={"status": ApprovalStatus.EXPIRED, "closed_at": closed_at}
+        )
         return [_expired_event(actor_id, expired, existing.status, existing.run_context)]
 
     async def get(self, request_id: UUID, *, connection: Any = None) -> ApprovalRequest:
@@ -685,13 +699,9 @@ class SQLApprovalQueue:
                     ),
                 )
 
-            consumed = ApprovalRequest.model_validate(
-                {**request.model_dump(), "status": ApprovalStatus.CONSUMED, "consumed_at": now},
-                context={STORED_RECORD: True},
-            )
-            changed = await session.execute_count(
+            rows = await session.execute(
                 f"UPDATE {self._table.sql} SET status = ?, consumed_at = ? "
-                "WHERE id = ? AND status = ?",
+                "WHERE id = ? AND status = ? RETURNING consumed_at",
                 (
                     ApprovalStatus.CONSUMED.value,
                     canonical_timestamp(now),
@@ -699,7 +709,7 @@ class SQLApprovalQueue:
                     ApprovalStatus.APPROVED.value,
                 ),
             )
-            if changed != 1:
+            if not rows:
                 return _denied(
                     ApprovalAlreadyResolvedError(f"Request {request_id} was used meanwhile."),
                     _event(
@@ -710,6 +720,15 @@ class SQLApprovalQueue:
                         reason="not_open",
                     ),
                 )
+            # The time as stored: on Postgres the database's own stamp, not `now`.
+            consumed = ApprovalRequest.model_validate(
+                {
+                    **request.model_dump(),
+                    "status": ApprovalStatus.CONSUMED,
+                    "consumed_at": datetime.fromisoformat(rows[0][0]),
+                },
+                context={STORED_RECORD: True},
+            )
             event = _event("approval.consumed", principal.id, consumed, event_context)
             return _Outcome(request=consumed, events=[event])
 
@@ -771,10 +790,8 @@ class SQLApprovalQueue:
                         reason=denial,
                     ),
                 )
-            cancelled = request.model_copy(
-                update={"status": ApprovalStatus.CANCELLED, "closed_at": now}
-            )
-            if not await _close(session, self._table, request, ApprovalStatus.CANCELLED, now):
+            closed_at = await _close(session, self._table, request, ApprovalStatus.CANCELLED, now)
+            if closed_at is None:
                 return _denied(
                     ApprovalAlreadyResolvedError(f"Request {request_id} was resolved meanwhile."),
                     _event(
@@ -785,6 +802,9 @@ class SQLApprovalQueue:
                         reason=DenialReason.NOT_PENDING.value,
                     ),
                 )
+            cancelled = request.model_copy(
+                update={"status": ApprovalStatus.CANCELLED, "closed_at": closed_at}
+            )
             event = _event("approval.cancelled", principal.id, cancelled, event_context, **details)
             return _Outcome(request=cancelled, events=[event])
 
@@ -818,6 +838,8 @@ class SQLApprovalQueue:
             if not await _table_exists(session, self._table):
                 return _Outcome()
             due, rows_read, unreadable = await _load_due(session, self._table, moment, limit)
+            if due:
+                await self._lock_after_reading(session, connection)
             if unreadable:
                 _LOG.warning(
                     "%d due approval request(s) are stored in a form this library will not read "
@@ -827,9 +849,12 @@ class SQLApprovalQueue:
                 )
             events = []
             for request in due:
-                if await _close(session, self._table, request, ApprovalStatus.EXPIRED, moment):
+                closed_at = await _close(
+                    session, self._table, request, ApprovalStatus.EXPIRED, moment
+                )
+                if closed_at is not None:
                     expired = request.model_copy(
-                        update={"status": ApprovalStatus.EXPIRED, "closed_at": moment}
+                        update={"status": ApprovalStatus.EXPIRED, "closed_at": closed_at}
                     )
                     # The sweep belongs to no run; the event carries the request's own.
                     events.append(
@@ -842,7 +867,9 @@ class SQLApprovalQueue:
 
         total = 0
         while True:
-            outcome = await self._write_outcome(sweep, connection=connection, stored_context=True)
+            outcome = await self._write_outcome(
+                sweep, connection=connection, stored_context=True, lock_first=False
+            )
             total += outcome.expired
             if not outcome.batch_full:
                 return total
@@ -900,6 +927,8 @@ class SQLApprovalQueue:
                     len(unreadable),
                     unreadable[0],
                 )
+            if candidates:
+                await self._lock_after_reading(session, connection)
             events = []
             for request in candidates:
                 changed = await session.execute_count(
@@ -925,10 +954,27 @@ class SQLApprovalQueue:
 
         total = 0
         while True:
-            outcome = await self._write_outcome(sweep, connection=connection, stored_context=True)
+            outcome = await self._write_outcome(
+                sweep, connection=connection, stored_context=True, lock_first=False
+            )
             total += outcome.purged
             if not outcome.batch_full:
                 return total
+
+    async def _lock_after_reading(self, session: Session, connection: Any) -> None:
+        """Take the audit append lock now, in a sweep that read its candidates first.
+
+        A sweep scans before it changes anything, so it holds the schema-wide lock only for
+        its writes, not for the scan. The order is still lock, then rows (see
+        _write_outcome). A host's `connection` is never locked early.
+        """
+        log = self._audit_log
+        if (
+            connection is None
+            and isinstance(log, SQLAuditLog)
+            and log.database.same_database(self.database)
+        ):
+            await log.lock_in(session)
 
     async def _write(
         self,
@@ -953,6 +999,7 @@ class SQLApprovalQueue:
         *,
         connection: Any = None,
         stored_context: bool = False,
+        lock_first: bool = True,
     ) -> _Outcome:
         """Run `work` in a write transaction and audit its events.
 
@@ -988,7 +1035,7 @@ class SQLApprovalQueue:
             )
 
         async def in_transaction(session: Session) -> _Outcome:
-            if connection is None and checked_log is not None and shares_database:
+            if lock_first and connection is None and checked_log is not None and shares_database:
                 # Append lock first, then the request's row: a host that appended before it
                 # changes a request takes them in that order, so no pair of transactions
                 # can wait for each other (Postgres would abort one with 40P01).
@@ -1178,14 +1225,16 @@ async def _close(
     request: ApprovalRequest,
     status: ApprovalStatus,
     now: datetime,
-) -> bool:
+) -> datetime | None:
     """Move a request from its stored status to `status` (cancelled, or expired for an
-    approval that lapsed too); False if it moved meanwhile."""
-    changed = await session.execute_count(
-        f"UPDATE {table.sql} SET status = ?, closed_at = ? WHERE id = ? AND status = ?",
+    approval that lapsed too). Returns the closed_at that was stored, which on Postgres is
+    the database's own stamp and not `now`; None if the request moved meanwhile."""
+    rows = await session.execute(
+        f"UPDATE {table.sql} SET status = ?, closed_at = ? WHERE id = ? AND status = ? "
+        "RETURNING closed_at",
         (status.value, canonical_timestamp(now), str(request.id), request.status.value),
     )
-    return changed == 1
+    return datetime.fromisoformat(rows[0][0]) if rows else None
 
 
 # The database's clock as a canonical timestamp, so the sweep picks only what the
@@ -1261,20 +1310,48 @@ async def _load_purgeable(
     return readable, len(rows), unreadable
 
 
-async def _load_open(
-    session: Session, table: TableName, request: ApprovalRequest, scrubber: Scrubber
-) -> ApprovalRequest | None:
-    """The open request (pending or approved) holding this requester, action and payload hash,
-    with its stored payload checked, or None if there is none."""
+async def _open_row(
+    session: Session, table: TableName, request: ApprovalRequest
+) -> tuple[Any, ...] | None:
+    """The row of the open request (pending or approved) holding this requester, action and
+    payload hash, unparsed, or None if there is none."""
     rows = await session.execute(
         f"SELECT {_COLUMNS} FROM {table.sql} WHERE requested_by = ? AND action = ? "
         f"AND payload_sha256 = ? AND status IN ({_OPEN_STATUS_LIST})",
         (request.requested_by, request.action, request.payload_sha256),
     )
-    if not rows:
-        return None
-    existing, payload_text = _parse_row(rows[0])
-    return _with_payload(existing, payload_text, scrubber)
+    return rows[0] if rows else None
+
+
+def _refused_repeat(
+    error: ApprovalError,
+    existing_id: str,
+    actor_id: str,
+    context: RunContext | None,
+    differs: tuple[str, ...],
+    reason: str,
+    earlier_events: list[AuditEvent],
+) -> _Outcome:
+    """A repeat submit refused: the open request has other terms, or cannot be read or shown.
+
+    Audited as approval.submit_conflict naming the open request, so a requester that finds
+    itself locked out has a record and an id to cancel. Events already made in this
+    transaction (a lapsed request it expired) are kept.
+    """
+    if not isinstance(error, ApprovalConflictError):
+        error = ApprovalConflictError(
+            f"Request {existing_id} is already open for this requester, action and payload, "
+            f"and cannot be used ({reason}). Cancel it, then submit again.",
+            existing=UUID(existing_id),
+            differs=differs,
+        )
+    event = _missing_event(
+        "approval.submit_conflict", actor_id, UUID(existing_id), context, reason=reason
+    )
+    event = event.model_copy(update={"payload": {**event.payload, "differs": ",".join(differs)}})
+    refusal = _denied(error, event)
+    refusal.events = [*earlier_events, *refusal.events]
+    return refusal
 
 
 async def _is_due(
@@ -1291,16 +1368,23 @@ async def _is_due(
     return bool(rows)
 
 
-def _terms_that_differ(existing: ApprovalRequest, asked: ApprovalRequest) -> tuple[str, ...]:
-    """What a repeat submit asks for that the open request does not have."""
+def _terms_that_differ(
+    existing: ApprovalRequest, asked: ApprovalRequest, *, wants_payload: bool
+) -> tuple[str, ...]:
+    """What a repeat submit asks for that the open request does not have.
+
+    A caller that asks for the payload to be stored (include_payload) must find that very
+    payload stored: otherwise the approver would be shown something else.
+    """
+    lifetime_differs = (
+        existing.expires_at - existing.created_at != asked.expires_at - asked.created_at
+    )
     return tuple(
         name
         for name, differs in (
             ("delegates", existing.delegates != asked.delegates),
-            (
-                "lifetime",
-                existing.expires_at - existing.created_at != asked.expires_at - asked.created_at,
-            ),
+            ("lifetime", lifetime_differs),
+            ("payload", wants_payload and existing.payload != asked.payload),
             ("required_role", existing.required_role != asked.required_role),
         )
         if differs
@@ -1390,6 +1474,10 @@ async def _ensure_table(session: Session) -> None:
             _PENDING_INDEX_DDL.replace("CREATE INDEX", "CREATE INDEX IF NOT EXISTS", 1)
         )
         await _ensure_open_index(session)
+        await session.execute(
+            f"CREATE INDEX IF NOT EXISTS {layout.PURGEABLE_INDEX} ON {APPROVALS_TABLE} "
+            f"(({layout.FINISHED_AT_EXPRESSION}), id) WHERE {layout.PURGEABLE_PREDICATE}"
+        )
 
 
 async def _ensure_open_index(session: Session) -> None:
@@ -1404,15 +1492,16 @@ async def _ensure_open_index(session: Session) -> None:
     ):
         return
     groups = await session.execute(
-        f"SELECT group_concat(id, ', ') FROM {APPROVALS_TABLE} "
+        f"SELECT group_concat(id || ' (' || status || ')', ', ') FROM {APPROVALS_TABLE} "
         f"WHERE status IN ({_OPEN_STATUS_LIST}) "
         f"GROUP BY {', '.join(layout.OPEN_REQUEST_COLUMNS)} HAVING count(*) > 1 LIMIT 10"
     )
     if groups:
         raise ConfigError(
             "Open approval requests share a requester, action and payload, which a unique "
-            f"index now forbids: {'; '.join(row[0] for row in groups)}. Cancel the extra "
-            "ones with cancel(), then submit again."
+            f"index now forbids: {'; '.join(row[0] for row in groups)}. Until only one of "
+            "each group is open, no request can be submitted: cancel the extra pending ones "
+            "with cancel(), consume the approved ones, or let them lapse and run expire_due()."
         )
     await session.execute(_OPEN_INDEX_DDL)
 
