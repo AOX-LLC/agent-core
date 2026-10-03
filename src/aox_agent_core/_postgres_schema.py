@@ -189,8 +189,10 @@ def approvals_guard_ddl(schema: str, requester_role: str, approver_role: str) ->
     # identifier() admits only [a-z0-9_], so the names are safe inside quotes.
     identifier(requester_role, what="role")
     identifier(approver_role, what="role")
-    guard_body = _GUARD_BODY.replace("'<requester>'", f"'{requester_role}'").replace(
-        "'<approver>'", f"'{approver_role}'"
+    guard_body = _with_timestamp_checks(
+        _GUARD_BODY.replace("'<requester>'", f"'{requester_role}'").replace(
+            "'<approver>'", f"'{approver_role}'"
+        )
     )
     return (
         f"""CREATE OR REPLACE FUNCTION {quoted_schema}.{APPROVALS_TABLE}_guard()
@@ -205,6 +207,24 @@ def approvals_guard_ddl(schema: str, requester_role: str, approver_role: str) ->
     )
 
 
+def _with_timestamp_checks(body: str) -> str:
+    """Expand NOT_CANONICAL(x): true unless x is exactly a timestamp the library writes.
+
+    The pattern alone admits values Postgres normalizes (24:00, a leap second,
+    30 February cast to a later day) that the library cannot read back, so the
+    value must also survive a round trip through timestamptz unchanged. A value
+    that does not cast at all raises, which refuses the statement too.
+    """
+    return re.sub(
+        r"NOT_CANONICAL\(([A-Za-z_.]+)\)",
+        lambda match: (
+            f"({match[1]} !~ timestamp_shape OR to_char(({match[1]})::timestamptz "
+            f"AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') <> {match[1]})"
+        ),
+        body,
+    )
+
+
 # The guard carries the installed role names as literals. A role counts as the
 # requester only if neither current_user nor session_user can act as the
 # approver, and the other way round, so SET ROLE cannot cross sides. A superuser
@@ -215,7 +235,8 @@ DECLARE
     approver_role text := '<approver>';
     -- The shapes the library writes; rows of any other shape are refused, so
     -- casts never depend on session settings and every row parses on read.
-    timestamp_shape text := '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}[.][0-9]{6}Z$';
+    timestamp_shape text :=
+        '^[0-9]{4}-[0-9]{2}-[0-9]{2}T([01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9][.][0-9]{6}Z$';
     principal_shape text := '^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$';
     opaque_shape text := '^[A-Za-z0-9][A-Za-z0-9._:/-]{0,199}$';
     run_context jsonb;
@@ -245,8 +266,8 @@ BEGIN
            OR NEW.payload_sha256 !~ '^[0-9a-f]{64}$'
            OR NEW.requested_by !~ principal_shape
            OR NEW.required_role !~ '^[a-z][a-z0-9_.-]{0,63}$'
-           OR NEW.created_at !~ timestamp_shape
-           OR NEW.expires_at !~ timestamp_shape THEN
+           OR NOT_CANONICAL(NEW.created_at)
+           OR NOT_CANONICAL(NEW.expires_at) THEN
             RAISE EXCEPTION 'a new approval request has a field of the wrong shape';
         END IF;
         IF jsonb_typeof(NEW.delegates::jsonb) <> 'array'
@@ -310,7 +331,7 @@ BEGIN
                (CASE NEW.status WHEN 'approved' THEN 'approve' ELSE 'reject' END)
            OR NEW.resolved_by IS NULL OR NEW.resolved_by = OLD.requested_by
            OR NEW.resolved_by !~ principal_shape
-           OR NEW.resolved_at IS NULL OR NEW.resolved_at !~ timestamp_shape
+           OR NEW.resolved_at IS NULL OR NOT_CANONICAL(NEW.resolved_at)
            OR (NEW.reason IS NOT NULL AND length(NEW.reason) NOT BETWEEN 1 AND 500)
            OR NEW.consumed_at IS DISTINCT FROM OLD.consumed_at
            OR NEW.closed_at IS DISTINCT FROM OLD.closed_at THEN
@@ -329,7 +350,7 @@ BEGIN
         IF NEW.status = 'expired' AND NOT is_expired THEN
             RAISE EXCEPTION 'approval request % has not expired yet', OLD.id;
         END IF;
-        IF NEW.closed_at IS NULL OR NEW.closed_at !~ timestamp_shape
+        IF NEW.closed_at IS NULL OR NOT_CANONICAL(NEW.closed_at)
            OR ROW(NEW.decision, NEW.resolved_by, NEW.resolved_at, NEW.reason, NEW.consumed_at)
               IS DISTINCT FROM
               ROW(OLD.decision, OLD.resolved_by, OLD.resolved_at, OLD.reason, OLD.consumed_at) THEN
@@ -345,7 +366,7 @@ BEGIN
         IF is_expired THEN
             RAISE EXCEPTION 'approval request % has expired', OLD.id;
         END IF;
-        IF NEW.consumed_at IS NULL OR NEW.consumed_at !~ timestamp_shape
+        IF NEW.consumed_at IS NULL OR NOT_CANONICAL(NEW.consumed_at)
            OR ROW(NEW.decision, NEW.resolved_by, NEW.resolved_at, NEW.reason, NEW.closed_at)
               IS DISTINCT FROM
               ROW(OLD.decision, OLD.resolved_by, OLD.resolved_at, OLD.reason, OLD.closed_at) THEN

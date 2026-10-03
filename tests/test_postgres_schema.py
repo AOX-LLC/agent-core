@@ -642,6 +642,9 @@ def insert_sql(**overrides: str) -> str:
         {"run_context": '\'{"run_id": "r1", "extra": 1}\''},
         {"run_context": '\'{"run_id": "r1", "external_ids": {"Bad": "x"}}\''},
         {"run_context": "'[1]'"},
+        {"expires_at": f"'{(NOW + timedelta(days=1)):%Y-%m-%d}T24:00:00.000000Z'"},
+        {"expires_at": f"'{(NOW + timedelta(days=1)):%Y-%m-%d}T23:59:60.000000Z'"},
+        {"expires_at": f"'{NOW.year + 1}-02-30T00:00:00.000000Z'"},
     ],
     ids=[
         "created-at-local-time",
@@ -658,6 +661,9 @@ def insert_sql(**overrides: str) -> str:
         "run-context-extra-key",
         "run-context-id-name",
         "run-context-array",
+        "hour-24",
+        "leap-second",
+        "february-30",
     ],
 )
 def test_the_guard_refuses_rows_of_the_wrong_shape(
@@ -686,8 +692,9 @@ def test_a_session_time_zone_cannot_stretch_a_lifetime(pg: ControlDatabase) -> N
         "resolved_at = '2026-10-02 12:00:00'",
         "resolved_by = 'jane@example.com', resolved_at = '{now}'",
         "reason = '', resolved_at = '{now}'",
+        "resolved_at = '{day}T24:00:00.000000Z'",
     ],
-    ids=["resolved-at", "resolved-by", "empty-reason"],
+    ids=["resolved-at", "resolved-by", "empty-reason", "resolved-at-hour-24"],
 )
 def test_a_decision_of_the_wrong_shape_is_refused(pg: ControlDatabase, assignments: str) -> None:
     assert pg.approver_raw is not None
@@ -695,7 +702,7 @@ def test_a_decision_of_the_wrong_shape_is_refused(pg: ControlDatabase, assignmen
     sql = (
         "UPDATE agent_core_approvals SET status = 'approved', decision = 'approve', "
         + ("resolved_by = 'user-17', " if "resolved_by" not in assignments else "")
-        + assignments.format(now=stamp(NOW))
+        + assignments.format(now=stamp(NOW), day=f"{NOW:%Y-%m-%d}")
         + f" WHERE id = '{request_id}'"
     )
 
