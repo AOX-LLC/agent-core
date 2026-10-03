@@ -28,6 +28,7 @@ from aox_agent_core.errors import (
     ApprovalNotGrantedError,
     ApprovalPayloadMismatchError,
     NotAuthorizedToResolveError,
+    NotTheRequesterError,
 )
 from aox_agent_core.storage import open_database
 from databases import ControlDatabase, SplitQueue, split_queue, sqlite_database
@@ -309,10 +310,42 @@ def test_role_policy_checks_in_order(
     assert verdict.allowed is (reason is None)
 
 
-async def test_consume_names_the_principal_who_acted(control_database: ControlDatabase) -> None:
+async def test_only_the_requester_may_consume_by_default(
+    control_database: ControlDatabase,
+) -> None:
     executor = Principal(id="svc-crm-writer", kind=PrincipalKind.SERVICE)
     queue = queue_for(control_database)
     request = await submitted(queue)
+    await queue.resolve(request.id, decision=Decision.APPROVE, principal=APPROVER)
+
+    with pytest.raises(NotTheRequesterError, match="only they or a delegate"):
+        await queue.consume(
+            request.id, action="crm.update_contact", payload=PAYLOAD, principal=executor
+        )
+
+    assert (await queue.get(request.id)).status is ApprovalStatus.APPROVED
+    assert (await audit_actions(control_database))[-1] == (
+        "approval.consume_denied",
+        "svc-crm-writer",
+        "not_requester",
+    )
+
+
+async def test_a_named_delegate_may_consume_and_is_audited(
+    control_database: ControlDatabase,
+) -> None:
+    executor = Principal(id="svc-crm-writer", kind=PrincipalKind.SERVICE)
+    queue = queue_for(control_database)
+    request = await queue.submit(
+        action="crm.update_contact",
+        summary="Update the sample contact's phone number",
+        payload=PAYLOAD,
+        requested_by=REQUESTER,
+        required_role="ops.approver",
+        ttl_seconds=3_600,
+        delegates={"svc-crm-writer"},
+    )
+    (listed,) = await queue.list_pending(APPROVER)
     await queue.resolve(request.id, decision=Decision.APPROVE, principal=APPROVER)
 
     with pytest.raises(ApprovalPayloadMismatchError):
@@ -321,10 +354,13 @@ async def test_consume_names_the_principal_who_acted(control_database: ControlDa
         request.id, action="crm.update_contact", payload=PAYLOAD, principal=executor
     )
 
+    assert listed.delegates == frozenset({"svc-crm-writer"})
     assert [(action, actor) for action, actor, _ in await audit_actions(control_database)][-2:] == [
         ("approval.consume_denied", "svc-crm-writer"),
         ("approval.consumed", "svc-crm-writer"),
     ]
+    records = [record async for record in SQLAuditLog(control_database.database).iter_records()]
+    assert records[0].payload["delegates"] == ["svc-crm-writer"]
 
 
 async def test_separate_objects_for_one_database_share_the_transaction(

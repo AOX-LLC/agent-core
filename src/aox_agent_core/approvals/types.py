@@ -15,6 +15,7 @@ RoleName = Annotated[str, StringConstraints(pattern=r"^[a-z][a-z0-9_.-]{0,63}$")
 ShortText = Annotated[str, StringConstraints(min_length=1, max_length=500)]
 
 TTL_SECONDS_MAX = 7 * 24 * 60 * 60
+MAX_DELEGATES = 16
 
 
 class PrincipalKind(StrEnum):
@@ -93,6 +94,10 @@ class ApprovalRequest(FrozenModel):
     never authorize a different action that happens to share its payload.
     An approval authorizes a single run: using it moves it to CONSUMED.
     run_context is the run that asked for the approval, if the caller named one.
+
+    Only requested_by may consume it, unless it names delegates: principals the
+    requester allowed to consume in its place, fixed when it is submitted and
+    shown to whoever decides it.
     """
 
     id: UUID
@@ -110,6 +115,13 @@ class ApprovalRequest(FrozenModel):
     consumed_at: AwareDatetime | None = None
     reason: ShortText | None = None
     run_context: RunContext | None = None
+    delegates: frozenset[PrincipalId] = frozenset()
+
+    @model_validator(mode="after")
+    def _few_delegates(self) -> Self:
+        if len(self.delegates) > MAX_DELEGATES:
+            raise ValueError(f"at most {MAX_DELEGATES} delegates")
+        return self
 
     @model_validator(mode="after")
     def _lifetime_is_bounded(self) -> Self:
@@ -150,6 +162,7 @@ class DenialReason(StrEnum):
     MISSING_ROLE = "missing_role"
     SELF_APPROVAL = "self_approval"
     NOT_PENDING = "not_pending"
+    NOT_REQUESTER = "not_requester"
     EXPIRED = "expired"
 
 

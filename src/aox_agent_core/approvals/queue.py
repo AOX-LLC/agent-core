@@ -1,6 +1,6 @@
 """The approval queue: submit, resolve, and check before acting."""
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Collection, Mapping, Sequence
 from typing import Protocol
 from uuid import UUID
 
@@ -30,11 +30,13 @@ class ApprovalQueue(Protocol):
         requested_by: Principal,
         required_role: str,
         ttl_seconds: int,
+        delegates: Collection[str] = (),
         context: RunContext | None = None,
     ) -> ApprovalRequest:
         """Queue a request that expires after ttl_seconds (at most TTL_SECONDS_MAX).
 
-        The payload's hash is stored; the payload itself is not.
+        The payload's hash is stored; the payload itself is not. Only the
+        requester may consume the approval, unless `delegates` names others.
         """
         ...
 
@@ -79,7 +81,9 @@ class ApprovalQueue(Protocol):
 
         Atomically moves an approved request to CONSUMED.
 
-        One approval authorizes one run. Raises ApprovalPayloadMismatchError if the
+        `principal` must be the requester or one of the request's delegates, or
+        NotTheRequesterError is raised. One approval authorizes one run. Raises
+        ApprovalPayloadMismatchError if the
         action or payload differ from what was approved, ApprovalNotGrantedError if
         the request is pending or was rejected, ApprovalAlreadyResolvedError if it
         was already consumed or cancelled, and ApprovalExpiredError if it expired.

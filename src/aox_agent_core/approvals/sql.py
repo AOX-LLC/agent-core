@@ -7,7 +7,7 @@ a Database, in the same transaction as the change.
 """
 
 import json
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Collection, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from typing import Any, Final, TypeVar
@@ -43,6 +43,7 @@ from aox_agent_core.errors import (
     ApprovalPayloadMismatchError,
     ConfigError,
     NotAuthorizedToResolveError,
+    NotTheRequesterError,
 )
 from aox_agent_core.storage import (
     Database,
@@ -91,8 +92,10 @@ PENDING_PAGE_SIZE = 500
 
 _COLUMNS = (
     "id, action, summary, payload_sha256, requested_by, required_role, created_at, "
-    "expires_at, status, decision, resolved_by, resolved_at, consumed_at, reason, run_context"
+    "expires_at, status, decision, resolved_by, resolved_at, consumed_at, reason, run_context, "
+    "delegates"
 )
+DELEGATES_COLUMN: Final = "delegates"
 
 _DENIAL_ERRORS: Final[Mapping[DenialReason, type[ApprovalError]]] = {
     DenialReason.NOT_HUMAN: NotAuthorizedToResolveError,
@@ -183,12 +186,15 @@ class SQLApprovalQueue:
         requested_by: Principal,
         required_role: str,
         ttl_seconds: int,
+        delegates: Collection[str] = (),
         context: RunContext | None = None,
     ) -> ApprovalRequest:
         """Queue a request that expires after ttl_seconds (at most TTL_SECONDS_MAX).
 
         The payload's hash is stored; the payload itself is not. `context`, the
-        run asking, is stored on the request and its audit event.
+        run asking, is stored on the request and its audit event. Only
+        requested_by may consume the approval, unless `delegates` names other
+        principals allowed to: an explicit choice, shown to the approver.
         """
         if not 0 < ttl_seconds <= TTL_SECONDS_MAX:
             raise ValueError(f"ttl_seconds must be 1 to {TTL_SECONDS_MAX}, got {ttl_seconds}")
@@ -203,6 +209,7 @@ class SQLApprovalQueue:
             created_at=now,
             expires_at=now + timedelta(seconds=ttl_seconds),
             run_context=context,
+            delegates=frozenset(delegates),
         )
 
         def insert(session: Session) -> _Outcome:
@@ -211,7 +218,7 @@ class SQLApprovalQueue:
             require_current_table(session, APPROVALS_TABLE, RUN_CONTEXT_COLUMN)
             session.execute(
                 f"INSERT INTO {APPROVALS_TABLE} ({_COLUMNS}) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 _row_values(request),
             )
             event = _event(
@@ -222,6 +229,10 @@ class SQLApprovalQueue:
                 required_role=required_role,
                 payload_sha256=request.payload_sha256,
             )
+            if request.delegates:
+                event = event.model_copy(
+                    update={"payload": {**event.payload, "delegates": sorted(request.delegates)}}
+                )
             return _Outcome(request=request, events=[event])
 
         return await self._write(insert)
@@ -403,7 +414,9 @@ class SQLApprovalQueue:
         """Call right before acting. Atomically moves an approved request to CONSUMED.
 
         `principal` is whoever is about to act; the audit event names them, with
-        `context` or, without one, the request's own. One
+        `context` or, without one, the request's own. It must be the principal
+        who requested the approval or one of the request's delegates, or
+        NotTheRequesterError is raised. One
         approval authorizes one run. Raises ApprovalPayloadMismatchError if the
         action or payload differ from what was approved, ApprovalNotGrantedError if
         the request is pending or was rejected, ApprovalAlreadyResolvedError if it
@@ -421,7 +434,7 @@ class SQLApprovalQueue:
                 )
             event_context = context if context is not None else request.run_context
             now = self._now()
-            refusal = _consume_refusal(request, presented_hash, now)
+            refusal = _consume_refusal(request, presented_hash, now, principal)
             if refusal is not None:
                 error, reason = refusal
                 return _denied(
@@ -503,10 +516,18 @@ class SQLApprovalQueue:
 
 
 def _consume_refusal(
-    request: ApprovalRequest, presented_hash: str, now: datetime
+    request: ApprovalRequest, presented_hash: str, now: datetime, principal: Principal
 ) -> tuple[ApprovalError, str] | None:
     """Why this request cannot authorize a run now, or None if it can."""
     request_id = request.id
+    if principal.id != request.requested_by and principal.id not in request.delegates:
+        return (
+            NotTheRequesterError(
+                f"Request {request_id} was made by {request.requested_by}; only they or a "
+                "delegate it named may use it."
+            ),
+            DenialReason.NOT_REQUESTER.value,
+        )
     if presented_hash != request.payload_sha256:
         return (
             ApprovalPayloadMismatchError(
@@ -656,6 +677,7 @@ def _row_values(request: ApprovalRequest) -> tuple[Any, ...]:
             if request.run_context is not None
             else None
         ),
+        json.dumps(sorted(request.delegates)),
     )
 
 
@@ -665,6 +687,7 @@ def _request_from_row(row: tuple[Any, ...]) -> ApprovalRequest:
     fields = {name: value for name, value in zip(names, row, strict=True) if value is not None}
     if RUN_CONTEXT_COLUMN in fields:
         fields[RUN_CONTEXT_COLUMN] = json.loads(fields[RUN_CONTEXT_COLUMN])
+    fields[DELEGATES_COLUMN] = json.loads(fields.get(DELEGATES_COLUMN, "[]"))
     return ApprovalRequest.model_validate(fields, context={STORED_RECORD: True})
 
 

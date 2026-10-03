@@ -5,7 +5,7 @@ is a protocol for hosts: code typed against it runs on the SQL queue or on a
 host's own. mypy checks the in-memory classes below against both protocols.
 """
 
-from collections.abc import AsyncIterator, Mapping, Sequence
+from collections.abc import AsyncIterator, Collection, Mapping, Sequence
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from uuid import UUID, uuid4
@@ -40,6 +40,7 @@ from aox_agent_core.errors import (
     ApprovalPayloadMismatchError,
     AuditIntegrityError,
     NotAuthorizedToResolveError,
+    NotTheRequesterError,
 )
 from aox_agent_core.storage import open_database
 
@@ -110,6 +111,7 @@ class InMemoryApprovalQueue:
         requested_by: Principal,
         required_role: str,
         ttl_seconds: int,
+        delegates: Collection[str] = (),
         context: RunContext | None = None,
     ) -> ApprovalRequest:
         now = datetime.now(UTC)
@@ -123,6 +125,7 @@ class InMemoryApprovalQueue:
             created_at=now,
             expires_at=now + timedelta(seconds=ttl_seconds),
             run_context=context,
+            delegates=frozenset(delegates),
         )
         self._requests[request.id] = request
         await self._audit("approval.requested", requested_by, request, context)
@@ -185,6 +188,8 @@ class InMemoryApprovalQueue:
         context: RunContext | None = None,
     ) -> ApprovalRequest:
         request = await self.get(request_id)
+        if principal.id != request.requested_by and principal.id not in request.delegates:
+            raise NotTheRequesterError(f"Request {request_id} is not {principal.id}'s to use.")
         if approval_payload_hash(action, payload) != request.payload_sha256:
             raise ApprovalPayloadMismatchError(f"Request {request_id} approved something else.")
         if request.status is not ApprovalStatus.APPROVED:
