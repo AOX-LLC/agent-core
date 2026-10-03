@@ -22,6 +22,10 @@ Fix release for 0.1.0a5. **0.1.0a5 was tagged but never released** (see below): 
 
 - The purge index now matches the library's purge query on Postgres. `purge_payloads` also requires the finish time to be a canonical timestamp, which the 0.1.0a5 index predicate did not carry, so the planner could not use the index for the ordered scan: it read every due row and sorted them, for each batch, under a backlog (300,000 due rows in a probe: 3.8 s per batch, 0.26 ms with the index). The index is `agent_core_approvals_purge_due`, with the condition in its predicate; the installer drops the 0.1.0a5 index `agent_core_approvals_purgeable` and builds the new one (SQLite does the same on first use). A request whose finish time is not canonical is still never purged.
 
+### Changed
+
+- SQLite 3.35 (March 2021) is the declared minimum, up from the 3.15 the code checked. The approval queue reads back what the store wrote with `UPDATE ... RETURNING` (closed, and since this release a decision's `resolved_at`), which SQLite added in 3.35. `open_database` for a `sqlite:` URL raises a `ConfigError` that names the version your Python is linked against and the minimum, and says to use a Python build with a newer SQLite or Postgres, instead of failing with a syntax error on the first close. Postgres is unaffected. `sqlite3.sqlite_version` shows what you have.
+
 ## [0.1.0a5] - 2026-10-03
 
 **Tagged but not released; use 0.1.0a6.** The `v0.1.0a5` tag exists, but the release workflow refused it because this section was filed under Unreleased, so there is no GitHub release and no published wheel. The tag stays where it is. Everything in this section ships in 0.1.0a6.

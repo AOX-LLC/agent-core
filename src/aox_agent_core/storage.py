@@ -42,8 +42,9 @@ ResultT = TypeVar("ResultT")
 
 SQLITE_BUSY_TIMEOUT_SECONDS = 30.0
 POSTGRES_DEFAULT_PORT = 5432
-# Row-value comparisons, which approval listing uses, arrived in SQLite 3.15.
-SQLITE_MINIMUM_VERSION = (3, 15, 0)
+# UPDATE ... RETURNING, which the approval queue uses to read back the time the guard or the
+# store wrote, arrived in SQLite 3.35 (2021-03). Row-value comparisons need 3.15.
+SQLITE_MINIMUM_VERSION = (3, 35, 0)
 POSTGRES_MINIMUM_VERSION_NUM = layout.POSTGRES_MINIMUM_VERSION_NUM
 DEFAULT_MAX_CONNECTIONS = 10
 
@@ -201,8 +202,10 @@ class SQLiteDatabase(Database):
     def __init__(self, path: Path) -> None:
         if sqlite3.sqlite_version_info < SQLITE_MINIMUM_VERSION:
             raise ConfigError(
-                f"SQLite {sqlite3.sqlite_version} is too old; the library needs "
-                f"{'.'.join(map(str, SQLITE_MINIMUM_VERSION))} or later."
+                f"The SQLite library this Python is linked against is {sqlite3.sqlite_version}; "
+                f"agent-core needs {'.'.join(map(str, SQLITE_MINIMUM_VERSION))} or later "
+                "(it uses UPDATE ... RETURNING). Use a Python build that links a newer SQLite, "
+                "or use Postgres."
             )
         self.path = path
         self._connection: sqlite3.Connection | None = None

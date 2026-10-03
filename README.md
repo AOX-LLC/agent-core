@@ -156,7 +156,7 @@ async def main() -> None:
         )
 ```
 
-Storage is async. A Postgres `Database` owns a connection pool (`max_connections`, default 10) that opens on first use, on the running event loop: use one `Database` per event loop, and close it with `await database.aclose()` or `async with`. `PostgresDatabase.from_pool(pool)` borrows a pool you own and never closes it. SQLite keeps one connection per `Database` on a worker thread, one transaction at a time. Postgres 16 or later is required, and the library refuses an older server with a `ConfigError`. Every statement runs with `prepare=False`, and isolation and `search_path` are set per transaction, so a transaction-mode pooler is the design target; it has not been tested against one.
+Storage is async. A Postgres `Database` owns a connection pool (`max_connections`, default 10) that opens on first use, on the running event loop: use one `Database` per event loop, and close it with `await database.aclose()` or `async with`. `PostgresDatabase.from_pool(pool)` borrows a pool you own and never closes it. SQLite keeps one connection per `Database` on a worker thread, one transaction at a time. Postgres 16 or later is required, and the library refuses an older server with a `ConfigError`. SQLite 3.35 or later is required (the library uses `UPDATE ... RETURNING`); `open_database` refuses an older SQLite library, the one your Python is linked against, with a `ConfigError`. Every statement runs with `prepare=False`, and isolation and `search_path` are set per transaction, so a transaction-mode pooler is the design target; it has not been tested against one.
 
 A script with no event loop of its own wraps a log or a queue in `aox_agent_core.sync`, which runs it on a background loop thread:
 
