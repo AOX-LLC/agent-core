@@ -91,6 +91,7 @@ async def test_a_repeat_with_other_terms_is_a_conflict_and_is_audited(
     records = [r async for r in SQLAuditLog(control_database.database).iter_records()]
     assert records[-1].subject_id == str(first.id)
     assert records[-1].payload["differs"] == ",".join(differs)
+    assert records[-1].payload["approval_action"] == ACTION
     assert control_database.raw(f"SELECT count(*) FROM {APPROVALS}") == [(1,)]
 
 

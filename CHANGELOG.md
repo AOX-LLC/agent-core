@@ -25,6 +25,8 @@ Fix release for 0.1.0a5. **0.1.0a5 was tagged but never released** (see below): 
 ### Changed
 
 - SQLite 3.35 (March 2021) is the declared minimum, up from the 3.15 the code checked. The approval queue reads back what the store wrote with `UPDATE ... RETURNING` (closed, and since this release a decision's `resolved_at`), which SQLite added in 3.35. `open_database` for a `sqlite:` URL raises a `ConfigError` that names the version your Python is linked against and the minimum, and says to use a Python build with a newer SQLite or Postgres, instead of failing with a syntax error on the first close. Postgres is unaffected. `sqlite3.sqlite_version` shows what you have.
+- `ApprovalConflictError` keeps its notes (`add_note`) as well as `existing` and `differs` when it is pickled or copied.
+- The `approval.submit_conflict` audit event records `approval_action` in its payload, as the other `approval.*` events do.
 
 ## [0.1.0a5] - 2026-10-03
 

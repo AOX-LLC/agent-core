@@ -333,7 +333,14 @@ class SQLApprovalQueue:
                     existing, payload_text = _parse_row(row)
                 except _StoredRowError as stored:
                     return _refused_repeat(
-                        stored, row[0], requested_by.id, context, ("row",), stored.reason, events
+                        stored,
+                        existing_id=row[0],
+                        action=request.action,
+                        actor_id=requested_by.id,
+                        context=context,
+                        differs=("row",),
+                        reason=stored.reason,
+                        earlier_events=events,
                     )
                 if await _is_due(session, self._table, existing, now):
                     events += await self._expire_lapsed(session, existing, requested_by.id, now)
@@ -343,12 +350,13 @@ class SQLApprovalQueue:
                 except _StoredRowError as stored:
                     return _refused_repeat(
                         stored,
-                        row[0],
-                        requested_by.id,
-                        context,
-                        ("payload",),
-                        stored.reason,
-                        events,
+                        existing_id=row[0],
+                        action=request.action,
+                        actor_id=requested_by.id,
+                        context=context,
+                        differs=("payload",),
+                        reason=stored.reason,
+                        earlier_events=events,
                     )
                 differs = _terms_that_differ(existing, request, wants_payload=include_payload)
                 if differs:
@@ -360,12 +368,13 @@ class SQLApprovalQueue:
                             existing=existing.id,
                             differs=differs,
                         ),
-                        str(existing.id),
-                        requested_by.id,
-                        context,
-                        differs,
-                        "conflict",
-                        events,
+                        existing_id=str(existing.id),
+                        action=request.action,
+                        actor_id=requested_by.id,
+                        context=context,
+                        differs=differs,
+                        reason="conflict",
+                        earlier_events=events,
                     )
                 return _Outcome(request=existing, events=events)
             raise ApprovalError(
@@ -1341,7 +1350,9 @@ async def _open_row(
 
 def _refused_repeat(
     error: ApprovalError,
+    *,
     existing_id: str,
+    action: str,
     actor_id: str,
     context: RunContext | None,
     differs: tuple[str, ...],
@@ -1364,7 +1375,13 @@ def _refused_repeat(
     event = _missing_event(
         "approval.submit_conflict", actor_id, UUID(existing_id), context, reason=reason
     )
-    event = event.model_copy(update={"payload": {**event.payload, "differs": ",".join(differs)}})
+    # The open request has this submit's action (it is part of the key), so the event says
+    # which action was refused as the other approval.* events do.
+    event = event.model_copy(
+        update={
+            "payload": {**event.payload, "approval_action": action, "differs": ",".join(differs)}
+        }
+    )
     refusal = _denied(error, event)
     refusal.events = [*earlier_events, *refusal.events]
     return refusal
