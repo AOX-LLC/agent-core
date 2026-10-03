@@ -612,27 +612,36 @@ def _check_connecting_roles(session: "Session", table: str, *, as_requester: boo
 
 
 def refuse_requester_create(session: "Session", requester_role: str, schema: str) -> None:
-    """Raise ConfigError if the requester role can create objects in `schema` or public.
+    """Raise ConfigError if any role acting as the requester can create objects.
 
     The library pins its own search_path, but the approver side may run other
-    code too, and a function or table the requester planted in a schema that
-    code searches would run with the approver's rights. Postgres 14 and clusters
-    upgraded from it let PUBLIC create in public by default.
+    code too, and a function or table the requester planted where that code
+    looks (the install schema, public, or a new schema named after the approver
+    role, which a default "$user", public path searches) would run with the
+    approver's rights. Every non-superuser role that is the requester role or a
+    member of it is checked: no CREATE on the install schema or public, and no
+    CREATE on the database. Postgres 14 and clusters upgraded from it let PUBLIC
+    create in public by default.
     """
-    creatable = [
-        row[0]
-        for row in session.execute(
-            "SELECT nspname FROM pg_namespace WHERE nspname IN (?, 'public') "
-            "AND has_schema_privilege(?, oid, 'CREATE') ORDER BY nspname",
-            (schema, requester_role),
-        )
-    ]
-    if creatable:
+    rows = session.execute(
+        "SELECT r.rolname, n.nspname FROM pg_roles r "
+        "JOIN pg_namespace n ON n.nspname IN (?, 'public') "
+        "WHERE NOT r.rolsuper AND pg_has_role(r.oid, ?, 'MEMBER') "
+        "AND has_schema_privilege(r.oid, n.oid, 'CREATE') "
+        "UNION ALL "
+        "SELECT r.rolname, 'the database' FROM pg_roles r "
+        "WHERE NOT r.rolsuper AND pg_has_role(r.oid, ?, 'MEMBER') "
+        "AND has_database_privilege(r.oid, current_database(), 'CREATE') "
+        "ORDER BY 1, 2",
+        (schema, requester_role, requester_role),
+    )
+    if rows:
+        role, where = rows[0]
+        target = where if where == "the database" else f"schema {where}"
         raise ConfigError(
-            f"The requester role {requester_role} can create objects in schema "
-            f"{', '.join(creatable)}, where code on the approver side could pick them up. "
-            f"Revoke it, e.g. REVOKE CREATE ON SCHEMA {creatable[0]} FROM PUBLIC (the default "
-            "before Postgres 15), and from the requester role if granted directly."
+            f"The requester role {requester_role}, through {role}, can create objects in "
+            f"{target}, where code on the approver side could pick them up. Revoke it, e.g. "
+            "REVOKE CREATE ON SCHEMA public FROM PUBLIC (the default before Postgres 15)."
         )
 
 

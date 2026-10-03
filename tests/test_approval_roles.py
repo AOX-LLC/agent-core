@@ -190,3 +190,21 @@ async def test_an_approver_login_with_its_own_insert_grant_is_refused(pg: Contro
 
     with pytest.raises(ConfigError, match="can insert approval requests"):
         await queue_on(open_database(url)).side()
+
+
+@pytest.mark.parametrize(
+    "grant",
+    ["GRANT CREATE ON SCHEMA public TO {role}", "GRANT CREATE ON DATABASE {database} TO {role}"],
+    ids=["member-creates-in-public", "member-creates-schemas"],
+)
+async def test_a_member_of_the_requester_that_can_create_is_refused(
+    pg: ControlDatabase, grant: str
+) -> None:
+    database_name = pg.url.rsplit("/", 1)[1]
+    pg.login_role(
+        f"GRANT {REQUESTER_ROLE} TO {{role}}",
+        grant.replace("{database}", f'"{database_name}"'),
+    )
+
+    with pytest.raises(ConfigError, match="through agent_core_probe_"):
+        await queue_on(pg.database).side()
