@@ -1,8 +1,8 @@
 # Compatibility with project 03
 
-Project 03 (the ops kit) drafted the interfaces it wants from agent-core. This page maps each of those names to what release 0.1.0a2 ships, and says which parts the ops kit keeps in its own adapter.
+Project 03 (the ops kit) drafted the interfaces it wants from agent-core. This page maps each of those names to what release 0.1.0a3 ships, and says which parts the ops kit keeps in its own adapter.
 
-Every signature below was checked against the source of 0.1.0a2. Where a name differs, the ops kit's factory holds a thin shim.
+Every signature below was checked against the source of 0.1.0a3. Where a name differs, the ops kit's factory holds a thin shim. Section "What project 03 must change for 0.1.0a3" lists what its own backends need to match this release.
 
 ## Name mapping
 
@@ -229,6 +229,7 @@ class ApprovalQueue(Protocol):
         requested_by: Principal,
         required_role: str,
         ttl_seconds: int,
+        delegates: Collection[str] = (),
         context: RunContext | None = None,
     ) -> ApprovalRequest: ...
 
@@ -257,6 +258,19 @@ class ApprovalQueue(Protocol):
         principal: Principal,
         context: RunContext | None = None,
     ) -> ApprovalRequest: ...
+
+    async def cancel(
+        self,
+        request_id: UUID,
+        *,
+        principal: Principal,
+        reason: str | None = None,
+        context: RunContext | None = None,
+    ) -> ApprovalRequest: ...
+
+    async def expire_due(
+        self, *, principal: Principal, now: datetime | None = None, limit: int = 500
+    ) -> int: ...
 ```
 
 `request` becomes `submit`:
@@ -265,6 +279,7 @@ class ApprovalQueue(Protocol):
 - `subject` becomes `payload`. Only its SHA-256 is stored, not the payload.
 - `expires_in` becomes `ttl_seconds=int(expires_in.total_seconds())`. The maximum is 7 days.
 - `summary`, `requested_by` and `required_role` are required by agent-core. The ops kit's adapter supplies them.
+- `delegates` is new. It names principals, besides the requester, that may consume the approval: at most 16 ids, fixed for the request, recorded in the `approval.requested` audit event and shown on the request the approver sees.
 - `resume_url` has no equivalent. See item 7 below.
 
 `decide` becomes `resolve`:
@@ -272,7 +287,8 @@ class ApprovalQueue(Protocol):
 - `decision` takes `Decision.APPROVE` or `Decision.REJECT`.
 - `actor` becomes a `Principal`. `note` becomes `reason`.
 - `edited_subject` has no equivalent. See item 8 below.
-- The default `RoleApproverPolicy` needs a human who holds `required_role` and is not the requester.
+- `RoleApproverPolicy(roles_by_action={...})` on the approver side decides which role each action needs. A request for an unlisted action, or whose stored `required_role` differs from the listed role, is refused (`unknown_action`, `role_mismatch`) and audited. The approver must also be a human who holds that role and is not the requester.
+- The default `RoleApproverPolicy()`, with no map, refuses every request. `RoleApproverPolicy(trust_requester_role=True)` takes the requester's `required_role` as given; it is for local development only, never where the requester may be compromised.
 - Errors: `ApprovalAlreadyResolvedError` (close to 03's not-pending), `ApprovalExpiredError`, `NotAuthorizedToResolveError`, `ApprovalNotFoundError`.
 - Resolution is compare-and-set, so a request is resolved once.
 
@@ -285,9 +301,24 @@ class ApprovalQueue(Protocol):
 - The cursor is the last request's id, passed as `after`. It is a `UUID`, not a string.
 - It returns a `Sequence`, not a `Page`.
 
-`expire_due` has no equivalent. Expiry is judged from `expires_at` whenever a request is resolved or consumed.
+`expire_due(*, principal, now=None, limit=500) -> int` stores EXPIRED on pending requests past their lifetime and returns how many.
 
-`consume` is new. Call it right before acting. It is single use, and it checks the action and the payload hash. It raises `ApprovalPayloadMismatchError`, `ApprovalNotGrantedError`, `ApprovalAlreadyResolvedError` or `ApprovalExpiredError`.
+- It works in batches of `limit`, writes one `approval.expired` audit event per request naming `principal`, and sets `closed_at`.
+- Either side may run it. On Postgres it picks only what the database's clock agrees is due.
+- Reads still judge expiry themselves: `get()` reports a pending request past its lifetime as EXPIRED (with `closed_at` equal to `expires_at`) without writing, so nothing depends on the sweep.
+- It takes no `Page` and returns a count, not requests. See item 8 below.
+
+`cancel(request_id, *, principal, reason=None, context=None)` is new. The requester withdraws a pending request. A delegate may not.
+
+- It stores CANCELLED and sets `closed_at`. It audits `approval.cancelled`, with the reason as `cancel_reason`, or `approval.cancel_denied`.
+- It raises `NotTheRequesterError`, `ApprovalAlreadyResolvedError` (no longer pending) or `ApprovalExpiredError`.
+
+`consume` is new. Call it right before acting. It is single use, and it checks the action and the payload hash.
+
+- `principal` must be the requester or one of the request's delegates. Otherwise it raises `NotTheRequesterError`, audited as `approval.consume_denied` with reason `not_requester`.
+- It also raises `ApprovalPayloadMismatchError`, `ApprovalNotGrantedError`, `ApprovalAlreadyResolvedError` or `ApprovalExpiredError`.
+
+On Postgres, a queue also has a side: `await queue.side()` returns `ApprovalSide.REQUESTER` or `ApprovalSide.APPROVER` (`BOTH` on SQLite). A call from the wrong side raises `ConfigError`. See [upgrade-0.1.0a3.md](upgrade-0.1.0a3.md).
 
 ### Approval and Decision
 
@@ -304,13 +335,15 @@ class ApprovalRequest:
     required_role: str
     created_at: datetime
     expires_at: datetime
-    status: ApprovalStatus  # pending, approved, rejected, consumed
+    status: ApprovalStatus  # pending, approved, rejected, consumed, expired, cancelled
     decision: Decision | None
     resolved_by: str | None
     resolved_at: datetime | None
     consumed_at: datetime | None
+    closed_at: datetime | None  # set exactly when EXPIRED or CANCELLED
     reason: str | None
     run_context: RunContext | None
+    delegates: frozenset[str] = frozenset()
 
 
 class Principal:
@@ -319,7 +352,7 @@ class Principal:
     roles: frozenset[str] = frozenset()
 ```
 
-- `ApprovalStatus` also has `EXPIRED` and `CANCELLED`. This release never sets them.
+- `ApprovalStatus` also has `EXPIRED` and `CANCELLED`. They are stored states in this release: `expire_due` and `cancel` set them, and both set `closed_at`. `ApprovalRequest` refuses `closed_at` on any other status, and refuses a missing one on these two.
 
 ### AuditLog
 
@@ -355,7 +388,9 @@ record = await audit.append(
 - Payload numbers must be integers. Write decimals as strings, for example `"0.0123"`.
 - At most 8192 bytes of payload.
 - Keys that end in a secret word (token, secret, password, and so on) are refused. Strings are scanned for secrets.
-- Records carry audit schema version 2.
+- Records carry audit schema version 3. Version 2 records in an upgraded chain keep version 2 and still verify.
+- `AuditRecord.db_role` is new: the database role that inserted the row. On Postgres the database's insert trigger sets it, whatever was sent, and it is fixed afterwards. It is outside the hash. It is `None` on SQLite. Both roles may append audit rows and `actor_id` is supplied by the library, so `db_role` shows who really wrote a record.
+- `SQLAuditLog(database, *, scrubber=None, schema=None)` and `SQLApprovalQueue(..., schema=None)` take a Postgres schema. `aox-agent-core audit verify URL --schema NAME` checks it.
 - The protocol also has `iter_records`, `head` and `verify`. The log is hash-chained.
 
 ### Core
@@ -392,7 +427,7 @@ def replay_key(
 ## Host-supplied backends
 
 - `ApprovalQueue` and `AuditLog` are `Protocol`s. The ops kit's Postgres implementations can stand in wherever code is typed against them.
-- A host can pass its own log to the SQL queue: `SQLApprovalQueue(database, *, audit_log, policy=None, clock=None)`.
+- A host can pass its own log to the SQL queue: `SQLApprovalQueue(database, *, audit_log, policy=None, clock=None, schema=None)`.
 - `tests/test_host_backends.py` proves both directions, with in-memory classes checked by mypy against both protocols.
 - A host `AuditLog` must implement all four methods: `append`, `iter_records`, `head`, `verify`.
 - With an `AuditLog` that is not `SQLAuditLog`, the queue writes its audit events right after its own commit, as best effort. They are not in the same transaction as the approval change.
@@ -401,14 +436,26 @@ def replay_key(
 
 | Item | Stays in 03? | What agent-core offers |
 | --- | --- | --- |
-| 5. Postgres `ApprovalQueue` and `AuditLog` on a caller-provided async session, configurable schema | Yes | The SQL backends open their own connection per operation, on sync drivers in a worker thread, with fixed table names. Project 03 implements the protocols itself. |
-| 6. Host-run migrations without a superuser, grant-friendly roles, database-enforced append-only audit | Yes, for 03's own backends | `storage.install_postgres_schema(owner_url, app_role=...)` runs as the table owner, not a superuser. Its audit table has update, delete and truncate triggers, and the app role gets insert and select only. Use it as a reference design. It does not install into 03's schema. |
+| 5. Postgres `ApprovalQueue` and `AuditLog` on a caller-provided async session, configurable schema | Yes | The SQL backends open their own connection per operation, on sync drivers in a worker thread, with fixed table names, in a configurable Postgres schema (`schema=`), but not on a caller-provided session. Project 03 implements the protocols itself. |
+| 6. Host-run migrations without a superuser, grant-friendly roles, database-enforced append-only audit | Yes, for 03's own backends | `storage.install_postgres_schema(owner_url, *, requester_role, approver_role, schema="public")` runs as the table owner, not a superuser. It is idempotent and schema-qualified. Its audit table has update, delete and truncate triggers. Its approvals table has a guard trigger with a role-separated design: a requester role and an approver role, and a fixed transition table. Use it as a reference design. It installs only agent-core's own tables, not 03's. |
 | 7. External resume targets, outbox, at-least-once dispatcher | Yes | Nothing. |
-| 8. Decision semantics | Partly | In agent-core: compare-and-set `resolve` with the errors above, keyset paging through `after`, and the actor recorded as the principal. In 03: the `expire_due` sweep, `edited_subject`, a string cursor and the `Page` type. |
+| 8. Decision semantics | Partly | In agent-core: compare-and-set `resolve` with the errors above, keyset paging through `after`, the actor recorded as the principal, and `expire_due(*, principal, now=None, limit=500) -> int`. In 03: `edited_subject`, a string cursor and the `Page` type. |
 | 9. Image preprocessing | Yes | Nothing, by design. agent-core sends the bytes it is given. |
 | 10. "Honest nulls" | Yes | Nothing. |
 | 11. Atomic record mode, lister of missing or stale fixtures | Partly | Each recording is written atomically: a temp file, then a rename, one file per exchange. `aox-agent-core cassettes check DIR` reports unreadable files (including format 1), misplaced files, key mismatches (tampering) and secret-bearing files. `StaleRecordingError` fires at replay. In 03: all-or-nothing recording of a whole run, and listing missing or stale fixtures before a run. Build the lister from `replay_key`, `PromptKey.for_call`, `DirectoryRecordingStore.prompt_path` and `PromptKey.stale_parts`. |
-| 12. Tag timing | Yes | Pin `v0.1.0a2`. Alpha 1 lacks these features. Install with `aox-agent-core @ git+https://github.com/AOX-LLC/agent-core@v0.1.0a2`. Name shims stay in 03's factory. |
+| 12. Tag timing | Yes | Pin `v0.1.0a3`. Alpha 2 lacks the role-separated approvals, `cancel` and `expire_due`. Install with `aox-agent-core @ git+https://github.com/AOX-LLC/agent-core@v0.1.0a3`. Name shims stay in 03's factory. |
+
+## What project 03 must change for 0.1.0a3
+
+If project 03 implements `ApprovalQueue` itself, as item 5 says, its backend must match the protocol of this release.
+
+- Add `cancel(request_id, *, principal, reason=None, context=None)` and `expire_due(*, principal, now=None, limit=500) -> int`, with these exact signatures.
+- Accept `submit(..., delegates=...)`, at most 16 ids, kept unchanged for the life of the request.
+- Refuse `consume` by a principal who is neither the requester nor a delegate, with `NotTheRequesterError`.
+- Decide the required role on the approver side, as `RoleApproverPolicy(roles_by_action=...)` does: the requester writes `required_role`, so trusting it lets a compromised requester ask for the weakest role. If the ops kit keeps its own approver policy, it should refuse unlisted actions and mismatched roles the same way.
+- Set `closed_at` when storing EXPIRED or CANCELLED. `ApprovalRequest` validates it.
+- If it builds records with agent-core's types, expect `AuditRecord.db_role` and audit schema 3.
+- If it uses agent-core's installer, call the new signature with `requester_role` and `approver_role`. `app_role` is gone.
 
 ## Other requirements
 

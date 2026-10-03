@@ -5,7 +5,7 @@ is a protocol for hosts: code typed against it runs on the SQL queue or on a
 host's own. mypy checks the in-memory classes below against both protocols.
 """
 
-from collections.abc import AsyncIterator, Mapping, Sequence
+from collections.abc import AsyncIterator, Collection, Mapping, Sequence
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from uuid import UUID, uuid4
@@ -35,11 +35,13 @@ from aox_agent_core.audit import (
     compute_record_hash,
 )
 from aox_agent_core.errors import (
+    ApprovalAlreadyResolvedError,
     ApprovalNotFoundError,
     ApprovalNotGrantedError,
     ApprovalPayloadMismatchError,
     AuditIntegrityError,
     NotAuthorizedToResolveError,
+    NotTheRequesterError,
 )
 from aox_agent_core.storage import open_database
 
@@ -47,6 +49,8 @@ RUN = RunContext(run_id="run-0001", external_ids={"execution_id": "ex-42"})
 REQUESTER = Principal(id="agent-intake", kind=PrincipalKind.AGENT)
 APPROVER = Principal(id="user-17", kind=PrincipalKind.HUMAN, roles=frozenset({"ops.approver"}))
 PAYLOAD: dict[str, JsonValue] = {"contact_id": "c-1001"}
+# The approver side decides which role each action needs.
+ROLES = {"crm.update_contact": "ops.approver"}
 
 
 class InMemoryAuditLog:
@@ -98,7 +102,7 @@ class InMemoryApprovalQueue:
 
     def __init__(self, audit_log: AuditLog) -> None:
         self._audit_log = audit_log
-        self._policy = RoleApproverPolicy()
+        self._policy = RoleApproverPolicy(roles_by_action=ROLES)
         self._requests: dict[UUID, ApprovalRequest] = {}
 
     async def submit(
@@ -110,6 +114,7 @@ class InMemoryApprovalQueue:
         requested_by: Principal,
         required_role: str,
         ttl_seconds: int,
+        delegates: Collection[str] = (),
         context: RunContext | None = None,
     ) -> ApprovalRequest:
         now = datetime.now(UTC)
@@ -123,6 +128,7 @@ class InMemoryApprovalQueue:
             created_at=now,
             expires_at=now + timedelta(seconds=ttl_seconds),
             run_context=context,
+            delegates=frozenset(delegates),
         )
         self._requests[request.id] = request
         await self._audit("approval.requested", requested_by, request, context)
@@ -185,6 +191,8 @@ class InMemoryApprovalQueue:
         context: RunContext | None = None,
     ) -> ApprovalRequest:
         request = await self.get(request_id)
+        if principal.id != request.requested_by and principal.id not in request.delegates:
+            raise NotTheRequesterError(f"Request {request_id} is not {principal.id}'s to use.")
         if approval_payload_hash(action, payload) != request.payload_sha256:
             raise ApprovalPayloadMismatchError(f"Request {request_id} approved something else.")
         if request.status is not ApprovalStatus.APPROVED:
@@ -195,6 +203,43 @@ class InMemoryApprovalQueue:
         self._requests[request_id] = consumed
         await self._audit("approval.consumed", principal, consumed, context)
         return consumed
+
+    async def cancel(
+        self,
+        request_id: UUID,
+        *,
+        principal: Principal,
+        reason: str | None = None,
+        context: RunContext | None = None,
+    ) -> ApprovalRequest:
+        request = await self.get(request_id)
+        if principal.id != request.requested_by:
+            raise NotTheRequesterError(f"Request {request_id} is not {principal.id}'s to cancel.")
+        if request.status is not ApprovalStatus.PENDING:
+            raise ApprovalAlreadyResolvedError(f"Request {request_id} is {request.status.value}.")
+        cancelled = request.model_copy(
+            update={"status": ApprovalStatus.CANCELLED, "closed_at": datetime.now(UTC)}
+        )
+        self._requests[request_id] = cancelled
+        await self._audit("approval.cancelled", principal, cancelled, context)
+        return cancelled
+
+    async def expire_due(
+        self, *, principal: Principal, now: datetime | None = None, limit: int = 500
+    ) -> int:
+        moment = now or datetime.now(UTC)
+        due = [
+            request
+            for request in self._requests.values()
+            if request.status is ApprovalStatus.PENDING and request.is_expired(moment)
+        ]
+        for request in due:
+            expired = request.model_copy(
+                update={"status": ApprovalStatus.EXPIRED, "closed_at": moment}
+            )
+            self._requests[request.id] = expired
+            await self._audit("approval.expired", principal, expired, None)
+        return len(due)
 
     async def _audit(
         self,
@@ -234,7 +279,9 @@ async def approve_and_act(queue: ApprovalQueue) -> ApprovalRequest:
 
 def sql_queue(tmp_path: Path, audit_log: AuditLog) -> ApprovalQueue:
     return SQLApprovalQueue(
-        open_database(f"sqlite:///{tmp_path / 'queue.sqlite3'}"), audit_log=audit_log
+        open_database(f"sqlite:///{tmp_path / 'queue.sqlite3'}"),
+        audit_log=audit_log,
+        policy=RoleApproverPolicy(roles_by_action=ROLES),
     )
 
 

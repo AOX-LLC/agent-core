@@ -28,9 +28,16 @@ from aox_agent_core.errors import (
     ApprovalNotGrantedError,
     ApprovalPayloadMismatchError,
     NotAuthorizedToResolveError,
+    NotTheRequesterError,
 )
 from aox_agent_core.storage import open_database
-from databases import ControlDatabase, sqlite_database
+from databases import (
+    TEST_ACTION_ROLES,
+    ControlDatabase,
+    SplitQueue,
+    split_queue,
+    sqlite_database,
+)
 
 REQUESTER = Principal(id="agent-intake", kind=PrincipalKind.AGENT)
 APPROVER = Principal(id="user-17", kind=PrincipalKind.HUMAN, roles=frozenset({"ops.approver"}))
@@ -40,7 +47,8 @@ OTHER_APPROVER = Principal(
 AGENT_WITH_ROLE = Principal(id="agent-reviewer", kind=PrincipalKind.AGENT, roles=APPROVER.roles)
 HUMAN_REQUESTER = Principal(id="agent-intake", kind=PrincipalKind.HUMAN, roles=APPROVER.roles)
 PAYLOAD = {"contact_id": "c-1001", "phone": "+1-555-0100"}
-NOW = datetime(2026, 10, 2, 12, 0, tzinfo=UTC)
+# Near the database's clock: the Postgres guard judges expiry and start times by it.
+NOW = datetime.now(UTC).replace(microsecond=0)
 
 
 class Clock:
@@ -51,12 +59,13 @@ class Clock:
         return self.now
 
 
-def queue_for(database: ControlDatabase, clock: Clock | None = None) -> SQLApprovalQueue:
-    log = SQLAuditLog(database.database)
-    return SQLApprovalQueue(database.database, audit_log=log, clock=clock or Clock())
+def queue_for(database: ControlDatabase, clock: Clock | None = None) -> SplitQueue:
+    return split_queue(database, clock=clock or Clock())
 
 
-async def submitted(queue: SQLApprovalQueue, requester: Principal = REQUESTER) -> ApprovalRequest:
+async def submitted(
+    queue: SQLApprovalQueue | SplitQueue, requester: Principal = REQUESTER
+) -> ApprovalRequest:
     return await queue.submit(
         action="crm.update_contact",
         summary="Update the sample contact's phone number",
@@ -301,16 +310,49 @@ def test_role_policy_checks_in_order(
     )
     now = NOW + timedelta(hours=2) if expired else NOW
 
-    verdict = RoleApproverPolicy().evaluate(principal, request, now=now)
+    policy = RoleApproverPolicy(roles_by_action=TEST_ACTION_ROLES)
+    verdict = policy.evaluate(principal, request, now=now)
 
     assert verdict.reason == (DenialReason(reason) if reason else None)
     assert verdict.allowed is (reason is None)
 
 
-async def test_consume_names_the_principal_who_acted(control_database: ControlDatabase) -> None:
+async def test_only_the_requester_may_consume_by_default(
+    control_database: ControlDatabase,
+) -> None:
     executor = Principal(id="svc-crm-writer", kind=PrincipalKind.SERVICE)
     queue = queue_for(control_database)
     request = await submitted(queue)
+    await queue.resolve(request.id, decision=Decision.APPROVE, principal=APPROVER)
+
+    with pytest.raises(NotTheRequesterError, match="only they or a delegate"):
+        await queue.consume(
+            request.id, action="crm.update_contact", payload=PAYLOAD, principal=executor
+        )
+
+    assert (await queue.get(request.id)).status is ApprovalStatus.APPROVED
+    assert (await audit_actions(control_database))[-1] == (
+        "approval.consume_denied",
+        "svc-crm-writer",
+        "not_requester",
+    )
+
+
+async def test_a_named_delegate_may_consume_and_is_audited(
+    control_database: ControlDatabase,
+) -> None:
+    executor = Principal(id="svc-crm-writer", kind=PrincipalKind.SERVICE)
+    queue = queue_for(control_database)
+    request = await queue.submit(
+        action="crm.update_contact",
+        summary="Update the sample contact's phone number",
+        payload=PAYLOAD,
+        requested_by=REQUESTER,
+        required_role="ops.approver",
+        ttl_seconds=3_600,
+        delegates={"svc-crm-writer"},
+    )
+    (listed,) = await queue.list_pending(APPROVER)
     await queue.resolve(request.id, decision=Decision.APPROVE, principal=APPROVER)
 
     with pytest.raises(ApprovalPayloadMismatchError):
@@ -319,10 +361,13 @@ async def test_consume_names_the_principal_who_acted(control_database: ControlDa
         request.id, action="crm.update_contact", payload=PAYLOAD, principal=executor
     )
 
+    assert listed.delegates == frozenset({"svc-crm-writer"})
     assert [(action, actor) for action, actor, _ in await audit_actions(control_database)][-2:] == [
         ("approval.consume_denied", "svc-crm-writer"),
         ("approval.consumed", "svc-crm-writer"),
     ]
+    records = [record async for record in SQLAuditLog(control_database.database).iter_records()]
+    assert records[0].payload["delegates"] == ["svc-crm-writer"]
 
 
 async def test_separate_objects_for_one_database_share_the_transaction(
@@ -348,8 +393,9 @@ async def test_list_pending_filters_expired_own_and_other_role_requests(
 ) -> None:
     clock = Clock()
     queue = queue_for(control_database, clock)
+    clock.now = NOW - timedelta(hours=2)
     stale = await submitted(queue)
-    clock.now = NOW + timedelta(hours=2)
+    clock.now = NOW
     fresh = await submitted(queue)
     await submitted(queue, requester=APPROVER)
     await queue.submit(
@@ -377,10 +423,7 @@ async def test_policy_denial_without_a_reason_is_still_refused(
         ) -> ResolveVerdict:
             return ResolveVerdict.model_construct(allowed=False, reason=None)
 
-    log = SQLAuditLog(control_database.database)
-    queue = SQLApprovalQueue(
-        control_database.database, audit_log=log, policy=DenyWithoutReason(), clock=Clock()
-    )
+    queue = split_queue(control_database, policy=DenyWithoutReason(), clock=Clock())
     request = await submitted(queue)
 
     with pytest.raises(NotAuthorizedToResolveError, match="denied"):
@@ -409,10 +452,7 @@ async def test_list_pending_follows_a_custom_policy(control_database: ControlDat
             return ResolveVerdict(allowed=False, reason=DenialReason.MISSING_ROLE)
 
     admin = Principal(id="user-1", kind=PrincipalKind.HUMAN, roles=frozenset({"admin"}))
-    log = SQLAuditLog(control_database.database)
-    queue = SQLApprovalQueue(
-        control_database.database, audit_log=log, policy=AdminsApproveAnything(), clock=Clock()
-    )
+    queue = split_queue(control_database, policy=AdminsApproveAnything(), clock=Clock())
     request = await submitted(queue)
 
     assert [pending.id for pending in await queue.list_pending(admin)] == [request.id]
@@ -431,14 +471,9 @@ async def test_list_pending_pages_past_requests_a_strict_policy_rejects(
                 return ResolveVerdict(allowed=False, reason=DenialReason.MISSING_ROLE)
             return super().evaluate(principal, request, now=now)
 
-    policy = OnlyTheNewest()
+    policy = OnlyTheNewest(roles_by_action=TEST_ACTION_ROLES)
     clock = Clock()
-    queue = SQLApprovalQueue(
-        control_database.database,
-        audit_log=SQLAuditLog(control_database.database),
-        policy=policy,
-        clock=clock,
-    )
+    queue = split_queue(control_database, policy=policy, clock=clock)
     for minute in range(5):
         clock.now = NOW + timedelta(minutes=minute)
         newest = await submitted(queue)
@@ -471,6 +506,7 @@ async def test_custom_policy_listing_pages_through_tied_timestamps(
 
     class EveryThird(RoleApproverPolicy):
         def __init__(self, wanted: set[UUID]) -> None:
+            super().__init__(roles_by_action=TEST_ACTION_ROLES)
             self.wanted = wanted
 
         def evaluate(
@@ -481,12 +517,7 @@ async def test_custom_policy_listing_pages_through_tied_timestamps(
             return super().evaluate(principal, request, now=now)
 
     policy = EveryThird(set())
-    queue = SQLApprovalQueue(
-        control_database.database,
-        audit_log=SQLAuditLog(control_database.database),
-        policy=policy,
-        clock=Clock(),  # every request shares one created_at
-    )
+    queue = split_queue(control_database, policy=policy, clock=Clock())  # one created_at
     submitted_ids = [(await submitted(queue)).id for _ in range(10)]
     in_listing_order = sorted(submitted_ids, key=str)
     policy.wanted = set(in_listing_order[::3])
@@ -521,14 +552,15 @@ async def test_a_full_listing_reads_no_extra_page(
     for _ in range(2):
         await submitted(queue)
     transactions = 0
-    run = control_database.database.run
+    # Listing is the approver's: it runs on the approver's connection.
+    run = control_database.approver_database.run
 
     async def counting_run(*args: Any, **kwargs: Any) -> Any:
         nonlocal transactions
         transactions += 1
         return await run(*args, **kwargs)
 
-    monkeypatch.setattr(control_database.database, "run", counting_run)
+    monkeypatch.setattr(control_database.approver_database, "run", counting_run)
 
     assert len(await queue.list_pending(APPROVER, limit=2)) == 2
     assert transactions == 1
@@ -550,3 +582,119 @@ async def test_list_pending_pages_with_an_after_cursor(control_database: Control
     assert pages == [created[0:2], created[2:4], created[4:5]]
     with pytest.raises(ApprovalNotFoundError):
         await queue.list_pending(APPROVER, after=uuid4())
+
+
+# The approver side decides which role each action needs
+
+
+async def test_an_approver_side_role_map_overrides_what_the_requester_asked_for(
+    control_database: ControlDatabase,
+) -> None:
+    policy = RoleApproverPolicy(roles_by_action={"crm.update_contact": "finance.approver"})
+    queue = split_queue(control_database, policy=policy, clock=Clock())
+    weak = await submitted(queue)  # asks for ops.approver, which APPROVER holds
+    unlisted = await queue.submit(
+        action="crm.delete_contact",
+        summary="s",
+        payload=PAYLOAD,
+        requested_by=REQUESTER,
+        required_role="ops.approver",
+        ttl_seconds=3_600,
+    )
+    finance = Principal(
+        id="user-30", kind=PrincipalKind.HUMAN, roles=frozenset({"finance.approver"})
+    )
+    proper = await queue.submit(
+        action="crm.update_contact",
+        summary="s",
+        payload=PAYLOAD,
+        requested_by=REQUESTER,
+        required_role="finance.approver",
+        ttl_seconds=3_600,
+    )
+
+    with pytest.raises(NotAuthorizedToResolveError, match="role_mismatch"):
+        await queue.resolve(weak.id, decision=Decision.APPROVE, principal=APPROVER)
+    with pytest.raises(NotAuthorizedToResolveError, match="unknown_action"):
+        await queue.resolve(unlisted.id, decision=Decision.APPROVE, principal=APPROVER)
+    assert await queue.list_pending(APPROVER) == []
+    approved = await queue.resolve(proper.id, decision=Decision.APPROVE, principal=finance)
+
+    assert approved.status is ApprovalStatus.APPROVED
+    reasons = [reason for _, _, reason in await audit_actions(control_database)]
+    assert "role_mismatch" in reasons
+    assert "unknown_action" in reasons
+
+
+async def test_without_a_role_map_every_request_is_refused(
+    control_database: ControlDatabase,
+) -> None:
+    queue = split_queue(control_database, policy=RoleApproverPolicy(), clock=Clock())
+    request = await submitted(queue)
+
+    with pytest.raises(NotAuthorizedToResolveError, match="unknown_action"):
+        await queue.resolve(request.id, decision=Decision.APPROVE, principal=APPROVER)
+
+    assert await queue.list_pending(APPROVER) == []
+    assert (await audit_actions(control_database))[-1] == (
+        "approval.resolve_denied",
+        "user-17",
+        "unknown_action",
+    )
+
+
+async def test_trusting_the_requesters_role_is_an_explicit_opt_out(
+    control_database: ControlDatabase,
+) -> None:
+    trusting = RoleApproverPolicy(trust_requester_role=True)
+    queue = split_queue(control_database, policy=trusting, clock=Clock())
+    unlisted = await queue.submit(
+        action="billing.refund",
+        summary="s",
+        payload=PAYLOAD,
+        requested_by=REQUESTER,
+        required_role="ops.approver",
+        ttl_seconds=3_600,
+    )
+    weaker_than_needed = await queue.submit(
+        action="billing.refund",
+        summary="s",
+        payload=PAYLOAD,
+        requested_by=REQUESTER,
+        required_role="finance.approver",
+        ttl_seconds=3_600,
+    )
+
+    approved = await queue.resolve(unlisted.id, decision=Decision.APPROVE, principal=APPROVER)
+    with pytest.raises(NotAuthorizedToResolveError, match="missing_role"):
+        await queue.resolve(weaker_than_needed.id, decision=Decision.APPROVE, principal=APPROVER)
+
+    assert approved.status is ApprovalStatus.APPROVED
+
+
+def test_a_role_map_and_the_opt_out_cannot_be_combined() -> None:
+    with pytest.raises(ValueError, match="not both"):
+        RoleApproverPolicy(roles_by_action=TEST_ACTION_ROLES, trust_requester_role=True)
+
+
+def test_a_subclass_that_skips_init_refuses_rather_than_trusts() -> None:
+    class Custom(RoleApproverPolicy):
+        def __init__(self) -> None:
+            pass
+
+    request = ApprovalRequest.model_validate(
+        {
+            "id": UUID("00000000-0000-4000-8000-000000000002"),
+            "action": "crm.update_contact",
+            "summary": "s",
+            "payload_sha256": "a" * 64,
+            "requested_by": "agent-intake",
+            "required_role": "ops.approver",
+            "created_at": NOW,
+            "expires_at": NOW + timedelta(hours=1),
+        }
+    )
+
+    verdict = Custom().evaluate(APPROVER, request, now=NOW)
+
+    assert verdict.reason is DenialReason.UNKNOWN_ACTION

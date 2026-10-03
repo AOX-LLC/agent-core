@@ -31,7 +31,7 @@ from aox_agent_core.errors import (
 )
 from aox_agent_core.replay import PatternScrubber, SecretFinding
 from aox_agent_core.storage import open_database, table_columns
-from databases import ControlDatabase
+from databases import ControlDatabase, SplitQueue, split_queue
 
 RUN = RunContext(run_id="run-0001", external_ids={"workflow_id": "wf-7"})
 REVIEW_RUN = RunContext(run_id="review-0009")
@@ -46,11 +46,11 @@ def event(context: RunContext | None = RUN) -> AuditEvent:
     )
 
 
-def queue_for(database: ControlDatabase) -> SQLApprovalQueue:
-    return SQLApprovalQueue(database.database, audit_log=SQLAuditLog(database.database))
+def queue_for(database: ControlDatabase) -> SplitQueue:
+    return split_queue(database)
 
 
-async def submit(queue: SQLApprovalQueue, context: RunContext | None = RUN) -> Any:
+async def submit(queue: SQLApprovalQueue | SplitQueue, context: RunContext | None = RUN) -> Any:
     return await queue.submit(
         action="crm.update_contact",
         summary="Update the sample contact",
@@ -72,7 +72,7 @@ async def test_a_record_stores_its_run_context(control_database: ControlDatabase
     await log.append(event(context=None))
 
     with_context, without = [record async for record in log.iter_records()]
-    assert appended.schema_version == AUDIT_SCHEMA_VERSION == 2
+    assert appended.schema_version == AUDIT_SCHEMA_VERSION == 3
     assert with_context.run_context == RUN
     assert without.run_context is None
     assert (await log.verify()).seq == 2
@@ -143,9 +143,7 @@ async def test_the_logs_own_patterns_apply_to_the_context(
 async def test_an_approval_with_such_a_context_is_not_stored(
     control_database: ControlDatabase,
 ) -> None:
-    database = control_database.database
-    log = SQLAuditLog(database, scrubber=PatternScrubber(extra_patterns=ACME_PATTERNS))
-    queue = SQLApprovalQueue(database, audit_log=log)
+    queue = split_queue(control_database, scrubber=PatternScrubber(extra_patterns=ACME_PATTERNS))
 
     with pytest.raises(AuditPayloadRejectedError):
         await submit(queue, context=ACME_RUN)

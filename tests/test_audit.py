@@ -6,14 +6,17 @@ import threading
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
+from uuid import UUID
 
 import psycopg
 import pytest
 
+from aox_agent_core.approvals import Decision, Principal, PrincipalKind
 from aox_agent_core.audit import (
     GENESIS_HASH,
     AuditEvent,
     AuditHead,
+    AuditRecord,
     UnsealedAuditRecord,
     compute_record_hash,
 )
@@ -22,7 +25,13 @@ from aox_agent_core.audit.chain import canonical_timestamp
 from aox_agent_core.audit.sql import SQLAuditLog
 from aox_agent_core.errors import AuditIntegrityError, AuditPayloadRejectedError, ConfigError
 from aox_agent_core.storage import open_database
-from databases import ControlDatabase, sqlite_database
+from databases import (
+    APPROVER_ROLE,
+    REQUESTER_ROLE,
+    ControlDatabase,
+    split_queue,
+    sqlite_database,
+)
 
 REFUSED = (sqlite3.DatabaseError, psycopg.Error)
 
@@ -180,7 +189,9 @@ def _rewrite_actor_and_rehash(database: ControlDatabase, *, seq: int, actor_id: 
         changes: dict[str, Any] = {"prev_hash": prev_hash}
         if record.seq == seq:
             changes["actor_id"] = actor_id
-        unsealed = UnsealedAuditRecord(**{**record.model_dump(exclude={"record_hash"}), **changes})
+        unsealed = UnsealedAuditRecord(
+            **{**record.model_dump(exclude={"record_hash", "db_role"}), **changes}
+        )
         record_hash = compute_record_hash(unsealed)
         database.raw(
             f"UPDATE {audit_sql.AUDIT_TABLE} SET actor_id = '{unsealed.actor_id}', "
@@ -310,11 +321,11 @@ async def test_verify_walks_in_batches_off_the_event_loop(
     [
         f"INSERT OR REPLACE INTO {audit_sql.AUDIT_TABLE} ({audit_sql.COLUMNS}) "
         "SELECT seq, schema_version, event_id, occurred_at, 'model.forged', actor_id, "
-        "subject_id, payload, run_context, prev_hash, record_hash "
+        "subject_id, payload, run_context, prev_hash, record_hash, db_role "
         f"FROM {audit_sql.AUDIT_TABLE} WHERE seq = 2",
         f"INSERT INTO {audit_sql.AUDIT_TABLE} ({audit_sql.COLUMNS}) "
         "SELECT 10, schema_version, 'forged-event', occurred_at, action, actor_id, "
-        "subject_id, payload, run_context, prev_hash, record_hash "
+        "subject_id, payload, run_context, prev_hash, record_hash, db_role "
         f"FROM {audit_sql.AUDIT_TABLE} WHERE seq = 3",
     ],
     ids=["insert-or-replace", "insert-out-of-order"],
@@ -379,7 +390,7 @@ async def test_insert_or_replace_on_an_existing_event_id_is_refused(tmp_path: Pa
         database.raw(
             f"INSERT OR REPLACE INTO {audit_sql.AUDIT_TABLE} ({audit_sql.COLUMNS}) "
             "SELECT 4, schema_version, event_id, occurred_at, action, actor_id, subject_id, "
-            "payload, run_context, prev_hash, record_hash "
+            "payload, run_context, prev_hash, record_hash, db_role "
             f"FROM {audit_sql.AUDIT_TABLE} WHERE seq = 2"
         )
 
@@ -396,7 +407,7 @@ async def test_a_temporary_table_cannot_stand_in_for_the_audit_table(
     forge_after_gap = (
         f"INSERT INTO public.{audit_sql.AUDIT_TABLE} ({audit_sql.COLUMNS}) "
         "SELECT 1001, schema_version, 'forged-event', occurred_at, action, actor_id, "
-        "subject_id, payload, run_context, prev_hash, record_hash "
+        "subject_id, payload, run_context, prev_hash, record_hash, db_role "
         f"FROM public.{audit_sql.AUDIT_TABLE} "
         "WHERE seq = 3"
     )
@@ -428,3 +439,69 @@ def test_too_old_sqlite_is_refused(tmp_path: Path, monkeypatch: pytest.MonkeyPat
 
     with pytest.raises(ConfigError, match="too old"):
         open_database(f"sqlite:///{tmp_path / 'audit.sqlite3'}")
+
+
+# db_role: who wrote each row, as the database saw it
+
+
+async def test_postgres_records_the_inserting_role(control_database: ControlDatabase) -> None:
+    queue = split_queue(control_database)
+    request = await queue.submit(
+        action="crm.update_contact",
+        summary="s",
+        payload={},
+        requested_by=Principal(id="agent-intake", kind=PrincipalKind.AGENT),
+        required_role="ops.approver",
+        ttl_seconds=600,
+    )
+    approver = Principal(id="user-17", kind=PrincipalKind.HUMAN, roles=frozenset({"ops.approver"}))
+    await queue.resolve(request.id, decision=Decision.APPROVE, principal=approver)
+
+    records = [record async for record in SQLAuditLog(control_database.database).iter_records()]
+    expected = (
+        [REQUESTER_ROLE, APPROVER_ROLE] if control_database.backend == "postgres" else [None, None]
+    )
+    assert [record.db_role for record in records] == expected
+    assert (await SQLAuditLog(control_database.database).verify()).seq == 2
+
+
+def test_db_role_is_outside_the_hash() -> None:
+    unsealed = UnsealedAuditRecord(
+        seq=1,
+        event_id=UUID("6f2b8a43-46bb-4f7e-9d43-27c3f2f0a6f1"),
+        occurred_at=datetime(2026, 10, 2, 12, 0, tzinfo=UTC),
+        action="model.call",
+        actor_id="svc",
+        subject_id=None,
+        payload={},
+        run_context=None,
+        prev_hash=GENESIS_HASH,
+    )
+    sealed = AuditRecord(**unsealed.model_dump(), record_hash=compute_record_hash(unsealed))
+
+    assert compute_record_hash(sealed.model_copy(update={"db_role": "someone"})) == (
+        sealed.record_hash
+    )
+
+
+async def test_an_a2_sqlite_file_gains_db_role_in_place(tmp_path: Path) -> None:
+    database = sqlite_database(tmp_path)
+    log = await filled_log(database, 2)
+    database.raw(f"ALTER TABLE {audit_sql.AUDIT_TABLE} DROP COLUMN db_role")
+
+    fresh = SQLAuditLog(database.database)
+    await fresh.append(event(3))
+
+    assert (await fresh.verify()).seq == 3
+    assert [record.db_role async for record in log.iter_records()] == [None, None, None]
+
+
+async def test_an_a2_postgres_table_asks_for_the_installer(
+    control_database: ControlDatabase,
+) -> None:
+    if control_database.backend != "postgres":
+        pytest.skip("only Postgres refuses; SQLite upgrades its own file")
+    control_database.raw(f"ALTER TABLE {audit_sql.AUDIT_TABLE} DROP COLUMN db_role")
+
+    with pytest.raises(ConfigError, match=r"0\.1\.0a2 .* install_postgres_schema"):
+        await SQLAuditLog(control_database.database).append(event(1))

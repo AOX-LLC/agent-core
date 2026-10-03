@@ -23,6 +23,7 @@ from uuid import UUID, uuid4
 
 from pydantic import JsonValue, ValidationError
 
+from aox_agent_core import _postgres_schema as layout
 from aox_agent_core._canonical import canonical_json
 from aox_agent_core._validation import STORED_RECORD
 from aox_agent_core.audit.chain import canonical_timestamp, compute_record_hash
@@ -35,17 +36,25 @@ from aox_agent_core.audit.types import (
 )
 from aox_agent_core.errors import AuditIntegrityError, AuditPayloadRejectedError, ConfigError
 from aox_agent_core.replay.scrub import PatternScrubber, Scrubber
-from aox_agent_core.storage import Database, Dialect, Session, require_current_table
+from aox_agent_core.storage import (
+    Database,
+    Dialect,
+    Session,
+    TableName,
+    bring_table_up_to_date,
+)
 
-AUDIT_TABLE: Final = "agent_core_audit"
+AUDIT_TABLE: Final = layout.AUDIT_TABLE
 RUN_CONTEXT_COLUMN: Final = "run_context"
 UPDATE_TRIGGER: Final = "agent_core_audit_no_update"
 DELETE_TRIGGER: Final = "agent_core_audit_no_delete"
-UPDATE_DELETE_TRIGGER: Final = "agent_core_audit_no_update_delete"
-TRUNCATE_TRIGGER: Final = "agent_core_audit_no_truncate"
-APPEND_TRIGGER: Final = "agent_core_audit_append_at_end"
+# The Postgres table, its triggers and grants are installed by
+# storage.install_postgres_schema (see _postgres_schema).
+UPDATE_DELETE_TRIGGER: Final = layout.AUDIT_UPDATE_DELETE_TRIGGER
+TRUNCATE_TRIGGER: Final = layout.AUDIT_TRUNCATE_TRIGGER
+APPEND_TRIGGER: Final = layout.AUDIT_APPEND_TRIGGER
 SQLITE_TRIGGERS: Final = frozenset({UPDATE_TRIGGER, DELETE_TRIGGER, APPEND_TRIGGER})
-POSTGRES_TRIGGERS: Final = frozenset({UPDATE_DELETE_TRIGGER, TRUNCATE_TRIGGER, APPEND_TRIGGER})
+POSTGRES_TRIGGERS: Final = layout.AUDIT_TRIGGERS
 
 # pg_advisory_xact_lock key that serializes appends: ASCII "agentcor" as an int64.
 APPEND_LOCK_KEY: Final = 0x6167656E74636F72
@@ -54,8 +63,10 @@ READ_BATCH_SIZE = 500
 
 COLUMNS = (
     "seq, schema_version, event_id, occurred_at, action, actor_id, subject_id, payload, "
-    "run_context, prev_hash, record_hash"
+    "run_context, prev_hash, record_hash, db_role"
 )
+# Columns added in 0.1.0a3, with their SQLite types.
+ADDED_IN_A3: Final = {"db_role": "TEXT"}
 
 _TABLE_DDL = f"""
 CREATE TABLE {AUDIT_TABLE} (
@@ -69,7 +80,8 @@ CREATE TABLE {AUDIT_TABLE} (
     payload TEXT NOT NULL,
     run_context TEXT,
     prev_hash TEXT NOT NULL,
-    record_hash TEXT NOT NULL
+    record_hash TEXT NOT NULL,
+    db_role TEXT
 )"""
 
 SQLITE_SCHEMA: Final = (
@@ -88,39 +100,6 @@ SQLITE_SCHEMA: Final = (
     BEGIN SELECT RAISE(ABORT, '{AUDIT_TABLE} is append-only'); END""",
 )
 
-POSTGRES_SCHEMA: Final = (
-    _TABLE_DDL,
-    # Both trigger functions pin search_path and reach the table through the
-    # trigger's own schema and name, so a temporary table of the same name cannot
-    # stand in for the audit table.
-    f"""CREATE FUNCTION {AUDIT_TABLE}_refuse_change() RETURNS trigger LANGUAGE plpgsql
-    SET search_path = pg_catalog, pg_temp AS $$
-    BEGIN RAISE EXCEPTION '{AUDIT_TABLE} is append-only'; END $$""",
-    f"""CREATE TRIGGER {UPDATE_DELETE_TRIGGER} BEFORE UPDATE OR DELETE ON {AUDIT_TABLE}
-    FOR EACH ROW EXECUTE FUNCTION {AUDIT_TABLE}_refuse_change()""",
-    f"""CREATE TRIGGER {TRUNCATE_TRIGGER} BEFORE TRUNCATE ON {AUDIT_TABLE}
-    FOR EACH STATEMENT EXECUTE FUNCTION {AUDIT_TABLE}_refuse_change()""",
-    f"""CREATE FUNCTION {AUDIT_TABLE}_append_at_end() RETURNS trigger LANGUAGE plpgsql
-    SET search_path = pg_catalog, pg_temp AS $$
-    DECLARE last_seq bigint;
-    BEGIN
-        EXECUTE format('SELECT COALESCE(MAX(seq), 0) FROM %I.%I', TG_TABLE_SCHEMA, TG_TABLE_NAME)
-            INTO last_seq;
-        IF NEW.seq <> last_seq + 1 THEN
-            RAISE EXCEPTION '{AUDIT_TABLE} is append-only';
-        END IF;
-        RETURN NEW;
-    END $$""",
-    f"""CREATE TRIGGER {APPEND_TRIGGER} BEFORE INSERT ON {AUDIT_TABLE}
-    FOR EACH ROW EXECUTE FUNCTION {AUDIT_TABLE}_append_at_end()""",
-    f"REVOKE ALL ON {AUDIT_TABLE} FROM PUBLIC",
-)
-
-
-def postgres_grants(app_role: str) -> tuple[str, ...]:
-    """The app role may read and append, nothing else."""
-    return (f'GRANT SELECT, INSERT ON {AUDIT_TABLE} TO "{app_role}"',)
-
 
 class SQLAuditLog:
     """The AuditLog protocol on a Database.
@@ -129,12 +108,20 @@ class SQLAuditLog:
     they are installed by the owner role (storage.install_postgres_schema), and
     the first write checks that the connecting role is not a superuser, does not
     own the table, and cannot UPDATE, DELETE or TRUNCATE it; otherwise it raises
-    ConfigError and writes nothing.
+    ConfigError and writes nothing. `schema` names the Postgres schema the table
+    was installed in (public by default); SQLite has none.
     """
 
-    def __init__(self, database: Database, *, scrubber: Scrubber | None = None) -> None:
+    def __init__(
+        self,
+        database: Database,
+        *,
+        scrubber: Scrubber | None = None,
+        schema: str | None = None,
+    ) -> None:
         self.database = database
         self._scrubber = scrubber if scrubber is not None else PatternScrubber()
+        self._table = TableName.on(database, AUDIT_TABLE, schema)
         self._protections_checked = False
 
     async def append(self, event: AuditEvent) -> AuditRecord:
@@ -171,7 +158,7 @@ class SQLAuditLog:
         self._ensure_protected(session)
         if session.dialect is Dialect.POSTGRES:
             session.execute("SELECT pg_advisory_xact_lock(?)", (APPEND_LOCK_KEY,))
-        head = _head_in(session)
+        head = _head_in(session, self._table)
         unsealed = UnsealedAuditRecord(
             seq=head.seq + 1,
             event_id=uuid4(),
@@ -184,17 +171,22 @@ class SQLAuditLog:
             prev_hash=head.record_hash,
         )
         record = AuditRecord(**unsealed.model_dump(), record_hash=compute_record_hash(unsealed))
-        session.execute(
-            f"INSERT INTO {AUDIT_TABLE} ({COLUMNS}) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        # On Postgres the insert trigger sets db_role to the inserting role, whatever
+        # is sent; SQLite has no roles and leaves it empty.
+        rows = session.execute(
+            f"INSERT INTO {self._table.sql} ({COLUMNS}) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+            + (" RETURNING db_role" if session.dialect is Dialect.POSTGRES else ""),
             _row_values(record),
         )
-        return record
+        return record.model_copy(update={"db_role": rows[0][0]}) if rows else record
 
     async def iter_records(self, *, after_seq: int = 0) -> AsyncIterator[AuditRecord]:
         """Yield records with seq greater than after_seq, in order, read in batches."""
         last_seq = after_seq
         while True:
-            batch = partial(_rows_after, after_seq=last_seq, limit=READ_BATCH_SIZE)
+            batch = partial(
+                _rows_after, table=self._table, after_seq=last_seq, limit=READ_BATCH_SIZE
+            )
             rows = await self.database.run(batch)
             for row in rows:
                 record = record_from_row(row)
@@ -205,7 +197,7 @@ class SQLAuditLog:
 
     async def head(self) -> AuditHead:
         """The latest record's seq and hash; seq 0 and the genesis hash if the log is empty."""
-        return await self.database.run(_head_in)
+        return await self.database.run(partial(_head_in, table=self._table))
 
     async def verify(self, *, expected_head: AuditHead | None = None) -> AuditHead:
         """Walk the whole chain, check every hash and seq, and return the head.
@@ -226,7 +218,7 @@ class SQLAuditLog:
         )
         while True:
             rows = self.database.run_sync(
-                partial(_rows_after, after_seq=head.seq, limit=READ_BATCH_SIZE)
+                partial(_rows_after, table=self._table, after_seq=head.seq, limit=READ_BATCH_SIZE)
             )
             for row in rows:
                 record = record_from_row(row)
@@ -248,9 +240,9 @@ class SQLAuditLog:
         if session.dialect is Dialect.SQLITE:
             _ensure_sqlite_schema(session)
         else:
-            _check_postgres_role(session)
-            _require_triggers(session, _postgres_triggers(session), POSTGRES_TRIGGERS)
-        require_current_table(session, AUDIT_TABLE, RUN_CONTEXT_COLUMN)
+            _check_postgres_role(session, self._table)
+            _require_triggers(session, _postgres_triggers(session, self._table), POSTGRES_TRIGGERS)
+        bring_table_up_to_date(session, AUDIT_TABLE, ADDED_IN_A3, schema=self._table.schema)
         self._protections_checked = True
 
 
@@ -266,9 +258,11 @@ def _check_link(record: AuditRecord, previous: AuditHead) -> None:
         raise AuditIntegrityError(f"Record {record.seq} was altered after it was written.")
 
 
-def audit_table_exists(database: Database) -> bool:
+def audit_table_exists(database: Database, *, schema: str | None = None) -> bool:
     """True when the database holds an audit table, so a check of it means something."""
-    return database.run_sync(_table_is_readable)
+    return database.run_sync(
+        partial(_table_is_readable, table=TableName.on(database, AUDIT_TABLE, schema))
+    )
 
 
 def _check_anchor(head: AuditHead, expected: AuditHead, anchored_hash: str | None) -> None:
@@ -336,29 +330,29 @@ LEFT JOIN pg_class c ON c.oid = target.oid
 """
 
 
-def _check_postgres_role(session: Session) -> None:
-    table_exists, can_change = session.execute(_ROLE_CHECK_SQL, (AUDIT_TABLE,))[0]
+def _check_postgres_role(session: Session, table: TableName) -> None:
+    table_exists, can_change = session.execute(_ROLE_CHECK_SQL, (table.sql,))[0]
     if not table_exists:
         raise ConfigError(
-            f"Table {AUDIT_TABLE} does not exist; install it with "
+            f"Table {table} does not exist; install it with "
             "storage.install_postgres_schema as the owner role."
         )
     if can_change:
         raise ConfigError(
             "The audit log's database role may only INSERT and SELECT on "
-            f"{AUDIT_TABLE}; this role, or a role it can switch to, is a superuser, owns "
+            f"{table}; this role, or a role it can switch to, is a superuser, owns "
             "the table, or can update, delete or truncate it. Connect as the application "
             "role."
         )
 
 
-def _postgres_triggers(session: Session) -> set[str]:
+def _postgres_triggers(session: Session, table: TableName) -> set[str]:
     return {
         row[0]
         for row in session.execute(
             "SELECT tgname FROM pg_trigger "
             "WHERE tgrelid = to_regclass(?) AND NOT tgisinternal AND tgenabled <> 'D'",
-            (AUDIT_TABLE,),
+            (table.sql,),
         )
     }
 
@@ -371,31 +365,33 @@ def _sqlite_table_exists(session: Session) -> bool:
     )
 
 
-def _table_is_readable(session: Session) -> bool:
+def _table_is_readable(session: Session, table: TableName) -> bool:
     if session.dialect is Dialect.SQLITE:
         return _sqlite_table_exists(session)
-    return bool(session.execute("SELECT to_regclass(?) IS NOT NULL", (AUDIT_TABLE,))[0][0])
+    return bool(session.execute("SELECT to_regclass(?) IS NOT NULL", (table.sql,))[0][0])
 
 
-def _head_in(session: Session) -> AuditHead:
+def _head_in(session: Session, table: TableName) -> AuditHead:
     # A missing table means nothing was ever written, which is an empty log, not an error.
-    if not _table_is_readable(session):
+    if not _table_is_readable(session, table):
         return AuditHead(seq=0, record_hash=GENESIS_HASH)
-    rows = session.execute(f"SELECT seq, record_hash FROM {AUDIT_TABLE} ORDER BY seq DESC LIMIT 1")
+    rows = session.execute(f"SELECT seq, record_hash FROM {table.sql} ORDER BY seq DESC LIMIT 1")
     if not rows:
         return AuditHead(seq=0, record_hash=GENESIS_HASH)
     seq, record_hash = rows[0]
     return AuditHead(seq=seq, record_hash=record_hash)
 
 
-def _rows_after(session: Session, after_seq: int, limit: int | None) -> list[tuple[Any, ...]]:
+def _rows_after(
+    session: Session, table: TableName, after_seq: int, limit: int | None
+) -> list[tuple[Any, ...]]:
     # limit is formatted in, not bound, and int() keeps that safe.
-    if not _table_is_readable(session):
+    if not _table_is_readable(session, table):
         return []
-    require_current_table(session, AUDIT_TABLE, RUN_CONTEXT_COLUMN)
+    bring_table_up_to_date(session, AUDIT_TABLE, ADDED_IN_A3, schema=table.schema)
     limit_clause = f" LIMIT {int(limit)}" if limit is not None else ""
     return session.execute(
-        f"SELECT {COLUMNS} FROM {AUDIT_TABLE} WHERE seq > ? ORDER BY seq{limit_clause}",
+        f"SELECT {COLUMNS} FROM {table.sql} WHERE seq > ? ORDER BY seq{limit_clause}",
         (after_seq,),
     )
 
@@ -417,13 +413,14 @@ def _row_values(record: AuditRecord) -> tuple[Any, ...]:
         ),
         record.prev_hash,
         record.record_hash,
+        None,
     )
 
 
 def record_from_row(row: tuple[Any, ...]) -> AuditRecord:
     """Rebuild a record from a COLUMNS-ordered row; AuditIntegrityError if it is malformed."""
     seq, schema_version, event_id, occurred_at, action, actor_id, subject_id = row[:7]
-    payload, run_context, prev_hash, record_hash = row[7:]
+    payload, run_context, prev_hash, record_hash, db_role = row[7:]
     try:
         return AuditRecord.model_validate(
             {
@@ -438,6 +435,7 @@ def record_from_row(row: tuple[Any, ...]) -> AuditRecord:
                 "run_context": json.loads(run_context) if run_context is not None else None,
                 "prev_hash": prev_hash,
                 "record_hash": record_hash,
+                "db_role": db_role,
             },
             context={STORED_RECORD: True},
         )

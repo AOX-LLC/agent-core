@@ -8,6 +8,41 @@ Pre-releases are spelled the PEP 440 way, so tags look like `v0.1.0a1`.
 
 ## [Unreleased]
 
+## [0.1.0a3] - 2026-10-03
+
+Approvals enforced by Postgres itself, not only by the library.
+
+### Security
+
+- In 0.1.0a2, Postgres approvals relied on library checks only. `install_postgres_schema` gave one application role SELECT, INSERT and UPDATE on the approvals table, so that role could set a request approved with plain SQL, bypassing the rule that only a human holding the required role may resolve it. 0.1.0a3 adds database enforcement: separate requester and approver roles, column grants, and a guard trigger that checks every insert and update against the allowed transitions using the database's own role membership and clock. A host on 0.1.0a2 should upgrade (see docs/upgrade-0.1.0a3.md) and check its approved requests against the audit log with the query given there.
+- `consume()` accepted any principal. It now requires the requester, or a delegate the request names.
+- Both roles may append audit records and `actor_id` is supplied by the library, so a record could claim the wrong actor. Audit records now carry `db_role`, set by the database to the inserting role.
+- The library pins `search_path` to `pg_catalog, pg_temp` on every Postgres transaction, and the installer and every queue refuse to run while the requester role can create objects in the install schema or in `public` (PUBLIC's default before Postgres 15), where approver-side code could run them with the approver's rights.
+- The guard requires the library's canonical UTC timestamps and checks every column's shape, so session settings cannot change how a lifetime is read and a hand-written row cannot block the approver's listing.
+- The requester writes `required_role`, so it no longer decides who may approve. `RoleApproverPolicy` takes the role each action needs from `roles_by_action`, configured on the approver side, and refuses a request for an unlisted action (`unknown_action`) or whose stored role differs (`role_mismatch`), both audited.
+- Requests approved by plain SQL under 0.1.0a2 survive an upgrade. The guard refuses to let a request whose lifetime exceeds 7 days be decided or used, the install report lists approved, unused requests no `approval.resolved` event approves (`unaudited_approvals`), and `close_unaudited_approvals=True` cancels them during the upgrade.
+
+### Changed (breaking)
+
+- `install_postgres_schema(owner_url, *, requester_role, approver_role, schema="public")` replaces `app_role=`, returns an `InstallReport`, and needs Postgres 14 or later (with `CREATE ON SCHEMA public` revoked from PUBLIC). It is idempotent, schema-qualified and upgrades a 0.1.0a2 schema in place.
+- On Postgres a queue connects as the requester role (the agent side: submit, consume, cancel) or the approver role (the decision side: approve, reject); a call from the wrong side raises `ConfigError`. A queue refuses to start if the schema predates 0.1.0a3, lost its guard, or the roles are set up wrongly.
+- `consume()` raises `NotTheRequesterError` for anyone but the requester or a named delegate.
+- `RoleApproverPolicy()` with no arguments refuses every request. Pass `roles_by_action={...}` on the approver side, or `trust_requester_role=True` to take the requester's `required_role` as given (local development only). A subclass whose `__init__` skips `super().__init__()` refuses too.
+- The `ApprovalQueue` protocol gains `cancel()` and `expire_due()`, and `submit()` a `delegates` keyword. A host's own queue must add them.
+- `ApprovalRequest` gains `closed_at`, set exactly when the status is `EXPIRED` or `CANCELLED`, and `delegates`. Both statuses are now stored.
+- Audit schema 3: `AuditRecord.db_role`, outside the hash. Version 2 records in an upgraded chain keep their version and still verify. `UnsealedAuditRecord.schema_version` accepts 2 or 3.
+- Postgres tables from 0.1.0a2 are refused until the 0.1.0a3 installer upgrades them; a SQLite file from 0.1.0a2 gains the new columns in place.
+
+### Added
+
+- `cancel(request_id, *, principal, reason=None, context=None)`: the requester withdraws a pending request; audited, refusals included.
+- `expire_due(*, principal, now=None, limit=500)`: stores EXPIRED on pending requests past their lifetime, audited per request; either side may run it. Reads still report such requests as expired without it.
+- `submit(..., delegates=...)`: up to 16 principals allowed to consume in the requester's place, fixed and shown to the approver.
+- `schema=` on `SQLAuditLog` and `SQLApprovalQueue`, and `--schema` on `aox-agent-core audit verify`.
+- `ApprovalSide`, `SQLApprovalQueue.side()`, `NotTheRequesterError`, `storage.InstallReport` and `storage.Grant`.
+- `RoleApproverPolicy(roles_by_action=..., trust_requester_role=...)`, and the denial reasons `NOT_REQUESTER`, `UNKNOWN_ACTION` and `ROLE_MISMATCH`.
+- docs/upgrade-0.1.0a3.md: the role layout, the transition table, setup, and the upgrade from 0.1.0a2.
+
 ## [0.1.0a2] - 2026-10-02
 
 What a consuming project needs to key replay by prompt, send images and PDFs, and tie calls, approvals and audit records to its own runs.
@@ -58,6 +93,7 @@ The first pre-release. Projects can pin it; the API may still change before 0.1.
 - Extras `bedrock`, `postgres`, `otel` and `testing`; examples for a routed call and for the control layer.
 - CI on every pull request (lint, types, tests on Python 3.11 to 3.14 with Postgres, package check, gitleaks) and a tag-driven release workflow.
 
-[Unreleased]: https://github.com/AOX-LLC/agent-core/compare/v0.1.0a2...HEAD
+[Unreleased]: https://github.com/AOX-LLC/agent-core/compare/v0.1.0a3...HEAD
+[0.1.0a3]: https://github.com/AOX-LLC/agent-core/compare/v0.1.0a2...v0.1.0a3
 [0.1.0a2]: https://github.com/AOX-LLC/agent-core/compare/v0.1.0a1...v0.1.0a2
 [0.1.0a1]: https://github.com/AOX-LLC/agent-core/releases/tag/v0.1.0a1

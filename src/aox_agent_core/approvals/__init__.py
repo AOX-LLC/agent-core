@@ -6,6 +6,7 @@ from aox_agent_core.approvals.sql import SQLApprovalQueue, approval_payload_hash
 from aox_agent_core.approvals.types import (
     TTL_SECONDS_MAX,
     ApprovalRequest,
+    ApprovalSide,
     ApprovalStatus,
     Decision,
     DenialReason,
@@ -18,6 +19,7 @@ __all__ = [
     "TTL_SECONDS_MAX",
     "ApprovalQueue",
     "ApprovalRequest",
+    "ApprovalSide",
     "ApprovalStatus",
     "ApproverPolicy",
     "Decision",

@@ -16,6 +16,7 @@ from aox_agent_core.approvals import (
     Decision,
     Principal,
     PrincipalKind,
+    RoleApproverPolicy,
     SQLApprovalQueue,
 )
 from aox_agent_core.audit import AuditEvent, SQLAuditLog
@@ -85,7 +86,9 @@ async def main() -> None:
 
     database = open_database(f"sqlite:///{arguments.path}")
     log = SQLAuditLog(database)
-    queue = SQLApprovalQueue(database, audit_log=log)
+    # The approver side decides which role each action needs.
+    policy = RoleApproverPolicy(roles_by_action={"crm.update_contact": "ops.approver"})
+    queue = SQLApprovalQueue(database, audit_log=log, policy=policy)
     if arguments.step == "seed":
         await seed(log, queue)
     else:

@@ -119,6 +119,11 @@ class ApprovalAlreadyResolvedError(ApprovalError):
     """The request is no longer open: already resolved, consumed or cancelled."""
 
 
+class NotTheRequesterError(ApprovalError):
+    """Only the principal who asked for an approval, or a delegate it named, may use or
+    cancel it."""
+
+
 class ApprovalNotGrantedError(ApprovalError):
     """The action was attempted while its request was pending or after it was rejected."""
 

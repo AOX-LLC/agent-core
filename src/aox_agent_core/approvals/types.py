@@ -15,6 +15,7 @@ RoleName = Annotated[str, StringConstraints(pattern=r"^[a-z][a-z0-9_.-]{0,63}$")
 ShortText = Annotated[str, StringConstraints(min_length=1, max_length=500)]
 
 TTL_SECONDS_MAX = 7 * 24 * 60 * 60
+MAX_DELEGATES = 16
 
 
 class PrincipalKind(StrEnum):
@@ -40,8 +41,10 @@ class Principal(FrozenModel):
 class ApprovalStatus(StrEnum):
     """Where a request is in its life. CONSUMED means its one permitted run has happened.
 
-    EXPIRED and CANCELLED are reserved: this release never sets them. Expiry is
-    judged from expires_at whenever a request is resolved or used.
+    A pending request becomes CANCELLED when its requester withdraws it, and
+    EXPIRED when expire_due() stores its expiry. Expiry does not wait for that
+    sweep: it is judged from expires_at whenever a request is read, resolved or
+    used, so a pending request past its lifetime reads as EXPIRED either way.
     """
 
     PENDING = "pending"
@@ -50,6 +53,21 @@ class ApprovalStatus(StrEnum):
     CONSUMED = "consumed"
     EXPIRED = "expired"
     CANCELLED = "cancelled"
+
+
+class ApprovalSide(StrEnum):
+    """Which side of the approval queue a connection acts for.
+
+    On Postgres the requester role (the agent side) submits, consumes and
+    cancels, and the approver role (the decision side) approves and rejects;
+    the database enforces it. SQLite has no roles, so a SQLite queue is BOTH and
+    the library's checks are all there is: anyone who can write the file is
+    trusted with everything.
+    """
+
+    REQUESTER = "requester"
+    APPROVER = "approver"
+    BOTH = "both"
 
 
 class Decision(StrEnum):
@@ -78,6 +96,10 @@ class ApprovalRequest(FrozenModel):
     never authorize a different action that happens to share its payload.
     An approval authorizes a single run: using it moves it to CONSUMED.
     run_context is the run that asked for the approval, if the caller named one.
+
+    Only requested_by may consume it, unless it names delegates: principals the
+    requester allowed to consume in its place, fixed when it is submitted and
+    shown to whoever decides it.
     """
 
     id: UUID
@@ -93,8 +115,16 @@ class ApprovalRequest(FrozenModel):
     resolved_by: PrincipalId | None = None
     resolved_at: AwareDatetime | None = None
     consumed_at: AwareDatetime | None = None
+    closed_at: AwareDatetime | None = None
     reason: ShortText | None = None
     run_context: RunContext | None = None
+    delegates: frozenset[PrincipalId] = frozenset()
+
+    @model_validator(mode="after")
+    def _few_delegates(self) -> Self:
+        if len(self.delegates) > MAX_DELEGATES:
+            raise ValueError(f"at most {MAX_DELEGATES} delegates")
+        return self
 
     @model_validator(mode="after")
     def _lifetime_is_bounded(self) -> Self:
@@ -122,6 +152,9 @@ class ApprovalRequest(FrozenModel):
 
         if (self.consumed_at is not None) != (self.status is ApprovalStatus.CONSUMED):
             raise ValueError("consumed_at is set exactly when the status is consumed")
+        is_closed = self.status in {ApprovalStatus.EXPIRED, ApprovalStatus.CANCELLED}
+        if (self.closed_at is not None) != is_closed:
+            raise ValueError("closed_at is set exactly when the status is expired or cancelled")
         return self
 
     def is_expired(self, now: datetime) -> bool:
@@ -135,6 +168,9 @@ class DenialReason(StrEnum):
     MISSING_ROLE = "missing_role"
     SELF_APPROVAL = "self_approval"
     NOT_PENDING = "not_pending"
+    NOT_REQUESTER = "not_requester"
+    UNKNOWN_ACTION = "unknown_action"
+    ROLE_MISMATCH = "role_mismatch"
     EXPIRED = "expired"
 
 

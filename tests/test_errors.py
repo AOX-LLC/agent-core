@@ -34,6 +34,7 @@ EXPECTED_PARENTS: dict[type[Exception], type[Exception]] = {
     errors.ApprovalError: AgentCoreError,
     errors.ApprovalNotFoundError: ApprovalError,
     errors.NotAuthorizedToResolveError: ApprovalError,
+    errors.NotTheRequesterError: ApprovalError,
     errors.ApprovalAlreadyResolvedError: ApprovalError,
     errors.ApprovalNotGrantedError: ApprovalError,
     errors.ApprovalExpiredError: ApprovalError,

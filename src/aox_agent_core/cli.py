@@ -57,10 +57,15 @@ def main(argv: Sequence[str] | None = None) -> int:
     verify.add_argument("url", nargs="?")
     verify.add_argument("--anchor-seq", type=int)
     verify.add_argument("--anchor-hash")
+    verify.add_argument(
+        "--schema", help="the Postgres schema the audit log was installed in (default: public)"
+    )
     arguments = parser.parse_args(argv)
 
     if arguments.command == "audit":
-        return _verify_audit(arguments.url, arguments.anchor_seq, arguments.anchor_hash)
+        return _verify_audit(
+            arguments.url, arguments.anchor_seq, arguments.anchor_hash, arguments.schema
+        )
     return _check_cassettes_command(arguments.directory)
 
 
@@ -82,7 +87,9 @@ def _check_cassettes_command(directory: Path) -> int:
     return 0
 
 
-def _verify_audit(url: str | None, anchor_seq: int | None, anchor_hash: str | None) -> int:
+def _verify_audit(
+    url: str | None, anchor_seq: int | None, anchor_hash: str | None, schema: str | None = None
+) -> int:
     if (anchor_seq is None) != (anchor_hash is None):
         print("error: pass --anchor-seq and --anchor-hash together", file=sys.stderr)
         return 2
@@ -107,10 +114,10 @@ def _verify_audit(url: str | None, anchor_seq: int | None, anchor_hash: str | No
         if isinstance(database, SQLiteDatabase) and not database.path.is_file():
             print(f"error: no audit database at {database.path}", file=sys.stderr)
             return 2
-        if not audit_table_exists(database):
+        if not audit_table_exists(database, schema=schema):
             print("error: this database has no audit log table", file=sys.stderr)
             return 2
-        log = SQLAuditLog(database)
+        log = SQLAuditLog(database, schema=schema)
         anchor = (
             AuditHead(seq=anchor_seq, record_hash=anchor_hash)
             if anchor_seq is not None and anchor_hash is not None

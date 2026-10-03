@@ -11,8 +11,10 @@ from aox_agent_core._canonical import canonical_json
 from aox_agent_core._model import ActionName, FrozenModel, PrincipalId, Sha256Hex, SubjectId
 from aox_agent_core.context import RunContext
 
-# 2 added run_context to every record and to its hash (agent-core 0.1.0a2).
-AUDIT_SCHEMA_VERSION: Final = 2
+# 2 added run_context to every record and to its hash (agent-core 0.1.0a2); 3
+# added db_role, set by the database and kept out of the hash (0.1.0a3). A chain
+# upgraded from 2 keeps its earlier records at 2, and they still verify.
+AUDIT_SCHEMA_VERSION: Final = 3
 GENESIS_HASH: Final = "0" * 64
 MAX_PAYLOAD_BYTES = 8_192
 MAX_SAFE_INTEGER: Final = 2**53 - 1
@@ -94,7 +96,7 @@ class UnsealedAuditRecord(FrozenModel):
     Postgres jsonb, so verify() hashes exactly the bytes append() hashed.
     """
 
-    schema_version: Literal[2] = AUDIT_SCHEMA_VERSION
+    schema_version: Literal[2, 3] = AUDIT_SCHEMA_VERSION
     seq: Annotated[int, Field(ge=1)]
     event_id: UUID
     occurred_at: AwareDatetime
@@ -107,9 +109,17 @@ class UnsealedAuditRecord(FrozenModel):
 
 
 class AuditRecord(UnsealedAuditRecord):
-    """A stored record, sealed with record_hash = compute_record_hash(its other fields)."""
+    """A stored record, sealed with record_hash = compute_record_hash(its other fields).
+
+    db_role is the database role that inserted the record. On Postgres the
+    database sets it itself, whatever the writer supplied, and keeps it fixed
+    like every other column: actor_id is who the library was told acted, db_role
+    is who wrote the row. It is outside the hash, so it is always None on SQLite,
+    which has no roles, and proves nothing about records copied elsewhere.
+    """
 
     record_hash: Sha256Hex
+    db_role: str | None = None
 
 
 class AuditHead(FrozenModel):

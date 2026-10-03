@@ -72,6 +72,7 @@ EXPECTED_EXPORTS = {
         "TTL_SECONDS_MAX",
         "ApprovalQueue",
         "ApprovalRequest",
+        "ApprovalSide",
         "ApprovalStatus",
         "ApproverPolicy",
         "Decision",
@@ -117,6 +118,8 @@ EXPECTED_EXPORTS = {
     "aox_agent_core.storage": [
         "Database",
         "Dialect",
+        "Grant",
+        "InstallReport",
         "PostgresDatabase",
         "SQLiteDatabase",
         "Session",
