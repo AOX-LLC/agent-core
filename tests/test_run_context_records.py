@@ -268,11 +268,11 @@ def _update_triggers(database: ControlDatabase) -> list[str]:
     return [f"DROP TRIGGER {audit_sql.UPDATE_DELETE_TRIGGER} ON {audit_sql.AUDIT_TABLE}"]
 
 
-def test_table_columns_refuses_a_name_that_is_not_an_identifier(tmp_path: Path) -> None:
+async def test_table_columns_refuses_a_name_that_is_not_an_identifier(tmp_path: Path) -> None:
     database = open_database(f"sqlite:///{tmp_path / 'x.sqlite3'}")
 
     with pytest.raises(ValueError, match="not a plain table name"):
-        database.run_sync(lambda session: table_columns(session, "x); DROP TABLE y; --"))
+        await database.run(lambda session: table_columns(session, "x); DROP TABLE y; --"))
 
 
 def test_contexts_and_what_holds_them_copy_and_pickle() -> None:

@@ -385,9 +385,9 @@ def test_the_database_records_who_wrote_each_audit_row(pg: ControlDatabase) -> N
     assert pg.requester_raw is not None
     pg.requester_raw(
         "INSERT INTO agent_core_audit (seq, schema_version, event_id, occurred_at, action, "
-        "actor_id, payload, prev_hash, record_hash, db_role) VALUES (1, 2, 'e1', "
-        f"'{stamp(NOW)}', 'approval.resolved', 'user-17', '{{}}', '{'0' * 64}', '{'0' * 64}', "
-        f"'{APPROVER_ROLE}')"
+        "actor_id, payload, prev_hash, record_hash, db_role) VALUES (1, 3, "
+        f"'{uuid4()}', '{stamp(NOW)}', 'approval.resolved', 'user-17', '{{}}', '{'0' * 64}', "
+        f"'{'0' * 64}', '{APPROVER_ROLE}')"
     )
 
     assert pg.raw("SELECT actor_id, db_role FROM agent_core_audit") == [("user-17", REQUESTER_ROLE)]
@@ -626,13 +626,15 @@ async def test_an_a2_schema_is_upgraded_in_place() -> None:
             ),
         )
         assert database.requester_raw is not None
-        next_seq = database.raw("SELECT max(seq) + 1 FROM agent_core_audit")[0][0]
+        next_seq, head_hash = database.raw(
+            "SELECT seq + 1, record_hash FROM agent_core_audit ORDER BY seq DESC LIMIT 1"
+        )[0]
         database.requester_raw(
             "INSERT INTO agent_core_audit (seq, schema_version, event_id, occurred_at, action, "
             "actor_id, subject_id, payload, prev_hash, record_hash) VALUES "
             f"({next_seq}, 3, '{uuid4()}', '{stamp(NOW)}', 'approval.resolved', 'user-17', "
             f'\'{legacy_id}\', \'{{"approval_action":"crm.update_contact","decision":'
-            f"\"approve\"}}', '{'0' * 64}', '{'0' * 64}')"
+            f"\"approve\"}}', '{head_hash}', '{'0' * 64}')"
         )
 
         closing = install_postgres_schema(

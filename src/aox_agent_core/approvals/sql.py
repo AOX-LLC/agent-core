@@ -7,7 +7,7 @@ a Database, in the same transaction as the change.
 """
 
 import json
-from collections.abc import Callable, Collection, Mapping, Sequence
+from collections.abc import Awaitable, Callable, Collection, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from typing import Any, Final, TypeVar
@@ -32,25 +32,29 @@ from aox_agent_core.approvals.types import (
 from aox_agent_core.audit.chain import canonical_timestamp
 from aox_agent_core.audit.log import AuditLog
 from aox_agent_core.audit.sql import SQLAuditLog
-from aox_agent_core.audit.types import AuditEvent
+from aox_agent_core.audit.types import AuditEvent, check_payload
 from aox_agent_core.context import RunContext
 from aox_agent_core.errors import (
     ApprovalAlreadyResolvedError,
     ApprovalError,
     ApprovalExpiredError,
+    ApprovalIntegrityError,
     ApprovalNotFoundError,
     ApprovalNotGrantedError,
     ApprovalPayloadMismatchError,
+    ApprovalPayloadRejectedError,
     ConfigError,
     NotAuthorizedToResolveError,
     NotTheRequesterError,
 )
+from aox_agent_core.replay.scrub import PatternScrubber, Scrubber
 from aox_agent_core.storage import (
     Database,
     Dialect,
     Session,
     TableName,
     bring_table_up_to_date,
+    driver_errors,
     require_current_table,
 )
 
@@ -77,10 +81,15 @@ CREATE TABLE {APPROVALS_TABLE} (
     reason TEXT,
     run_context TEXT,
     closed_at TEXT,
-    delegates TEXT NOT NULL DEFAULT '[]'
+    delegates TEXT NOT NULL DEFAULT '[]',
+    payload_json TEXT
 )"""
-# Columns added in 0.1.0a3, with their SQLite types.
-ADDED_IN_A3: Final = {"closed_at": "TEXT", "delegates": "TEXT NOT NULL DEFAULT '[]'"}
+# Columns added in 0.1.0a3 and 0.1.0a4, with their SQLite types.
+ADDED_COLUMNS: Final = {
+    "closed_at": "TEXT",
+    "delegates": "TEXT NOT NULL DEFAULT '[]'",
+    "payload_json": "TEXT",
+}
 
 _PENDING_INDEX_DDL = (
     f"CREATE INDEX agent_core_approvals_pending ON {APPROVALS_TABLE} (status, created_at, id)"
@@ -94,9 +103,12 @@ PENDING_PAGE_SIZE = 500
 _COLUMNS = (
     "id, action, summary, payload_sha256, requested_by, required_role, created_at, "
     "expires_at, status, decision, resolved_by, resolved_at, consumed_at, reason, run_context, "
-    "delegates, closed_at"
+    "delegates, closed_at, payload_json"
 )
 DELEGATES_COLUMN: Final = "delegates"
+PAYLOAD_COLUMN: Final = "payload_json"
+# Seconds an independent audit write waits for the append lock before falling back.
+DENIAL_LOCK_TIMEOUT: Final = "2s"
 
 _DENIAL_ERRORS: Final[Mapping[DenialReason, type[ApprovalError]]] = {
     DenialReason.NOT_HUMAN: NotAuthorizedToResolveError,
@@ -148,8 +160,10 @@ class SQLApprovalQueue:
         policy: ApproverPolicy | None = None,
         clock: Callable[[], datetime] | None = None,
         schema: str | None = None,
+        scrubber: Scrubber | None = None,
     ) -> None:
         self.database = database
+        self._scrubber = scrubber if scrubber is not None else PatternScrubber()
         self._table = TableName.on(database, APPROVALS_TABLE, schema)
         self._audit_log = audit_log
         self._policy = policy if policy is not None else RoleApproverPolicy()
@@ -157,26 +171,43 @@ class SQLApprovalQueue:
         self._schema = self._table.schema or layout.DEFAULT_SCHEMA
         self._side: ApprovalSide | None = None
 
-    async def side(self) -> ApprovalSide:
+    async def side(self, *, connection: Any = None) -> ApprovalSide:
         """Which side this queue's connection acts for, checking the setup first.
 
         Raises ConfigError if the Postgres schema or roles are wrong; see
         _postgres_schema.check_connection.
         """
-        return await self.database.run(self._prepare)
+        return await self._run(self._prepare, write=False, connection=connection)
 
-    def _prepare(self, session: Session) -> ApprovalSide:
+    async def _run(
+        self,
+        work: Callable[[Session], Awaitable[ResultT]],
+        *,
+        write: bool,
+        connection: Any,
+    ) -> ResultT:
+        """Run `work` in a transaction of its own, or in the host's on `connection`."""
+        if connection is None:
+            return await self.database.run(work, write=write)
+        return await self.database.run_on(connection, work)
+
+    async def _prepare(self, session: Session) -> ApprovalSide:
         """Check the connection once per queue, upgrading a SQLite file in place."""
         if self._side is None:
             if session.dialect is Dialect.SQLITE:
-                bring_table_up_to_date(session, APPROVALS_TABLE, ADDED_IN_A3)
+                await bring_table_up_to_date(session, APPROVALS_TABLE, ADDED_COLUMNS)
                 self._side = ApprovalSide.BOTH
             else:
-                self._side = ApprovalSide(layout.check_connection(session, self._schema))
+                side = ApprovalSide(await layout.check_connection(session, self._schema))
+                # An installer that predates this release leaves columns out.
+                await bring_table_up_to_date(
+                    session, APPROVALS_TABLE, ADDED_COLUMNS, schema=self._table.schema
+                )
+                self._side = side
         return self._side
 
-    def _require_side(self, session: Session, operation: str, side: ApprovalSide) -> None:
-        actual = self._prepare(session)
+    async def _require_side(self, session: Session, operation: str, side: ApprovalSide) -> None:
+        actual = await self._prepare(session)
         if actual not in (side, ApprovalSide.BOTH):
             raise ConfigError(
                 f"This queue connects as the {actual.value} role, which cannot {operation}; "
@@ -200,16 +231,27 @@ class SQLApprovalQueue:
         ttl_seconds: int,
         delegates: Collection[str] = (),
         context: RunContext | None = None,
+        include_payload: bool = False,
+        connection: Any = None,
     ) -> ApprovalRequest:
         """Queue a request that expires after ttl_seconds (at most TTL_SECONDS_MAX).
 
-        The payload's hash is stored; the payload itself is not. `context`, the
-        run asking, is stored on the request and its audit event. Only
-        requested_by may consume the approval, unless `delegates` names other
-        principals allowed to: an explicit choice, shown to the approver.
+        The payload's hash is stored. The payload itself is stored only with
+        include_payload=True: at most MAX_STORED_PAYLOAD_BYTES of canonical JSON,
+        with the audit log's key, number and secret rules, else
+        ApprovalPayloadRejectedError. Every read checks a stored payload against
+        the hash before returning it (ApprovalIntegrityError otherwise), so the
+        approver is shown what the hash binds. It is never copied into the audit
+        log. `context`, the run asking, is stored on the request and its audit
+        event. Only requested_by may consume the approval, unless `delegates` names
+        other principals allowed to: an explicit choice, shown to the approver.
+
+        With `connection`, a psycopg AsyncConnection already in a transaction, the
+        request and its audit event are written in that transaction.
         """
         if not 0 < ttl_seconds <= TTL_SECONDS_MAX:
             raise ValueError(f"ttl_seconds must be 1 to {TTL_SECONDS_MAX}, got {ttl_seconds}")
+        stored_payload = self._payload_to_store(payload) if include_payload else None
         now = self._now()
         request = ApprovalRequest(
             id=uuid4(),
@@ -222,17 +264,18 @@ class SQLApprovalQueue:
             expires_at=now + timedelta(seconds=ttl_seconds),
             run_context=context,
             delegates=frozenset(delegates),
+            payload=stored_payload,
         )
 
-        def insert(session: Session) -> _Outcome:
-            self._require_side(session, "submit requests", ApprovalSide.REQUESTER)
-            _ensure_table(session)
-            require_current_table(
+        async def insert(session: Session) -> _Outcome:
+            await self._require_side(session, "submit requests", ApprovalSide.REQUESTER)
+            await _ensure_table(session)
+            await require_current_table(
                 session, APPROVALS_TABLE, RUN_CONTEXT_COLUMN, schema=self._table.schema
             )
-            session.execute(
+            await session.execute(
                 f"INSERT INTO {self._table.sql} ({_COLUMNS}) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 _row_values(request),
             )
             event = _event(
@@ -249,16 +292,35 @@ class SQLApprovalQueue:
                 )
             return _Outcome(request=request, events=[event])
 
-        return await self._write(insert)
+        return await self._write(insert, connection=connection)
 
-    async def get(self, request_id: UUID) -> ApprovalRequest:
-        """Return the request; raises ApprovalNotFoundError if there is none."""
+    def _payload_to_store(self, payload: Mapping[str, JsonValue]) -> dict[str, JsonValue]:
+        """The payload to keep with a request, or ApprovalPayloadRejectedError."""
+        try:
+            checked = check_payload(dict(payload), max_bytes=layout.MAX_STORED_PAYLOAD_BYTES)
+        except ValueError as error:
+            raise ApprovalPayloadRejectedError(f"The payload cannot be stored: {error}") from error
+        if len(canonical_json(checked)) > layout.MAX_STORED_PAYLOAD_BYTES:
+            raise ApprovalPayloadRejectedError(
+                f"The payload cannot be stored: more than {layout.MAX_STORED_PAYLOAD_BYTES} bytes."
+            )
+        findings = self._scrubber.find_secrets({"payload": checked})
+        if findings:
+            located = ", ".join(f"{finding.rule} at {finding.path}" for finding in findings)
+            raise ApprovalPayloadRejectedError(
+                f"The payload cannot be stored: it contains {located}."
+            )
+        return checked
 
-        def read(session: Session) -> ApprovalRequest | None:
-            self._prepare(session)
-            return _load(session, self._table, request_id)
+    async def get(self, request_id: UUID, *, connection: Any = None) -> ApprovalRequest:
+        """Return the request; raises ApprovalNotFoundError if there is none, and
+        ApprovalIntegrityError if its stored payload does not match its hash."""
 
-        request = await self.database.run(read)
+        async def read(session: Session) -> ApprovalRequest | None:
+            await self._prepare(session)
+            return await _load(session, self._table, request_id)
+
+        request = await self._run(read, write=False, connection=connection)
         if request is None:
             raise ApprovalNotFoundError(f"No approval request {request_id}.")
         if request.status is ApprovalStatus.PENDING and request.is_expired(self._now()):
@@ -274,6 +336,7 @@ class SQLApprovalQueue:
         *,
         limit: int = DEFAULT_PENDING_LIMIT,
         after: UUID | None = None,
+        connection: Any = None,
     ) -> Sequence[ApprovalRequest]:
         """Up to `limit` pending, unexpired requests this principal may resolve, oldest first.
 
@@ -285,6 +348,9 @@ class SQLApprovalQueue:
         database also narrows by role and requester, which keeps a large queue
         cheap; with any other policy the queue is read page by page until `limit`
         requests pass or none are left, so a custom policy sees every candidate.
+
+        A request whose stored payload does not match its hash is left out: the
+        approver must not be shown it, and resolving it is refused and audited.
         """
         if limit < 1:
             raise ValueError(f"limit must be at least 1, got {limit}")
@@ -298,14 +364,14 @@ class SQLApprovalQueue:
         page_size = limit if uses_default_policy else max(limit, PENDING_PAGE_SIZE)
 
         eligible: list[ApprovalRequest] = []
-        resume_after = await self.get(after) if after is not None else None
+        resume_after = await self.get(after, connection=connection) if after is not None else None
 
-        def read_pages(session: Session) -> bool:
+        async def read_pages(session: Session) -> bool:
             """Read pages until `limit` requests pass; return whether more pages remain."""
             nonlocal resume_after
-            self._prepare(session)
+            await self._prepare(session)
             while len(eligible) < limit:
-                page = _load_pending_page(
+                page = await _load_pending_page(
                     session,
                     self._table,
                     now=now,
@@ -316,7 +382,8 @@ class SQLApprovalQueue:
                 eligible.extend(
                     request
                     for request in page
-                    if self._policy.evaluate(principal, request, now=now).allowed
+                    if _payload_is_bound(request)
+                    and self._policy.evaluate(principal, request, now=now).allowed
                 )
                 if len(page) < page_size:
                     return False
@@ -328,7 +395,7 @@ class SQLApprovalQueue:
         # Postgres reads never block writers, so all pages share one transaction.
         # A SQLite read holds a lock that makes writers wait, so there each page is
         # its own short transaction.
-        while await self.database.run(read_pages):
+        while await self._run(read_pages, write=False, connection=connection):
             pass
         return eligible[:limit]
 
@@ -340,6 +407,7 @@ class SQLApprovalQueue:
         principal: Principal,
         reason: str | None = None,
         context: RunContext | None = None,
+        connection: Any = None,
     ) -> ApprovalRequest:
         """Approve or reject a pending request, once.
 
@@ -350,9 +418,22 @@ class SQLApprovalQueue:
         one, the request's own.
         """
 
-        def decide(session: Session) -> _Outcome:
-            self._require_side(session, "decide requests", ApprovalSide.APPROVER)
-            request = _load(session, self._table, request_id)
+        async def decide(session: Session) -> _Outcome:
+            await self._require_side(session, "decide requests", ApprovalSide.APPROVER)
+            try:
+                request = await _load(session, self._table, request_id)
+            except ApprovalIntegrityError as error:
+                # What is stored is not what the hash binds: nobody may approve it.
+                return _denied(
+                    error,
+                    _missing_event(
+                        "approval.resolve_denied",
+                        principal.id,
+                        request_id,
+                        context,
+                        reason="payload_integrity",
+                    ),
+                )
             if request is None:
                 return _denied(
                     ApprovalNotFoundError(f"No approval request {request_id}."),
@@ -394,7 +475,7 @@ class SQLApprovalQueue:
                     "reason": reason,
                 }
             )
-            changed = session.execute_count(
+            changed = await session.execute_count(
                 f"UPDATE {self._table.sql} SET status = ?, decision = ?, resolved_by = ?, "
                 "resolved_at = ?, reason = ? WHERE id = ? AND status = ?",
                 (
@@ -424,7 +505,7 @@ class SQLApprovalQueue:
             )
             return _Outcome(request=resolved, events=[event])
 
-        return await self._write(decide)
+        return await self._write(decide, connection=connection)
 
     async def consume(
         self,
@@ -434,6 +515,7 @@ class SQLApprovalQueue:
         payload: Mapping[str, JsonValue],
         principal: Principal,
         context: RunContext | None = None,
+        connection: Any = None,
     ) -> ApprovalRequest:
         """Call right before acting. Atomically moves an approved request to CONSUMED.
 
@@ -448,9 +530,9 @@ class SQLApprovalQueue:
         """
         presented_hash = approval_payload_hash(action, payload)
 
-        def use(session: Session) -> _Outcome:
-            self._require_side(session, "consume approvals", ApprovalSide.REQUESTER)
-            request = _load(session, self._table, request_id)
+        async def use(session: Session) -> _Outcome:
+            await self._require_side(session, "consume approvals", ApprovalSide.REQUESTER)
+            request = await _load(session, self._table, request_id, verify=False)
             if request is None:
                 return _denied(
                     ApprovalNotFoundError(f"No approval request {request_id}."),
@@ -475,7 +557,7 @@ class SQLApprovalQueue:
             consumed = ApprovalRequest.model_validate(
                 {**request.model_dump(), "status": ApprovalStatus.CONSUMED, "consumed_at": now}
             )
-            changed = session.execute_count(
+            changed = await session.execute_count(
                 f"UPDATE {self._table.sql} SET status = ?, consumed_at = ? "
                 "WHERE id = ? AND status = ?",
                 (
@@ -499,7 +581,7 @@ class SQLApprovalQueue:
             event = _event("approval.consumed", principal.id, consumed, event_context)
             return _Outcome(request=consumed, events=[event])
 
-        return await self._write(use)
+        return await self._write(use, connection=connection)
 
     async def cancel(
         self,
@@ -508,6 +590,7 @@ class SQLApprovalQueue:
         principal: Principal,
         reason: str | None = None,
         context: RunContext | None = None,
+        connection: Any = None,
     ) -> ApprovalRequest:
         """Withdraw a pending request. Only the principal who submitted it may.
 
@@ -521,9 +604,9 @@ class SQLApprovalQueue:
             raise ValueError("reason must be 1 to 500 characters")
         details = {"cancel_reason": reason} if reason is not None else {}
 
-        def withdraw(session: Session) -> _Outcome:
-            self._require_side(session, "cancel requests", ApprovalSide.REQUESTER)
-            request = _load(session, self._table, request_id)
+        async def withdraw(session: Session) -> _Outcome:
+            await self._require_side(session, "cancel requests", ApprovalSide.REQUESTER)
+            request = await _load(session, self._table, request_id, verify=False)
             if request is None:
                 return _denied(
                     ApprovalNotFoundError(f"No approval request {request_id}."),
@@ -547,7 +630,7 @@ class SQLApprovalQueue:
             cancelled = request.model_copy(
                 update={"status": ApprovalStatus.CANCELLED, "closed_at": now}
             )
-            if not _close(session, self._table, request, ApprovalStatus.CANCELLED, now):
+            if not await _close(session, self._table, request, ApprovalStatus.CANCELLED, now):
                 return _denied(
                     ApprovalAlreadyResolvedError(f"Request {request_id} was resolved meanwhile."),
                     _event(
@@ -561,10 +644,15 @@ class SQLApprovalQueue:
             event = _event("approval.cancelled", principal.id, cancelled, event_context, **details)
             return _Outcome(request=cancelled, events=[event])
 
-        return await self._write(withdraw)
+        return await self._write(withdraw, connection=connection)
 
     async def expire_due(
-        self, *, principal: Principal, now: datetime | None = None, limit: int = 500
+        self,
+        *,
+        principal: Principal,
+        now: datetime | None = None,
+        limit: int = 500,
+        connection: Any = None,
     ) -> int:
         """Store EXPIRED on every pending request whose lifetime is over; return how many.
 
@@ -580,14 +668,14 @@ class SQLApprovalQueue:
         if moment.tzinfo is None or moment.utcoffset() is None:
             raise ValueError("now must be a timezone-aware datetime")
 
-        def sweep(session: Session) -> _Outcome:
-            self._prepare(session)
-            if not _table_exists(session, self._table):
+        async def sweep(session: Session) -> _Outcome:
+            await self._prepare(session)
+            if not await _table_exists(session, self._table):
                 return _Outcome()
-            due = _load_due(session, self._table, moment, limit)
+            due = await _load_due(session, self._table, moment, limit)
             events = []
             for request in due:
-                if _close(session, self._table, request, ApprovalStatus.EXPIRED, moment):
+                if await _close(session, self._table, request, ApprovalStatus.EXPIRED, moment):
                     expired = request.model_copy(
                         update={"status": ApprovalStatus.EXPIRED, "closed_at": moment}
                     )
@@ -599,27 +687,40 @@ class SQLApprovalQueue:
 
         total = 0
         while True:
-            outcome = await self._write_outcome(sweep)
+            outcome = await self._write_outcome(sweep, connection=connection)
             total += outcome.expired
             if not outcome.batch_full:
                 return total
 
-    async def _write(self, work: Callable[[Session], _Outcome]) -> ApprovalRequest:
+    async def _write(
+        self, work: Callable[[Session], Awaitable[_Outcome]], *, connection: Any = None
+    ) -> ApprovalRequest:
         """Run `work` as _write_outcome does, then return its request or raise its error."""
-        outcome = await self._write_outcome(work)
+        outcome = await self._write_outcome(work, connection=connection)
         if outcome.error is not None:
             raise outcome.error
         if outcome.request is None:
             raise AssertionError("an approval transaction must return a request or an error")
         return outcome.request
 
-    async def _write_outcome(self, work: Callable[[Session], _Outcome]) -> _Outcome:
+    async def _write_outcome(
+        self, work: Callable[[Session], Awaitable[_Outcome]], *, connection: Any = None
+    ) -> _Outcome:
         """Run `work` in a write transaction and audit its events.
 
         When the audit log is on the same database the events are written in the
         same transaction, so the change and its record commit together or not at
         all. An audit log elsewhere is written right after the commit; that is best
         effort, since a failure then cannot undo the change.
+
+        On a host's `connection` the same holds for what succeeded: the host's
+        commit or rollback decides it. A refusal is different. It changed nothing,
+        and the host will most likely roll back when the error reaches it, which
+        would erase the record of the refusal; so it is written on a connection of
+        the audit log's own pool, committed at once. If that cannot be done
+        promptly (the pool is exhausted, the append lock is held by the host's own
+        earlier audit write, the database fails) the record goes into the host's
+        transaction instead, where it lasts only if the host commits.
         """
         audit_log = self._audit_log
         checked_log = audit_log if isinstance(audit_log, SQLAuditLog) else None
@@ -627,24 +728,44 @@ class SQLApprovalQueue:
             self.database
         )
 
-        def in_transaction(session: Session) -> _Outcome:
-            outcome = work(session)
+        async def in_transaction(session: Session) -> _Outcome:
+            outcome = await work(session)
             # Checked before the commit, so an event the log would refuse stops the change.
-            checked_events = (
-                [checked_log.checked_event(event) for event in outcome.events]
-                if checked_log is not None
-                else outcome.events
-            )
-            if shares_database and checked_log is not None:
-                for event in checked_events:
-                    checked_log.append_in(session, event)
+            if checked_log is not None:
+                outcome.events = [checked_log.checked_event(event) for event in outcome.events]
+            keep_apart = connection is not None and outcome.error is not None
+            if shares_database and checked_log is not None and not keep_apart:
+                for event in outcome.events:
+                    await checked_log.append_in(session, event)
             return outcome
 
-        outcome = await self.database.run(in_transaction, write=True)
+        outcome = await self._run(in_transaction, write=True, connection=connection)
         if not shares_database:
             for event in outcome.events:
                 await audit_log.append(event)
+        elif connection is not None and outcome.error is not None and checked_log is not None:
+            await self._record_refusal(checked_log, outcome.events, connection)
         return outcome
+
+    async def _record_refusal(
+        self, log: SQLAuditLog, events: list[AuditEvent], connection: Any
+    ) -> None:
+        """Write a refusal's events apart from the host's transaction, or fall back to it."""
+
+        async def apart(session: Session) -> list[Any]:
+            if session.dialect is Dialect.POSTGRES:
+                # Waits only briefly for the append lock: the host's own transaction
+                # may hold it already, and it is waiting for us.
+                await session.execute(f"SET LOCAL lock_timeout = '{DENIAL_LOCK_TIMEOUT}'")
+            return await log.append_many_in(session, events)
+
+        async def inside(session: Session) -> list[Any]:
+            return await log.append_many_in(session, events)
+
+        try:
+            await log.database.run(apart, write=True)
+        except driver_errors():
+            await self.database.run_on(connection, inside)
 
 
 def _consume_refusal(
@@ -707,7 +828,7 @@ def _cancel_refusal(
     return None
 
 
-def _close(
+async def _close(
     session: Session,
     table: TableName,
     request: ApprovalRequest,
@@ -715,7 +836,7 @@ def _close(
     now: datetime,
 ) -> bool:
     """Move a pending request to `status` (expired or cancelled); False if it moved meanwhile."""
-    changed = session.execute_count(
+    changed = await session.execute_count(
         f"UPDATE {table.sql} SET status = ?, closed_at = ? WHERE id = ? AND status = ?",
         (status.value, canonical_timestamp(now), str(request.id), ApprovalStatus.PENDING.value),
     )
@@ -729,14 +850,14 @@ _POSTGRES_NOW_TEXT = (
 )
 
 
-def _load_due(
+async def _load_due(
     session: Session, table: TableName, now: datetime, limit: int
 ) -> list[ApprovalRequest]:
     """Up to `limit` pending requests whose lifetime ended by `now`, oldest expiry first."""
     database_clock = (
         f" AND expires_at <= {_POSTGRES_NOW_TEXT}" if session.dialect is Dialect.POSTGRES else ""
     )
-    rows = session.execute(
+    rows = await session.execute(
         f"SELECT {_COLUMNS} FROM {table.sql} WHERE status = ? AND expires_at <= ?"
         f"{database_clock} ORDER BY expires_at, id LIMIT ?",
         (ApprovalStatus.PENDING.value, canonical_timestamp(now), limit),
@@ -765,49 +886,84 @@ def _event(
 
 
 def _missing_event(
-    action: str, actor_id: str | None, request_id: UUID, context: RunContext | None
+    action: str,
+    actor_id: str | None,
+    request_id: UUID,
+    context: RunContext | None,
+    *,
+    reason: str = "not_found",
 ) -> AuditEvent:
     return AuditEvent(
         action=action,
         actor_id=actor_id or "unknown",
         subject_id=str(request_id),
-        payload={"reason": "not_found"},
+        payload={"reason": reason},
         context=context,
     )
 
 
-def _ensure_table(session: Session) -> None:
+async def _ensure_table(session: Session) -> None:
     # On Postgres the owner role installs the table; the app role cannot create it.
     if session.dialect is Dialect.SQLITE:
-        session.execute(_TABLE_DDL.replace("CREATE TABLE", "CREATE TABLE IF NOT EXISTS", 1))
-        session.execute(_PENDING_INDEX_DDL.replace("CREATE INDEX", "CREATE INDEX IF NOT EXISTS", 1))
+        await session.execute(_TABLE_DDL.replace("CREATE TABLE", "CREATE TABLE IF NOT EXISTS", 1))
+        await session.execute(
+            _PENDING_INDEX_DDL.replace("CREATE INDEX", "CREATE INDEX IF NOT EXISTS", 1)
+        )
 
 
-def _table_exists(session: Session, table: TableName) -> bool:
+async def _table_exists(session: Session, table: TableName) -> bool:
     """Whether the table exists; ConfigError if it is a 0.1.0a1 table without run_context."""
     # Reads before the first submit see "no table", which means "no requests".
     if session.dialect is Dialect.SQLITE:
         exists = bool(
-            session.execute(
+            await session.execute(
                 "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
                 (APPROVALS_TABLE,),
             )
         )
     else:
-        exists = bool(session.execute("SELECT to_regclass(?) IS NOT NULL", (table.sql,))[0][0])
+        exists = bool(
+            (await session.execute("SELECT to_regclass(?) IS NOT NULL", (table.sql,)))[0][0]
+        )
     if exists:
-        require_current_table(session, APPROVALS_TABLE, RUN_CONTEXT_COLUMN, schema=table.schema)
+        await require_current_table(
+            session, APPROVALS_TABLE, RUN_CONTEXT_COLUMN, schema=table.schema
+        )
     return exists
 
 
-def _load(session: Session, table: TableName, request_id: UUID) -> ApprovalRequest | None:
-    if not _table_exists(session, table):
+async def _load(
+    session: Session, table: TableName, request_id: UUID, *, verify: bool = True
+) -> ApprovalRequest | None:
+    """The request, with a stored payload checked against its hash unless verify is off.
+
+    Raises ApprovalIntegrityError when the check fails. Cancelling and consuming
+    skip it: neither shows the payload to anyone, and the requester must be able to
+    withdraw a request whatever is stored with it.
+    """
+    if not await _table_exists(session, table):
         return None
-    rows = session.execute(f"SELECT {_COLUMNS} FROM {table.sql} WHERE id = ?", (str(request_id),))
-    return _request_from_row(rows[0]) if rows else None
+    rows = await session.execute(
+        f"SELECT {_COLUMNS} FROM {table.sql} WHERE id = ?", (str(request_id),)
+    )
+    if not rows:
+        return None
+    request = _request_from_row(rows[0])
+    if verify and not _payload_is_bound(request):
+        raise ApprovalIntegrityError(
+            f"The payload stored with request {request_id} does not match its payload_sha256."
+        )
+    return request
 
 
-def _load_pending_page(
+def _payload_is_bound(request: ApprovalRequest) -> bool:
+    """True when the request stores no payload, or the one it stores hashes to payload_sha256."""
+    if request.payload is None:
+        return True
+    return approval_payload_hash(request.action, request.payload) == request.payload_sha256
+
+
+async def _load_pending_page(
     session: Session,
     table: TableName,
     *,
@@ -821,7 +977,7 @@ def _load_pending_page(
     With `narrowed_to`, only requests that principal could resolve under the
     default policy: a role it holds, and not its own.
     """
-    if not _table_exists(session, table):
+    if not await _table_exists(session, table):
         return []
     # Canonical timestamps are fixed-width UTC strings, so they compare as text.
     conditions = ["status = ?", "expires_at > ?"]
@@ -836,7 +992,7 @@ def _load_pending_page(
         conditions.append(f"required_role IN ({', '.join('?' for _ in roles)})")
         conditions.append("requested_by <> ?")
         parameters += [*roles, narrowed_to.id]
-    rows = session.execute(
+    rows = await session.execute(
         f"SELECT {_COLUMNS} FROM {table.sql} WHERE {' AND '.join(conditions)} "
         "ORDER BY created_at, id LIMIT ?",
         (*parameters, limit),
@@ -870,6 +1026,7 @@ def _row_values(request: ApprovalRequest) -> tuple[Any, ...]:
         ),
         json.dumps(sorted(request.delegates)),
         timestamp(request.closed_at),
+        (canonical_json(request.payload).decode("utf-8") if request.payload is not None else None),
     )
 
 
@@ -880,6 +1037,8 @@ def _request_from_row(row: tuple[Any, ...]) -> ApprovalRequest:
     if RUN_CONTEXT_COLUMN in fields:
         fields[RUN_CONTEXT_COLUMN] = json.loads(fields[RUN_CONTEXT_COLUMN])
     fields[DELEGATES_COLUMN] = json.loads(fields.get(DELEGATES_COLUMN, "[]"))
+    if PAYLOAD_COLUMN in fields:
+        fields["payload"] = json.loads(fields.pop(PAYLOAD_COLUMN))
     return ApprovalRequest.model_validate(fields, context={STORED_RECORD: True})
 
 

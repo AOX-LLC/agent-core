@@ -2,6 +2,7 @@
 
 import json
 import re
+from datetime import timedelta
 from typing import Annotated, Final, Literal
 from uuid import UUID
 
@@ -17,6 +18,9 @@ from aox_agent_core.context import RunContext
 AUDIT_SCHEMA_VERSION: Final = 3
 GENESIS_HASH: Final = "0" * 64
 MAX_PAYLOAD_BYTES = 8_192
+# How far a caller-supplied occurred_at may lie from the database's clock.
+OCCURRED_AT_MAX_FUTURE: Final = timedelta(minutes=5)
+OCCURRED_AT_MAX_PAST: Final = timedelta(hours=24)
 MAX_SAFE_INTEGER: Final = 2**53 - 1
 
 # A payload key is rejected when, lowercased with everything but letters and digits
@@ -52,6 +56,13 @@ class AuditEvent(FrozenModel):
 
     `context` names the run the event belongs to; it is stored and hashed with
     the record.
+
+    `occurred_at` is when the event happened, if the caller knows better than the
+    moment of the append. It is hashed. It must lie within OCCURRED_AT_MAX_PAST
+    before and OCCURRED_AT_MAX_FUTURE after the database's clock, which the log
+    checks when it appends and Postgres checks again. Without it the log uses the
+    database's clock. The record also carries `recorded_at`, which the database
+    sets and the caller cannot supply or change.
     """
 
     action: ActionName
@@ -59,32 +70,14 @@ class AuditEvent(FrozenModel):
     subject_id: SubjectId | None = None
     payload: dict[str, JsonValue] = Field(default_factory=dict)
     context: RunContext | None = None
+    occurred_at: AwareDatetime | None = None
 
     @field_validator("payload")
     @classmethod
     def _payload_is_small_and_has_no_secret_keys(
         cls, payload: dict[str, JsonValue]
     ) -> dict[str, JsonValue]:
-        forbidden = sorted(_forbidden_keys(payload))
-        if forbidden:
-            raise ValueError(f"payload has forbidden keys: {', '.join(forbidden)}")
-
-        if _contains_float(payload):
-            raise ValueError("payload numbers must be integers; write decimals as strings")
-        if _contains_unsafe_integer(payload):
-            raise ValueError(
-                f"payload integers must be within +/-{MAX_SAFE_INTEGER}, so that any JSON "
-                "reader can verify the hash exactly"
-            )
-        try:
-            canonical_json(payload)
-        except UnicodeEncodeError as error:
-            raise ValueError("payload text is not valid Unicode") from error
-
-        size = len(json.dumps(payload, separators=(",", ":")).encode())
-        if size > MAX_PAYLOAD_BYTES:
-            raise ValueError(f"payload is {size} bytes; the limit is {MAX_PAYLOAD_BYTES}")
-        return payload
+        return check_payload(payload)
 
 
 class UnsealedAuditRecord(FrozenModel):
@@ -116,10 +109,18 @@ class AuditRecord(UnsealedAuditRecord):
     like every other column: actor_id is who the library was told acted, db_role
     is who wrote the row. It is outside the hash, so it is always None on SQLite,
     which has no roles, and proves nothing about records copied elsewhere.
+
+    recorded_at is when the database wrote the row (0.1.0a4); occurred_at, which
+    the hash covers, is when the caller says the event happened. On Postgres a
+    trigger sets recorded_at, whatever the writer supplied. Like db_role it is
+    outside the hash, so the trigger, not the chain, is what guarantees it; on
+    SQLite the library writes it from the writer's own clock. It is None on
+    records written before 0.1.0a4.
     """
 
     record_hash: Sha256Hex
     db_role: str | None = None
+    recorded_at: AwareDatetime | None = None
 
 
 class AuditHead(FrozenModel):
@@ -127,6 +128,38 @@ class AuditHead(FrozenModel):
 
     seq: Annotated[int, Field(ge=0)]
     record_hash: Sha256Hex
+
+
+def check_payload(
+    payload: dict[str, JsonValue], *, max_bytes: int = MAX_PAYLOAD_BYTES
+) -> dict[str, JsonValue]:
+    """Return `payload` if it is small, plain JSON that any reader can hash exactly.
+
+    Raises ValueError for forbidden keys, floats, integers beyond the safe range,
+    text that is not valid Unicode, and more than `max_bytes` of JSON. It does not
+    scan strings for secrets; the audit log and the approval queue do, with their
+    scrubber.
+    """
+    forbidden = sorted(_forbidden_keys(payload))
+    if forbidden:
+        raise ValueError(f"payload has forbidden keys: {', '.join(forbidden)}")
+
+    if _contains_float(payload):
+        raise ValueError("payload numbers must be integers; write decimals as strings")
+    if _contains_unsafe_integer(payload):
+        raise ValueError(
+            f"payload integers must be within +/-{MAX_SAFE_INTEGER}, so that any JSON "
+            "reader can verify the hash exactly"
+        )
+    try:
+        canonical_json(payload)
+    except UnicodeEncodeError as error:
+        raise ValueError("payload text is not valid Unicode") from error
+
+    size = len(json.dumps(payload, separators=(",", ":")).encode())
+    if size > max_bytes:
+        raise ValueError(f"payload is {size} bytes; the limit is {max_bytes}")
+    return payload
 
 
 def _forbidden_keys(value: JsonValue) -> set[str]:

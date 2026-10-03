@@ -89,6 +89,8 @@ EXPECTED_EXPORTS = {
         "FORBIDDEN_KEY_SUFFIXES",
         "GENESIS_HASH",
         "MAX_PAYLOAD_BYTES",
+        "OCCURRED_AT_MAX_FUTURE",
+        "OCCURRED_AT_MAX_PAST",
         "AuditEvent",
         "AuditHead",
         "AuditLog",
@@ -115,7 +117,9 @@ EXPECTED_EXPORTS = {
         "write_scorecard_json",
     ],
     "aox_agent_core.testing": ["cassette_client"],
+    "aox_agent_core.sync": ["SyncApprovalQueue", "SyncAuditLog"],
     "aox_agent_core.storage": [
+        "ConnectionSource",
         "Database",
         "Dialect",
         "Grant",

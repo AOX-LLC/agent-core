@@ -136,6 +136,18 @@ class ApprovalPayloadMismatchError(ApprovalError):
     """The action or its payload differs from what was approved."""
 
 
+class ApprovalIntegrityError(ApprovalError):
+    """The payload stored with a request does not hash to the request's payload_sha256.
+
+    The approver must not be shown it: what is stored is not what the hash binds.
+    """
+
+
+class ApprovalPayloadRejectedError(ApprovalError):
+    """A payload offered for storage with a request is too large, has a forbidden
+    key, a float, or text that looks like a secret."""
+
+
 class AuditError(AgentCoreError):
     """Base class for audit-log failures."""
 
@@ -154,6 +166,10 @@ class AuditPayloadRejectedError(AuditError):
     Forbidden keys, floats and oversized payloads are caught earlier, as a
     ValidationError when the AuditEvent is built.
     """
+
+
+class AuditTimeRejectedError(AuditError):
+    """A caller-supplied occurred_at is too far from the database's clock."""
 
 
 class EvalError(AgentCoreError):

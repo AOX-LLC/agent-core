@@ -18,7 +18,7 @@ from aox_agent_core.replay.keys import request_hash
 from aox_agent_core.replay.recording import Recording
 from aox_agent_core.replay.scrub import PatternScrubber
 from aox_agent_core.replay.store import DirectoryRecordingStore, parse_recording, recorded_content
-from aox_agent_core.storage import SQLiteDatabase, driver_errors, open_database
+from aox_agent_core.storage import Database, SQLiteDatabase, driver_errors, open_database
 
 REDACTION_MARKER = "[REDACTED:"
 
@@ -114,16 +114,15 @@ def _verify_audit(
         if isinstance(database, SQLiteDatabase) and not database.path.is_file():
             print(f"error: no audit database at {database.path}", file=sys.stderr)
             return 2
-        if not audit_table_exists(database, schema=schema):
-            print("error: this database has no audit log table", file=sys.stderr)
-            return 2
-        log = SQLAuditLog(database, schema=schema)
         anchor = (
             AuditHead(seq=anchor_seq, record_hash=anchor_hash)
             if anchor_seq is not None and anchor_hash is not None
             else None
         )
-        head = asyncio.run(log.verify(expected_head=anchor))
+        head = asyncio.run(_verify(database, schema, anchor))
+        if head is None:
+            print("error: this database has no audit log table", file=sys.stderr)
+            return 2
     except AuditIntegrityError as error:
         print(f"FAILED: {error}")
         return 1
@@ -133,6 +132,18 @@ def _verify_audit(
     anchored = " and matches the anchor" if anchor is not None else " (no anchor given)"
     print(f"OK: {head.seq} records, chain intact{anchored}. Head: {head.seq} {head.record_hash}")
     return 0
+
+
+async def _verify(
+    database: Database, schema: str | None, anchor: AuditHead | None
+) -> AuditHead | None:
+    """The verified head, or None if the database has no audit table."""
+    try:
+        if not await audit_table_exists(database, schema=schema):
+            return None
+        return await SQLAuditLog(database, schema=schema).verify(expected_head=anchor)
+    finally:
+        await database.aclose()
 
 
 def check_cassettes(directory: Path) -> list[str]:

@@ -33,11 +33,15 @@ class ApprovalQueue(Protocol):
         ttl_seconds: int,
         delegates: Collection[str] = (),
         context: RunContext | None = None,
+        include_payload: bool = False,
     ) -> ApprovalRequest:
         """Queue a request that expires after ttl_seconds (at most TTL_SECONDS_MAX).
 
-        The payload's hash is stored; the payload itself is not. Only the
-        requester may consume the approval, unless `delegates` names others.
+        The payload's hash is stored. The payload itself is stored only with
+        include_payload=True, within a size cap and after the secret scan, and
+        every read checks it against the hash, so an approver is shown what the
+        hash binds (`ApprovalRequest.payload`). Only the requester may consume the
+        approval, unless `delegates` names others.
         """
         ...
 

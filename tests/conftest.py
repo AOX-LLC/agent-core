@@ -1,7 +1,7 @@
 """Every test runs offline and ignores the developer's environment."""
 
 import socket
-from collections.abc import Iterator
+from collections.abc import AsyncIterator, Iterator
 from pathlib import Path
 from typing import Any
 
@@ -11,6 +11,7 @@ from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import SimpleSpanProcessor
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 
+from aox_agent_core.storage import PostgresDatabase
 from databases import ControlDatabase, postgres_database, sqlite_database
 
 AMBIENT_VARIABLES = (
@@ -69,6 +70,22 @@ def _no_network(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(socket.socket, "connect", connect_loopback_only)
     monkeypatch.setattr(socket.socket, "connect_ex", refuse_connection)
     monkeypatch.setattr(socket, "getaddrinfo", lookup_loopback_only)
+
+
+@pytest.fixture(autouse=True)
+async def _close_postgres_pools(monkeypatch: pytest.MonkeyPatch) -> AsyncIterator[None]:
+    """Close every Postgres pool a test opened, on the loop that opened it."""
+    opened: list[PostgresDatabase] = []
+    original = PostgresDatabase.__init__
+
+    def tracking(self: PostgresDatabase, *args: Any, **kwargs: Any) -> None:
+        original(self, *args, **kwargs)
+        opened.append(self)
+
+    monkeypatch.setattr(PostgresDatabase, "__init__", tracking)
+    yield
+    for database in opened:
+        await database.aclose()
 
 
 @pytest.fixture(scope="session")

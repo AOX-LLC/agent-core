@@ -36,6 +36,14 @@ if TYPE_CHECKING:
     from aox_agent_core.storage import Session
 
 AUDIT_TABLE: Final = "agent_core_audit"
+# pg_advisory_xact_lock key that serializes audit appends: ASCII "agentcor" as an int64.
+# The library takes it before reading the chain head, and the insert trigger takes it
+# too, so even a plain INSERT is serialized and sees the committed head.
+AUDIT_APPEND_LOCK_KEY: Final = 0x6167656E74636F72
+# The oldest Postgres the library is tested on and supports (16.0).
+POSTGRES_MINIMUM_VERSION_NUM: Final = 160000
+# Most bytes of canonical JSON stored as an approval's payload.
+MAX_STORED_PAYLOAD_BYTES: Final = 8192
 APPROVALS_TABLE: Final = "agent_core_approvals"
 ROLES_TABLE: Final = "agent_core_approval_roles"
 
@@ -107,9 +115,11 @@ def audit_ddl(schema: str) -> tuple[str, ...]:
             run_context TEXT,
             prev_hash TEXT NOT NULL,
             record_hash TEXT NOT NULL,
-            db_role TEXT
+            db_role TEXT,
+            recorded_at TEXT
         )""",
         f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS db_role TEXT",
+        f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS recorded_at TEXT",
         # Both functions pin search_path and reach the table through the trigger's
         # own schema and name, so a temporary table cannot stand in for it.
         f"""CREATE OR REPLACE FUNCTION {functions}.{AUDIT_TABLE}_refuse_change()
@@ -120,24 +130,55 @@ def audit_ddl(schema: str) -> tuple[str, ...]:
         FOR EACH ROW EXECUTE FUNCTION {functions}.{AUDIT_TABLE}_refuse_change()""",
         f"""CREATE OR REPLACE TRIGGER {AUDIT_TRUNCATE_TRIGGER} BEFORE TRUNCATE ON {table}
         FOR EACH STATEMENT EXECUTE FUNCTION {functions}.{AUDIT_TABLE}_refuse_change()""",
-        # db_role is set here, from the database's own idea of who is inserting,
-        # whatever the insert supplied; the update trigger then keeps it fixed.
+        # The insert trigger enforces the chain's linkage (the next seq, prev_hash equal
+        # to the head's record_hash), the shape of every field it can check, and the
+        # bounds on occurred_at; it sets db_role and recorded_at from the database's own
+        # idea of who is inserting and when, whatever the insert supplied. It cannot
+        # check record_hash itself, which verify() recomputes.
         f"""CREATE OR REPLACE FUNCTION {functions}.{AUDIT_TABLE}_append_at_end()
         RETURNS trigger LANGUAGE plpgsql SET search_path = pg_catalog, pg_temp AS $$
-        DECLARE last_seq bigint;
-        BEGIN
-            EXECUTE format('SELECT COALESCE(MAX(seq), 0) FROM %I.%I',
-                           TG_TABLE_SCHEMA, TG_TABLE_NAME) INTO last_seq;
-            IF NEW.seq <> last_seq + 1 THEN
-                RAISE EXCEPTION '{AUDIT_TABLE} is append-only';
-            END IF;
-            NEW.db_role := current_user;
-            RETURN NEW;
-        END $$""",
+        {_AUDIT_APPEND_BODY}
+        $$""",
         f"""CREATE OR REPLACE TRIGGER {AUDIT_APPEND_TRIGGER} BEFORE INSERT ON {table}
         FOR EACH ROW EXECUTE FUNCTION {functions}.{AUDIT_TABLE}_append_at_end()""",
         f"REVOKE ALL ON {table} FROM PUBLIC",
     )
+
+
+_AUDIT_APPEND_BODY = """
+DECLARE
+    head_seq bigint;
+    head_hash text;
+    db_now timestamptz := clock_timestamp();
+    stamp text := 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"';
+BEGIN
+    PERFORM pg_advisory_xact_lock(<lock_key>);
+    EXECUTE format('SELECT seq, record_hash FROM %I.%I ORDER BY seq DESC LIMIT 1',
+                   TG_TABLE_SCHEMA, TG_TABLE_NAME) INTO head_seq, head_hash;
+    IF head_seq IS NULL THEN
+        head_seq := 0;
+        head_hash := repeat('0', 64);
+    END IF;
+    IF NEW.seq <> head_seq + 1 OR NEW.prev_hash IS DISTINCT FROM head_hash THEN
+        RAISE EXCEPTION '<table> is append-only: a record must follow the last one';
+    END IF;
+    IF NEW.schema_version IS DISTINCT FROM 3
+       OR NEW.event_id !~ '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+       OR NEW.record_hash !~ '^[0-9a-f]{64}$'
+       OR NEW.occurred_at !~
+          '^[0-9]{4}-[0-9]{2}-[0-9]{2}T([01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9][.][0-9]{6}Z$'
+       OR to_char((NEW.occurred_at)::timestamptz AT TIME ZONE 'UTC', stamp) <> NEW.occurred_at THEN
+        RAISE EXCEPTION '<table> is append-only: a new record has a field of the wrong shape';
+    END IF;
+    IF NEW.occurred_at::timestamptz > db_now + interval '5 minutes'
+       OR NEW.occurred_at::timestamptz < db_now - interval '24 hours' THEN
+        RAISE EXCEPTION '<table>: occurred_at is too far from the database clock';
+    END IF;
+    NEW.recorded_at := to_char(db_now AT TIME ZONE 'UTC', stamp);
+    NEW.db_role := current_user;
+    RETURN NEW;
+END
+""".replace("<lock_key>", str(AUDIT_APPEND_LOCK_KEY)).replace("<table>", AUDIT_TABLE)
 
 
 def approvals_tables_ddl(schema: str) -> tuple[str, ...]:
@@ -163,9 +204,11 @@ def approvals_tables_ddl(schema: str) -> tuple[str, ...]:
             reason TEXT,
             run_context TEXT,
             closed_at TEXT,
-            delegates TEXT NOT NULL DEFAULT '[]'
+            delegates TEXT NOT NULL DEFAULT '[]',
+            payload_json TEXT
         )""",
         f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS closed_at TEXT",
+        f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS payload_json TEXT",
         f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS delegates TEXT NOT NULL DEFAULT '[]'",
         f"""CREATE INDEX IF NOT EXISTS agent_core_approvals_pending
         ON {table} (status, created_at, id)""",
@@ -190,9 +233,9 @@ def approvals_guard_ddl(schema: str, requester_role: str, approver_role: str) ->
     identifier(requester_role, what="role")
     identifier(approver_role, what="role")
     guard_body = _with_timestamp_checks(
-        _GUARD_BODY.replace("'<requester>'", f"'{requester_role}'").replace(
-            "'<approver>'", f"'{approver_role}'"
-        )
+        _GUARD_BODY.replace("'<requester>'", f"'{requester_role}'")
+        .replace("'<approver>'", f"'{approver_role}'")
+        .replace("<max_payload>", str(MAX_STORED_PAYLOAD_BYTES))
     )
     return (
         f"""CREATE OR REPLACE FUNCTION {quoted_schema}.{APPROVALS_TABLE}_guard()
@@ -299,6 +342,11 @@ BEGIN
                 RAISE EXCEPTION 'run_context must be a run id and opaque external ids';
             END IF;
         END IF;
+        IF NEW.payload_json IS NOT NULL
+           AND (octet_length(NEW.payload_json) > <max_payload>
+                OR jsonb_typeof(NEW.payload_json::jsonb) <> 'object') THEN
+            RAISE EXCEPTION 'a stored payload must be a JSON object of at most <max_payload> bytes';
+        END IF;
         IF NEW.status <> 'pending' OR NEW.decision IS NOT NULL OR NEW.resolved_by IS NOT NULL
            OR NEW.resolved_at IS NOT NULL OR NEW.consumed_at IS NOT NULL
            OR NEW.closed_at IS NOT NULL OR NEW.reason IS NOT NULL THEN
@@ -313,10 +361,12 @@ BEGIN
     END IF;
 
     IF ROW(NEW.id, NEW.action, NEW.summary, NEW.payload_sha256, NEW.requested_by,
-           NEW.required_role, NEW.created_at, NEW.expires_at, NEW.run_context, NEW.delegates)
+           NEW.required_role, NEW.created_at, NEW.expires_at, NEW.run_context, NEW.delegates,
+           NEW.payload_json)
        IS DISTINCT FROM
        ROW(OLD.id, OLD.action, OLD.summary, OLD.payload_sha256, OLD.requested_by,
-           OLD.required_role, OLD.created_at, OLD.expires_at, OLD.run_context, OLD.delegates) THEN
+           OLD.required_role, OLD.created_at, OLD.expires_at, OLD.run_context, OLD.delegates,
+           OLD.payload_json) THEN
         RAISE EXCEPTION 'an approval request''s identity and payload never change';
     END IF;
     is_expired := OLD.expires_at::timestamptz <= db_now;
@@ -509,7 +559,17 @@ FROM installed i JOIN pg_class c ON c.oid = i.approvals
 """
 
 
-def check_connection(session: "Session", schema: str) -> str:
+async def require_postgres_version(session: "Session") -> None:
+    """Raise ConfigError if the server is older than the library supports (16)."""
+    version_num = int((await session.execute("SELECT current_setting('server_version_num')"))[0][0])
+    if version_num < POSTGRES_MINIMUM_VERSION_NUM:
+        raise ConfigError(
+            f"This Postgres server is version {version_num // 10000}; agent-core 0.1.0a4 "
+            f"needs {POSTGRES_MINIMUM_VERSION_NUM // 10000} or later."
+        )
+
+
+async def check_connection(session: "Session", schema: str) -> str:
     """Check the approvals schema and the connecting role; return the role's side.
 
     Raises ConfigError, before anything is written, when the schema predates
@@ -518,11 +578,14 @@ def check_connection(session: "Session", schema: str) -> str:
     when the connecting role is a superuser, the owner, able to delete rows,
     or a member of both roles or of neither.
     """
+    await require_postgres_version(session)
     quoted_schema = identifier(schema, what="schema")
     table = f"{quoted_schema}.{APPROVALS_TABLE}"
     roles_table = f"{quoted_schema}.{ROLES_TABLE}"
-    exists, has_roles = session.execute(
-        "SELECT to_regclass(?) IS NOT NULL, to_regclass(?) IS NOT NULL", (table, roles_table)
+    exists, has_roles = (
+        await session.execute(
+            "SELECT to_regclass(?) IS NOT NULL, to_regclass(?) IS NOT NULL", (table, roles_table)
+        )
     )[0]
     if not exists:
         raise ConfigError(
@@ -531,7 +594,7 @@ def check_connection(session: "Session", schema: str) -> str:
         )
     triggers = {
         row[0]
-        for row in session.execute(
+        for row in await session.execute(
             "SELECT tgname FROM pg_trigger "
             "WHERE tgrelid = to_regclass(?) AND NOT tgisinternal AND tgenabled <> 'D'",
             (table,),
@@ -543,14 +606,14 @@ def check_connection(session: "Session", schema: str) -> str:
             f"The approvals table in {schema} is not protected by the database "
             f"({'missing or disabled: ' + ', '.join(missing) if missing else 'no role table'}): "
             "it was created by agent-core 0.1.0a2, or its guard was removed. As the owner "
-            "role, run install_postgres_schema from 0.1.0a3 with the requester and approver "
+            "role, run install_postgres_schema from 0.1.0a4 with the requester and approver "
             "roles; it upgrades the schema in place and keeps every row."
         )
-    requester_role, approver_role = session.execute(
-        f"SELECT requester_role, approver_role FROM {roles_table}"
+    requester_role, approver_role = (
+        await session.execute(f"SELECT requester_role, approver_role FROM {roles_table}")
     )[0]
-    can_change, is_requester, is_approver, overlap = session.execute(
-        _CONNECTION_SQL, (requester_role, approver_role, table)
+    can_change, is_requester, is_approver, overlap = (
+        await session.execute(_CONNECTION_SQL, (requester_role, approver_role, table))
     )[0]
     if overlap or requester_role == approver_role:
         raise ConfigError(
@@ -569,9 +632,9 @@ def check_connection(session: "Session", schema: str) -> str:
             f"{requester_role} and {approver_role}; it is a member of "
             f"{'both' if is_requester else 'neither'}."
         )
-    _check_layout(session, table, requester_role, approver_role)
-    _check_connecting_roles(session, table, as_requester=bool(is_requester))
-    refuse_requester_create(session, requester_role, schema)
+    await _check_layout(session, table, requester_role, approver_role)
+    await _check_connecting_roles(session, table, as_requester=bool(is_requester))
+    await refuse_requester_create(session, requester_role, schema)
     return ConnectionSide.REQUESTER if is_requester else ConnectionSide.APPROVER
 
 
@@ -583,7 +646,7 @@ ORDER BY m.rolname
 """
 
 
-def _check_connecting_roles(session: "Session", table: str, *, as_requester: bool) -> None:
+async def _check_connecting_roles(session: "Session", table: str, *, as_requester: bool) -> None:
     """Refuse a connection whose own roles hold what its side's role must not.
 
     _check_layout looks at the two installed roles; this looks at the login and
@@ -591,18 +654,22 @@ def _check_connecting_roles(session: "Session", table: str, *, as_requester: boo
     a2 app role made a member of the requester role, say). The guard still
     refuses such writes; this makes the setup fail loudly first.
     """
-    for (role,) in session.execute(_CONNECTING_ROLES):
+    for (role,) in await session.execute(_CONNECTING_ROLES):
         if as_requester:
-            rights = session.execute(
-                "SELECT "
-                + " OR ".join("has_column_privilege(?, ?, ?, 'UPDATE')" for _ in DECISION_COLUMNS),
-                tuple(value for column in DECISION_COLUMNS for value in (role, table, column)),
+            rights = (
+                await session.execute(
+                    "SELECT "
+                    + " OR ".join(
+                        "has_column_privilege(?, ?, ?, 'UPDATE')" for _ in DECISION_COLUMNS
+                    ),
+                    tuple(value for column in DECISION_COLUMNS for value in (role, table, column)),
+                )
             )[0][0]
             what = "update a decision column"
         else:
-            rights = session.execute("SELECT has_table_privilege(?, ?, 'INSERT')", (role, table))[
-                0
-            ][0]
+            rights = (
+                await session.execute("SELECT has_table_privilege(?, ?, 'INSERT')", (role, table))
+            )[0][0]
             what = "insert approval requests"
         if rights:
             raise ConfigError(
@@ -611,7 +678,7 @@ def _check_connecting_roles(session: "Session", table: str, *, as_requester: boo
             )
 
 
-def refuse_requester_create(session: "Session", requester_role: str, schema: str) -> None:
+async def refuse_requester_create(session: "Session", requester_role: str, schema: str) -> None:
     """Raise ConfigError if any role acting as the requester can create objects.
 
     The library pins its own search_path, but the approver side may run other
@@ -623,7 +690,7 @@ def refuse_requester_create(session: "Session", requester_role: str, schema: str
     CREATE on the database. Postgres 14 and clusters upgraded from it let PUBLIC
     create in public by default.
     """
-    rows = session.execute(
+    rows = await session.execute(
         "SELECT r.rolname, n.nspname FROM pg_roles r "
         "JOIN pg_namespace n ON n.nspname IN (?, 'public') "
         "WHERE NOT r.rolsuper AND pg_has_role(r.oid, ?, 'MEMBER') "
@@ -645,11 +712,18 @@ def refuse_requester_create(session: "Session", requester_role: str, schema: str
         )
 
 
-def _check_layout(session: "Session", table: str, requester_role: str, approver_role: str) -> None:
+async def _check_layout(
+    session: "Session", table: str, requester_role: str, approver_role: str
+) -> None:
     """Refuse grants that would let a requester decide or an approver submit."""
-    decision_rights = session.execute(
-        "SELECT " + ", ".join("has_column_privilege(?, ?, ?, 'UPDATE')" for _ in DECISION_COLUMNS),
-        tuple(value for column in DECISION_COLUMNS for value in (requester_role, table, column)),
+    decision_rights = (
+        await session.execute(
+            "SELECT "
+            + ", ".join("has_column_privilege(?, ?, ?, 'UPDATE')" for _ in DECISION_COLUMNS),
+            tuple(
+                value for column in DECISION_COLUMNS for value in (requester_role, table, column)
+            ),
+        )
     )[0]
     writable = [
         column for column, can in zip(DECISION_COLUMNS, decision_rights, strict=True) if can
@@ -659,7 +733,9 @@ def _check_layout(session: "Session", table: str, requester_role: str, approver_
             f"The requester role {requester_role} can update {', '.join(writable)} on the "
             "approvals table, so it could record a decision. Revoke that grant."
         )
-    if session.execute("SELECT has_table_privilege(?, ?, 'INSERT')", (approver_role, table))[0][0]:
+    if (
+        await session.execute("SELECT has_table_privilege(?, ?, 'INSERT')", (approver_role, table))
+    )[0][0]:
         raise ConfigError(
             f"The approver role {approver_role} can insert approval requests. Revoke that grant."
         )
