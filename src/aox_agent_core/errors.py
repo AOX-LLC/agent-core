@@ -173,6 +173,17 @@ class AuditIntegrityError(AuditError):
     """The audit chain failed verification or does not match the expected head."""
 
 
+class AuditLockTimeoutError(AuditError):
+    """The audit log's append lock was not free within the log's lock_timeout.
+
+    Another transaction holds it: a long host transaction that appended earlier, or a role
+    that took the lock on purpose. Nothing was written. `sqlstate` is Postgres'
+    lock_not_available, 55P03.
+    """
+
+    sqlstate = "55P03"
+
+
 class AuditWriteError(AuditError):
     """An audit record could not be written."""
 

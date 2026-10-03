@@ -48,6 +48,7 @@ from aox_agent_core.errors import (
     ApprovalNotGrantedError,
     ApprovalPayloadMismatchError,
     ApprovalPayloadRejectedError,
+    AuditLockTimeoutError,
     AuditPayloadRejectedError,
     ConfigError,
     NotAuthorizedToResolveError,
@@ -987,6 +988,11 @@ class SQLApprovalQueue:
             )
 
         async def in_transaction(session: Session) -> _Outcome:
+            if connection is None and checked_log is not None and shares_database:
+                # Append lock first, then the request's row: a host that appended before it
+                # changes a request takes them in that order, so no pair of transactions
+                # can wait for each other (Postgres would abort one with 40P01).
+                await checked_log.lock_in(session)
             outcome = await work(session)
             # Checked before the commit, so an event the log would refuse stops the change.
             if checked_log is not None:
@@ -1023,23 +1029,19 @@ class SQLApprovalQueue:
         described = _describe(events)
 
         async def apart(session: Session) -> list[Any]:
-            if session.dialect is Dialect.POSTGRES:
-                # Waits only briefly for the append lock: the host's own transaction
-                # may hold it already, and it is waiting for us.
-                await session.execute(f"SET LOCAL lock_timeout = '{DENIAL_LOCK_TIMEOUT}'")
-            return await log.append_many_in(session, events)
+            # Waits only briefly for the append lock: the host's own transaction may hold
+            # it already, and it is waiting for us.
+            return await log.append_many_in(session, events, lock_timeout=DENIAL_LOCK_TIMEOUT)
 
         async def inside(session: Session) -> list[Any]:
-            if session.dialect is not Dialect.POSTGRES:
-                return await log.append_many_in(session, events)
-            # The same bound, for this savepoint only: put back before the host goes on.
-            previous = (await session.execute("SELECT current_setting('lock_timeout')"))[0][0]
-            await session.execute(f"SET LOCAL lock_timeout = '{DENIAL_LOCK_TIMEOUT}'")
-            records = await log.append_many_in(session, events)
-            await session.execute("SELECT set_config('lock_timeout', ?, true)", (previous,))
-            return records
+            # The same bound, for this savepoint only: the host's setting is put back.
+            return await log.append_many_in(session, events, lock_timeout=DENIAL_LOCK_TIMEOUT)
 
-        failures: tuple[type[Exception], ...] = (*driver_errors(), TimeoutError)
+        failures: tuple[type[Exception], ...] = (
+            *driver_errors(),
+            TimeoutError,
+            AuditLockTimeoutError,
+        )
         try:
             await log.database.run(apart, write=True, acquire_timeout=DENIAL_ACQUIRE_TIMEOUT)
         except failures as failure:

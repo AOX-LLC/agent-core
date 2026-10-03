@@ -41,14 +41,17 @@ if TYPE_CHECKING:
     from aox_agent_core.storage import Session
 
 AUDIT_TABLE: Final = "agent_core_audit"
-# pg_advisory_xact_lock key that serializes audit appends: ASCII "agentcor" as an int64.
-# The library takes it before reading the chain head, and the insert trigger takes it
-# too, so even a plain INSERT is serialized and sees the committed head.
-AUDIT_APPEND_LOCK_KEY: Final = 0x6167656E74636F72
+# The advisory lock that serializes audit appends is taken on
+# hashtextextended('agent_core_audit:' || <schema>, 0): one lock per schema, so two installs
+# in one database do not wait for each other. The library takes it before reading the chain
+# head, and the insert trigger takes it too, so even a plain INSERT is serialized and sees
+# the committed head. Both compute the key in SQL, so they cannot disagree.
+AUDIT_LOCK_PREFIX: Final = "agent_core_audit:"
 # Which revision of the guard function and the audit insert trigger this release writes
 # (a comment inside each). A connection refuses an older one, so a release that changes
 # them is not run against a schema it has not been installed over.
 GUARD_REVISION: Final = 5
+AUDIT_TRIGGER_REVISION: Final = 5
 # The oldest Postgres the library is tested on and supports (16.0).
 POSTGRES_MINIMUM_VERSION_NUM: Final = 160000
 # Most bytes of canonical JSON stored as an approval's payload.
@@ -129,6 +132,11 @@ UNSAFE_TEXT_PATTERN: Final = (
 )
 
 
+def audit_lock_name(schema: str) -> str:
+    """The text the audit append lock of `schema` is keyed on."""
+    return f"{AUDIT_LOCK_PREFIX}{schema}"
+
+
 def identifier(name: str, *, what: str) -> str:
     """`name` double-quoted, after checking it is a plain lowercase identifier."""
     if not IDENTIFIER.fullmatch(name):
@@ -183,14 +191,16 @@ def audit_ddl(schema: str) -> tuple[str, ...]:
     )
 
 
-_AUDIT_APPEND_BODY = """
+_AUDIT_APPEND_BODY = (
+    """
+-- agent-core audit trigger revision <audit_revision>
 DECLARE
     head_seq bigint;
     head_hash text;
     db_now timestamptz := clock_timestamp();
     stamp text := 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"';
 BEGIN
-    PERFORM pg_advisory_xact_lock(<lock_key>);
+    PERFORM pg_advisory_xact_lock(hashtextextended('<lock_prefix>' || TG_TABLE_SCHEMA, 0));
     EXECUTE format('SELECT seq, record_hash FROM %I.%I ORDER BY seq DESC LIMIT 1',
                    TG_TABLE_SCHEMA, TG_TABLE_NAME) INTO head_seq, head_hash;
     IF head_seq IS NULL THEN
@@ -227,7 +237,10 @@ BEGIN
     NEW.db_role := current_user;
     RETURN NEW;
 END
-""".replace("<lock_key>", str(AUDIT_APPEND_LOCK_KEY)).replace("<table>", AUDIT_TABLE)
+""".replace("<lock_prefix>", AUDIT_LOCK_PREFIX)
+    .replace("<table>", AUDIT_TABLE)
+    .replace("<audit_revision>", str(AUDIT_TRIGGER_REVISION))
+)
 
 
 def approvals_tables_ddl(schema: str) -> tuple[str, ...]:
@@ -804,6 +817,19 @@ async def _guard_source(session: "Session", table: str) -> str:
 async def _guard_revision(session: "Session", table: str) -> int | None:
     """The revision comment inside the installed guard function, or None if it has none."""
     found = re.search(r"-- agent-core guard revision (\d+)", await _guard_source(session, table))
+    return int(found[1]) if found else None
+
+
+async def audit_trigger_revision(session: "Session", table: str) -> int | None:
+    """The revision comment inside the installed audit insert trigger, or None if it has none."""
+    rows = await session.execute(
+        "SELECT p.prosrc FROM pg_trigger t JOIN pg_proc p ON p.oid = t.tgfoid "
+        "WHERE t.tgrelid = to_regclass(?) AND t.tgname = ?",
+        (table, AUDIT_APPEND_TRIGGER),
+    )
+    found = (
+        re.search(r"-- agent-core audit trigger revision (\d+)", str(rows[0][0])) if rows else None
+    )
     return int(found[1]) if found else None
 
 
