@@ -8,7 +8,7 @@ Pre-releases are spelled the PEP 440 way, so tags look like `v0.1.0a1`.
 
 ## [Unreleased]
 
-## [0.1.0a3] - 2026-10-02
+## [0.1.0a3] - 2026-10-03
 
 Approvals enforced by Postgres itself, not only by the library.
 
