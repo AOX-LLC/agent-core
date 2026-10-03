@@ -483,7 +483,33 @@ def check_connection(session: "Session", schema: str) -> str:
             f"{'both' if is_requester else 'neither'}."
         )
     _check_layout(session, table, requester_role, approver_role)
+    refuse_requester_create(session, requester_role, schema)
     return ConnectionSide.REQUESTER if is_requester else ConnectionSide.APPROVER
+
+
+def refuse_requester_create(session: "Session", requester_role: str, schema: str) -> None:
+    """Raise ConfigError if the requester role can create objects in `schema` or public.
+
+    The library pins its own search_path, but the approver side may run other
+    code too, and a function or table the requester planted in a schema that
+    code searches would run with the approver's rights. Postgres 14 and clusters
+    upgraded from it let PUBLIC create in public by default.
+    """
+    creatable = [
+        row[0]
+        for row in session.execute(
+            "SELECT nspname FROM pg_namespace WHERE nspname IN (?, 'public') "
+            "AND has_schema_privilege(?, oid, 'CREATE') ORDER BY nspname",
+            (schema, requester_role),
+        )
+    ]
+    if creatable:
+        raise ConfigError(
+            f"The requester role {requester_role} can create objects in schema "
+            f"{', '.join(creatable)}, where code on the approver side could pick them up. "
+            f"Revoke it, e.g. REVOKE CREATE ON SCHEMA {creatable[0]} FROM PUBLIC (the default "
+            "before Postgres 15), and from the requester role if granted directly."
+        )
 
 
 def _check_layout(session: "Session", table: str, requester_role: str, approver_role: str) -> None:

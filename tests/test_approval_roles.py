@@ -8,7 +8,7 @@ from aox_agent_core.approvals import ApprovalSide, Decision, Principal, Principa
 from aox_agent_core.approvals.sql import SQLApprovalQueue
 from aox_agent_core.audit.sql import SQLAuditLog
 from aox_agent_core.errors import ConfigError
-from aox_agent_core.storage import Database, open_database
+from aox_agent_core.storage import Database, install_postgres_schema, open_database
 from databases import (
     APPROVER_ROLE,
     REQUESTER_ROLE,
@@ -150,3 +150,24 @@ async def test_an_a2_schema_asks_for_the_installer() -> None:
 
         with pytest.raises(ConfigError, match=r"0\.1\.0a2.*install_postgres_schema"):
             await queue_on(database.database).side()
+
+
+async def test_library_connections_pin_search_path(pg: ControlDatabase) -> None:
+    rows = await pg.database.run(lambda session: session.execute("SHOW search_path"))
+
+    assert rows == [("pg_catalog, pg_temp",)]
+
+
+@pytest.mark.parametrize("grantee", ["PUBLIC", REQUESTER_ROLE])
+async def test_a_requester_that_can_create_in_public_is_refused(
+    pg: ControlDatabase, grantee: str
+) -> None:
+    assert pg.owner_url is not None
+    pg.superuser_raw(f"GRANT CREATE ON SCHEMA public TO {grantee}")
+
+    with pytest.raises(ConfigError, match="can create objects in schema public"):
+        await queue_on(pg.database).side()
+    with pytest.raises(ConfigError, match="can create objects in schema public"):
+        install_postgres_schema(
+            pg.owner_url, requester_role=REQUESTER_ROLE, approver_role=APPROVER_ROLE
+        )

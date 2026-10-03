@@ -180,6 +180,11 @@ class PostgresDatabase(Database):
             # is only safe in READ COMMITTED, whatever the server's default is.
             connection.isolation_level = self._psycopg.IsolationLevel.READ_COMMITTED
             with connection.transaction(), connection.cursor() as cursor:
+                # Nothing the library runs resolves a name through search_path: every
+                # table is schema-qualified. Pinning it means an object another role
+                # created in a schema this role searches can never stand in for a
+                # catalog function or operator in the library's own statements.
+                cursor.execute("SET LOCAL search_path = pg_catalog, pg_temp")
                 yield Session(cursor, self.dialect)
 
 
@@ -241,7 +246,8 @@ def table_columns(session: Session, table: str, *, schema: str | None = None) ->
     if session.dialect is Dialect.SQLITE:
         # PRAGMA arguments cannot be bound, so the name is checked above.
         return {row[1] for row in session.execute(f"PRAGMA table_info({table})")}
-    qualified = f'"{schema}".{table}' if schema is not None else table
+    # search_path is pinned to pg_catalog, so a bare name would find nothing.
+    qualified = f'"{schema if schema is not None else layout.DEFAULT_SCHEMA}".{table}'
     return {
         row[0]
         for row in session.execute(
@@ -361,6 +367,7 @@ def install_postgres_schema(
     def install(session: Session) -> InstallReport:
         session.execute("SELECT pg_advisory_xact_lock(?)", (layout.INSTALL_LOCK_KEY,))
         _refuse_overlapping_roles(session, requester_role, approver_role)
+        layout.refuse_requester_create(session, requester_role, schema)
         _refuse_tables_from_0_1_0a1(session, schema)
         if not session.execute("SELECT 1 FROM pg_namespace WHERE nspname = ?", (schema,)):
             session.execute(f"CREATE SCHEMA {layout.identifier(schema, what='schema')}")

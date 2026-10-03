@@ -35,7 +35,9 @@ In 0.1.0a2, `install_postgres_schema(owner_url, app_role=...)` gave one app role
 
 ## Setting up a new database
 
-Needs Postgres 14 or later. Create the roles first, as a role that may create roles. They must be NOSUPERUSER and not members of each other. The owner role owns the tables and is never used at run time. It must be able to create tables in the target schema.
+Needs Postgres 14 or later. On Postgres 14, and on a cluster upgraded from it, PUBLIC may create objects in the `public` schema; revoke that first (`REVOKE CREATE ON SCHEMA public FROM PUBLIC;`), or the installer and every queue refuse to run. A requester able to create objects where approver-side code looks could plant a function that runs with the approver's rights. The library itself pins `search_path` to `pg_catalog, pg_temp` on its connections and qualifies every table, so it never resolves a name through a schema another role can write.
+
+Create the roles first, as a role that may create roles. They must be NOSUPERUSER and not members of each other. The owner role owns the tables and is never used at run time. It must be able to create tables in the target schema.
 
 ```sql
 CREATE ROLE agent_core_owner LOGIN PASSWORD '...' NOSUPERUSER;
@@ -99,7 +101,8 @@ Before its first statement, a Postgres queue checks the setup and raises `Config
 - the requester role can update `decision`, `resolved_by`, `resolved_at` or `reason`;
 - the approver role can insert;
 - the connecting role, or any role it can switch to, is a superuser, the owner, or able to delete or truncate;
-- the connecting role is a member of both roles or of neither.
+- the connecting role is a member of both roles or of neither;
+- the requester role can create objects in the install schema or in `public`.
 
 ## Upgrading from 0.1.0a2
 
