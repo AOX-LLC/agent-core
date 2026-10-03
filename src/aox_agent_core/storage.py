@@ -588,7 +588,7 @@ async def bring_table_up_to_date(
 ) -> None:
     """Refuse a 0.1.0a1 table; add the columns later releases added, or ask for the installer.
 
-    `additions` maps each column added in 0.1.0a3 or 0.1.0a4 to its SQLite type. On SQLite,
+    `additions` maps each column added in 0.1.0a3 to 0.1.0a5 to its SQLite type. On SQLite,
     where the library owns its tables, missing columns are added in place. On
     Postgres the application role cannot alter tables, so a missing column means
     the schema predates this release and the installer must upgrade it.
@@ -603,7 +603,7 @@ async def bring_table_up_to_date(
     if session.dialect is Dialect.POSTGRES:
         raise ConfigError(
             f"Table {table} was created by an earlier agent-core and has no {', '.join(missing)} "
-            "column. As the owner role, run install_postgres_schema from 0.1.0a4 with the "
+            "column. As the owner role, run install_postgres_schema from 0.1.0a5 with the "
             "requester and approver roles: it upgrades the schema in place and keeps every row."
         )
     for column in missing:

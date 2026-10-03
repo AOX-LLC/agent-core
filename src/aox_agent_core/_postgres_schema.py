@@ -40,6 +40,10 @@ AUDIT_TABLE: Final = "agent_core_audit"
 # The library takes it before reading the chain head, and the insert trigger takes it
 # too, so even a plain INSERT is serialized and sees the committed head.
 AUDIT_APPEND_LOCK_KEY: Final = 0x6167656E74636F72
+# Which revision of the guard function and the audit insert trigger this release writes
+# (a comment inside each). A connection refuses an older one, so a release that changes
+# them is not run against a schema it has not been installed over.
+GUARD_REVISION: Final = 5
 # The oldest Postgres the library is tested on and supports (16.0).
 POSTGRES_MINIMUM_VERSION_NUM: Final = 160000
 # Most bytes of canonical JSON stored as an approval's payload.
@@ -257,6 +261,7 @@ def approvals_guard_ddl(schema: str, requester_role: str, approver_role: str) ->
         .replace("'<approver>'", f"'{approver_role}'")
         .replace("<max_payload>", str(MAX_STORED_PAYLOAD_BYTES))
         .replace("<unsafe_text>", UNSAFE_TEXT_PATTERN)
+        .replace("<revision>", str(GUARD_REVISION))
     )
     return (
         f"""CREATE OR REPLACE FUNCTION {quoted_schema}.{APPROVALS_TABLE}_guard()
@@ -294,6 +299,7 @@ def _with_timestamp_checks(body: str) -> str:
 # approver, and the other way round, so SET ROLE cannot cross sides. A superuser
 # is a member of every role, so it is neither, and is refused.
 _GUARD_BODY = """
+-- agent-core guard revision <revision>
 DECLARE
     requester_role text := '<requester>';
     approver_role text := '<approver>';
@@ -594,7 +600,7 @@ async def require_postgres_version(session: "Session") -> None:
     version_num = int((await session.execute("SELECT current_setting('server_version_num')"))[0][0])
     if version_num < POSTGRES_MINIMUM_VERSION_NUM:
         raise ConfigError(
-            f"This Postgres server is version {version_num // 10000}; agent-core 0.1.0a4 "
+            f"This Postgres server is version {version_num // 10000}; agent-core 0.1.0a5 "
             f"needs {POSTGRES_MINIMUM_VERSION_NUM // 10000} or later."
         )
 
@@ -636,8 +642,16 @@ async def check_connection(session: "Session", schema: str) -> str:
             f"The approvals table in {schema} is not protected by the database "
             f"({'missing or disabled: ' + ', '.join(missing) if missing else 'no role table'}): "
             "it was created by agent-core 0.1.0a2, or its guard was removed. As the owner "
-            "role, run install_postgres_schema from 0.1.0a4 with the requester and approver "
+            "role, run install_postgres_schema from 0.1.0a5 with the requester and approver "
             "roles; it upgrades the schema in place and keeps every row."
+        )
+    revision = await _guard_revision(session, table)
+    if revision != GUARD_REVISION:
+        raise ConfigError(
+            f"The approvals guard in {schema} is revision {revision or 'older than 5'}; this "
+            f"release needs {GUARD_REVISION}. As the owner role, run install_postgres_schema "
+            "from 0.1.0a5 with the requester and approver roles: it upgrades the schema in "
+            "place and keeps every row (see docs/upgrading.md)."
         )
     requester_role, approver_role = (
         await session.execute(f"SELECT requester_role, approver_role FROM {roles_table}")
@@ -666,6 +680,17 @@ async def check_connection(session: "Session", schema: str) -> str:
     await _check_connecting_roles(session, table, as_requester=bool(is_requester))
     await refuse_requester_create(session, requester_role, schema)
     return ConnectionSide.REQUESTER if is_requester else ConnectionSide.APPROVER
+
+
+async def _guard_revision(session: "Session", table: str) -> int | None:
+    """The revision comment inside the installed guard function, or None if it has none."""
+    rows = await session.execute(
+        "SELECT p.prosrc FROM pg_trigger t JOIN pg_proc p ON p.oid = t.tgfoid "
+        "WHERE t.tgrelid = to_regclass(?) AND t.tgname = ?",
+        (table, APPROVALS_GUARD_TRIGGER),
+    )
+    found = re.search(r"-- agent-core guard revision (\d+)", rows[0][0]) if rows else None
+    return int(found[1]) if found else None
 
 
 # Every role current_user or session_user can switch to, as in the role check.
