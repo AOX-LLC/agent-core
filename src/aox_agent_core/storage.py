@@ -23,6 +23,8 @@ from urllib.parse import urlsplit
 
 from pydantic import SecretStr
 
+from aox_agent_core import _postgres_schema as layout
+from aox_agent_core._postgres_schema import GRANTS_SQL, Grant, InstallReport
 from aox_agent_core.errors import ConfigError
 
 ResultT = TypeVar("ResultT")
@@ -203,19 +205,20 @@ def open_database(url: str | SecretStr) -> Database:
     raise ConfigError(f"Unsupported database URL scheme {scheme!r}; use sqlite or postgresql.")
 
 
-def table_columns(session: Session, table: str) -> set[str]:
-    """The column names of a table in the session's database; empty if there is no table."""
-    if not TABLE_NAME.fullmatch(table):
-        raise ValueError(f"{table!r} is not a plain table name.")
+def table_columns(session: Session, table: str, *, schema: str | None = None) -> set[str]:
+    """The column names of a table, in `schema` on Postgres; empty if there is no table."""
+    if not TABLE_NAME.fullmatch(table) or (schema is not None and not TABLE_NAME.fullmatch(schema)):
+        raise ValueError(f"{table!r} in {schema!r} is not a plain table name.")
     if session.dialect is Dialect.SQLITE:
         # PRAGMA arguments cannot be bound, so the name is checked above.
         return {row[1] for row in session.execute(f"PRAGMA table_info({table})")}
+    qualified = f'"{schema}".{table}' if schema is not None else table
     return {
         row[0]
         for row in session.execute(
             "SELECT attname FROM pg_attribute "
             "WHERE attrelid = to_regclass(?) AND attnum > 0 AND NOT attisdropped",
-            (table,),
+            (qualified,),
         )
     }
 
@@ -255,38 +258,185 @@ def _import_psycopg() -> Any:
     return psycopg
 
 
-def install_postgres_schema(owner_url: str | SecretStr, *, app_role: str) -> None:
-    """Create the audit and approval tables, their triggers and grants, as the owner role.
+def install_postgres_schema(
+    owner_url: str | SecretStr,
+    *,
+    requester_role: str,
+    approver_role: str,
+    schema: str = "public",
+) -> InstallReport:
+    """Create or upgrade the audit and approval tables in `schema`, as the owner role.
 
-    Run once per database by an operator, never by the application. The owner
-    keeps every privilege; `app_role` may only INSERT and SELECT on the audit
-    table, and SELECT, INSERT and UPDATE on the approvals table.
+    Run by an operator, never by the application, after creating the two roles.
+    The requester role (the agent side) may submit, consume and cancel; the
+    approver role (the decision side) may approve or reject; a guard trigger
+    enforces that in the database. See aox_agent_core._postgres_schema for the
+    layout and the transitions.
+
+    It is idempotent: a second run with the same roles changes nothing. It
+    upgrades a 0.1.0a2 schema in place, keeping every row. It grants a role its
+    layout only on a table where that role holds no privilege yet, and never
+    revokes anything, so it never weakens a grant an operator tightened. The
+    returned report lists grants outside the layout, such as an a2 app role's,
+    for the operator to revoke. Raises ConfigError for tables from 0.1.0a1, for
+    role names other than those an earlier run recorded, or for roles that
+    overlap. Needs Postgres 14 or later.
     """
-    from aox_agent_core.approvals import sql as approvals_sql
-    from aox_agent_core.audit import sql as audit_sql
-
-    if not POSTGRES_ROLE_NAME.fullmatch(app_role):
-        raise ConfigError(f"{app_role!r} is not a plain Postgres role name.")
+    layout.identifier(requester_role, what="role")
+    layout.identifier(approver_role, what="role")
+    layout.identifier(schema, what="schema")
+    if requester_role == approver_role:
+        raise ConfigError("The requester and approver roles must be different roles.")
     database = open_database(owner_url)
     if database.dialect is not Dialect.POSTGRES:
         raise ConfigError("install_postgres_schema needs a postgresql:// URL.")
-    statements = (
-        *audit_sql.POSTGRES_SCHEMA,
-        *audit_sql.postgres_grants(app_role),
-        *approvals_sql.SCHEMA,
-        *approvals_sql.postgres_grants(app_role),
-    )
 
-    def install(session: Session) -> None:
-        for statement in statements:
+    def install(session: Session) -> InstallReport:
+        session.execute("SELECT pg_advisory_xact_lock(?)", (layout.INSTALL_LOCK_KEY,))
+        _refuse_overlapping_roles(session, requester_role, approver_role)
+        _refuse_tables_from_0_1_0a1(session, schema)
+        if not session.execute("SELECT 1 FROM pg_namespace WHERE nspname = ?", (schema,)):
+            session.execute(f"CREATE SCHEMA {layout.identifier(schema, what='schema')}")
+        for statement in (*layout.audit_ddl(schema), *layout.approvals_tables_ddl(schema)):
             session.execute(statement)
+        # Checked before the guard is written: a run with other role names must not
+        # get as far as rewriting it with them.
+        _record_roles(session, schema, requester_role, approver_role)
+        for statement in layout.approvals_guard_ddl(schema, requester_role, approver_role):
+            session.execute(statement)
+        for role, role_layout in (
+            (requester_role, layout.REQUESTER_LAYOUT),
+            (approver_role, layout.APPROVER_LAYOUT),
+        ):
+            # Decided per table before granting anything, so a role's first grant on
+            # a table does not stop the rest of its layout there.
+            fresh_tables = {
+                table for table in role_layout if not _holds_any_grant(session, schema, table, role)
+            }
+            for table, statement in layout.grant_statements(schema, role, role_layout):
+                if table in fresh_tables:
+                    session.execute(statement)
+            # Both roles must reach the schema; in public, PUBLIC usually grants it.
+            if not session.execute("SELECT has_schema_privilege(?, ?, 'USAGE')", (role, schema))[0][
+                0
+            ]:
+                session.execute(
+                    f"GRANT USAGE ON SCHEMA {layout.identifier(schema, what='schema')} "
+                    f"TO {layout.identifier(role, what='role')}"
+                )
+        return InstallReport(
+            schema=schema,
+            requester_role=requester_role,
+            approver_role=approver_role,
+            outside_layout=tuple(outside_layout(session, schema, requester_role, approver_role)),
+        )
 
-    database.run_sync(install, write=True)
+    return database.run_sync(install, write=True)
+
+
+def outside_layout(
+    session: Session, schema: str, requester_role: str, approver_role: str
+) -> list[Grant]:
+    """Grants on the library's tables beyond the owner's and the two roles' layouts."""
+    layouts = {requester_role: layout.REQUESTER_LAYOUT, approver_role: layout.APPROVER_LAYOUT}
+    found: list[Grant] = []
+    for table in (layout.AUDIT_TABLE, layout.APPROVALS_TABLE, layout.ROLES_TABLE):
+        for grant in _grants_on(session, schema, table):
+            role_layout = layouts.get(grant.role)
+            if role_layout is None or not layout.within_layout(grant, role_layout):
+                found.append(grant)
+    return found
+
+
+def _grants_on(session: Session, schema: str, table: str) -> list[Grant]:
+    """Direct grants on a table and its columns, the owner's own left out."""
+    qualified = f'"{schema}".{table}'
+    owner_rows = session.execute(
+        "SELECT relowner FROM pg_class WHERE oid = to_regclass(?)", (qualified,)
+    )
+    if not owner_rows:
+        return []
+    owner = owner_rows[0][0]
+    grants = []
+    for grantee, privilege, column in session.execute(GRANTS_SQL, (qualified, qualified)):
+        if grantee == owner:
+            continue
+        role = (
+            "PUBLIC"
+            if grantee == 0
+            else session.execute("SELECT rolname FROM pg_roles WHERE oid = ?", (grantee,))[0][0]
+        )
+        grants.append(Grant(table=table, role=role, privilege=privilege, column=column))
+    return sorted(grants, key=lambda grant: (grant.role, grant.privilege, grant.column or ""))
+
+
+def _holds_any_grant(session: Session, schema: str, table: str, role: str) -> bool:
+    return any(grant.role == role for grant in _grants_on(session, schema, table))
+
+
+def _refuse_overlapping_roles(session: Session, requester_role: str, approver_role: str) -> None:
+    for role in (requester_role, approver_role):
+        if not session.execute("SELECT 1 FROM pg_roles WHERE rolname = ?", (role,)):
+            raise ConfigError(f"Role {role} does not exist; create it before installing.")
+    rows = session.execute(
+        "SELECT pg_has_role(?, ?, 'MEMBER') OR pg_has_role(?, ?, 'MEMBER'), "
+        "current_user IN (?, ?), "
+        "(SELECT rolsuper FROM pg_roles WHERE rolname = ?) "
+        "OR (SELECT rolsuper FROM pg_roles WHERE rolname = ?)",
+        (
+            requester_role,
+            approver_role,
+            approver_role,
+            requester_role,
+            requester_role,
+            approver_role,
+            requester_role,
+            approver_role,
+        ),
+    )
+    overlapping, is_owner, is_superuser = rows[0]
+    if overlapping:
+        raise ConfigError(
+            f"{requester_role} and {approver_role} overlap: one is a member of the other, so "
+            "the requester could act as the approver. Use two unrelated roles."
+        )
+    if is_owner:
+        raise ConfigError("Install as the owner role, not as the requester or approver role.")
+    if is_superuser:
+        raise ConfigError("The requester and approver roles must not be superusers.")
+
+
+def _refuse_tables_from_0_1_0a1(session: Session, schema: str) -> None:
+    for table in (layout.AUDIT_TABLE, layout.APPROVALS_TABLE):
+        columns = table_columns(session, table, schema=schema)
+        if columns and "run_context" not in columns:
+            raise ConfigError(
+                f"Table {schema}.{table} was created by agent-core 0.1.0a1, which this "
+                "installer cannot upgrade. Keep that database and install into a new one."
+            )
+
+
+def _record_roles(session: Session, schema: str, requester_role: str, approver_role: str) -> None:
+    """Store the two role names on the first run; refuse different names later."""
+    roles = f'"{schema}".{layout.ROLES_TABLE}'
+    session.execute(
+        f"INSERT INTO {roles} (requester_role, approver_role) VALUES (?, ?) "
+        "ON CONFLICT (singleton) DO NOTHING",
+        (requester_role, approver_role),
+    )
+    recorded = session.execute(f"SELECT requester_role, approver_role FROM {roles}")[0]
+    if tuple(recorded) != (requester_role, approver_role):
+        raise ConfigError(
+            f"Schema {schema} was installed with requester role {recorded[0]} and approver "
+            f"role {recorded[1]}; the installer will not add others. Pass the same roles."
+        )
 
 
 __all__ = [
     "Database",
     "Dialect",
+    "Grant",
+    "InstallReport",
     "PostgresDatabase",
     "SQLiteDatabase",
     "Session",

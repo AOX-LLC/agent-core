@@ -98,6 +98,10 @@ select = [
 # passed as a bound parameter.
 "src/aox_agent_core/audit/sql.py" = ["S608"]
 "src/aox_agent_core/approvals/sql.py" = ["S608"]
+# Schema and role names here pass identifier() (a plain lowercase name, quoted)
+# before they reach SQL; every value is a bound parameter.
+"src/aox_agent_core/_postgres_schema.py" = ["S608"]
+"src/aox_agent_core/storage.py" = ["S608"]
 
 [tool.ruff.lint.flake8-tidy-imports]
 ban-relative-imports = "all"

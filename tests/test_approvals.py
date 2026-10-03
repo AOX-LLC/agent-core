@@ -30,7 +30,7 @@ from aox_agent_core.errors import (
     NotAuthorizedToResolveError,
 )
 from aox_agent_core.storage import open_database
-from databases import ControlDatabase, sqlite_database
+from databases import ControlDatabase, SplitQueue, split_queue, sqlite_database
 
 REQUESTER = Principal(id="agent-intake", kind=PrincipalKind.AGENT)
 APPROVER = Principal(id="user-17", kind=PrincipalKind.HUMAN, roles=frozenset({"ops.approver"}))
@@ -40,7 +40,8 @@ OTHER_APPROVER = Principal(
 AGENT_WITH_ROLE = Principal(id="agent-reviewer", kind=PrincipalKind.AGENT, roles=APPROVER.roles)
 HUMAN_REQUESTER = Principal(id="agent-intake", kind=PrincipalKind.HUMAN, roles=APPROVER.roles)
 PAYLOAD = {"contact_id": "c-1001", "phone": "+1-555-0100"}
-NOW = datetime(2026, 10, 2, 12, 0, tzinfo=UTC)
+# Near the database's clock: the Postgres guard judges expiry and start times by it.
+NOW = datetime.now(UTC).replace(microsecond=0)
 
 
 class Clock:
@@ -51,12 +52,13 @@ class Clock:
         return self.now
 
 
-def queue_for(database: ControlDatabase, clock: Clock | None = None) -> SQLApprovalQueue:
-    log = SQLAuditLog(database.database)
-    return SQLApprovalQueue(database.database, audit_log=log, clock=clock or Clock())
+def queue_for(database: ControlDatabase, clock: Clock | None = None) -> SplitQueue:
+    return split_queue(database, clock=clock or Clock())
 
 
-async def submitted(queue: SQLApprovalQueue, requester: Principal = REQUESTER) -> ApprovalRequest:
+async def submitted(
+    queue: SQLApprovalQueue | SplitQueue, requester: Principal = REQUESTER
+) -> ApprovalRequest:
     return await queue.submit(
         action="crm.update_contact",
         summary="Update the sample contact's phone number",
@@ -348,8 +350,9 @@ async def test_list_pending_filters_expired_own_and_other_role_requests(
 ) -> None:
     clock = Clock()
     queue = queue_for(control_database, clock)
+    clock.now = NOW - timedelta(hours=2)
     stale = await submitted(queue)
-    clock.now = NOW + timedelta(hours=2)
+    clock.now = NOW
     fresh = await submitted(queue)
     await submitted(queue, requester=APPROVER)
     await queue.submit(
@@ -377,10 +380,7 @@ async def test_policy_denial_without_a_reason_is_still_refused(
         ) -> ResolveVerdict:
             return ResolveVerdict.model_construct(allowed=False, reason=None)
 
-    log = SQLAuditLog(control_database.database)
-    queue = SQLApprovalQueue(
-        control_database.database, audit_log=log, policy=DenyWithoutReason(), clock=Clock()
-    )
+    queue = split_queue(control_database, policy=DenyWithoutReason(), clock=Clock())
     request = await submitted(queue)
 
     with pytest.raises(NotAuthorizedToResolveError, match="denied"):
@@ -409,10 +409,7 @@ async def test_list_pending_follows_a_custom_policy(control_database: ControlDat
             return ResolveVerdict(allowed=False, reason=DenialReason.MISSING_ROLE)
 
     admin = Principal(id="user-1", kind=PrincipalKind.HUMAN, roles=frozenset({"admin"}))
-    log = SQLAuditLog(control_database.database)
-    queue = SQLApprovalQueue(
-        control_database.database, audit_log=log, policy=AdminsApproveAnything(), clock=Clock()
-    )
+    queue = split_queue(control_database, policy=AdminsApproveAnything(), clock=Clock())
     request = await submitted(queue)
 
     assert [pending.id for pending in await queue.list_pending(admin)] == [request.id]
@@ -433,12 +430,7 @@ async def test_list_pending_pages_past_requests_a_strict_policy_rejects(
 
     policy = OnlyTheNewest()
     clock = Clock()
-    queue = SQLApprovalQueue(
-        control_database.database,
-        audit_log=SQLAuditLog(control_database.database),
-        policy=policy,
-        clock=clock,
-    )
+    queue = split_queue(control_database, policy=policy, clock=clock)
     for minute in range(5):
         clock.now = NOW + timedelta(minutes=minute)
         newest = await submitted(queue)
@@ -481,12 +473,7 @@ async def test_custom_policy_listing_pages_through_tied_timestamps(
             return super().evaluate(principal, request, now=now)
 
     policy = EveryThird(set())
-    queue = SQLApprovalQueue(
-        control_database.database,
-        audit_log=SQLAuditLog(control_database.database),
-        policy=policy,
-        clock=Clock(),  # every request shares one created_at
-    )
+    queue = split_queue(control_database, policy=policy, clock=Clock())  # one created_at
     submitted_ids = [(await submitted(queue)).id for _ in range(10)]
     in_listing_order = sorted(submitted_ids, key=str)
     policy.wanted = set(in_listing_order[::3])
@@ -521,14 +508,15 @@ async def test_a_full_listing_reads_no_extra_page(
     for _ in range(2):
         await submitted(queue)
     transactions = 0
-    run = control_database.database.run
+    # Listing is the approver's: it runs on the approver's connection.
+    run = control_database.approver_database.run
 
     async def counting_run(*args: Any, **kwargs: Any) -> Any:
         nonlocal transactions
         transactions += 1
         return await run(*args, **kwargs)
 
-    monkeypatch.setattr(control_database.database, "run", counting_run)
+    monkeypatch.setattr(control_database.approver_database, "run", counting_run)
 
     assert len(await queue.list_pending(APPROVER, limit=2)) == 2
     assert transactions == 1

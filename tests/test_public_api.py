@@ -117,6 +117,8 @@ EXPECTED_EXPORTS = {
     "aox_agent_core.storage": [
         "Database",
         "Dialect",
+        "Grant",
+        "InstallReport",
         "PostgresDatabase",
         "SQLiteDatabase",
         "Session",

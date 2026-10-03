@@ -23,6 +23,7 @@ from uuid import UUID, uuid4
 
 from pydantic import JsonValue, ValidationError
 
+from aox_agent_core import _postgres_schema as layout
 from aox_agent_core._canonical import canonical_json
 from aox_agent_core._validation import STORED_RECORD
 from aox_agent_core.audit.chain import canonical_timestamp, compute_record_hash
@@ -41,11 +42,13 @@ AUDIT_TABLE: Final = "agent_core_audit"
 RUN_CONTEXT_COLUMN: Final = "run_context"
 UPDATE_TRIGGER: Final = "agent_core_audit_no_update"
 DELETE_TRIGGER: Final = "agent_core_audit_no_delete"
-UPDATE_DELETE_TRIGGER: Final = "agent_core_audit_no_update_delete"
-TRUNCATE_TRIGGER: Final = "agent_core_audit_no_truncate"
-APPEND_TRIGGER: Final = "agent_core_audit_append_at_end"
+# The Postgres table, its triggers and grants are installed by
+# storage.install_postgres_schema (see _postgres_schema).
+UPDATE_DELETE_TRIGGER: Final = layout.AUDIT_UPDATE_DELETE_TRIGGER
+TRUNCATE_TRIGGER: Final = layout.AUDIT_TRUNCATE_TRIGGER
+APPEND_TRIGGER: Final = layout.AUDIT_APPEND_TRIGGER
 SQLITE_TRIGGERS: Final = frozenset({UPDATE_TRIGGER, DELETE_TRIGGER, APPEND_TRIGGER})
-POSTGRES_TRIGGERS: Final = frozenset({UPDATE_DELETE_TRIGGER, TRUNCATE_TRIGGER, APPEND_TRIGGER})
+POSTGRES_TRIGGERS: Final = layout.AUDIT_TRIGGERS
 
 # pg_advisory_xact_lock key that serializes appends: ASCII "agentcor" as an int64.
 APPEND_LOCK_KEY: Final = 0x6167656E74636F72
@@ -87,39 +90,6 @@ SQLITE_SCHEMA: Final = (
         OR EXISTS (SELECT 1 FROM {AUDIT_TABLE} WHERE event_id = NEW.event_id)
     BEGIN SELECT RAISE(ABORT, '{AUDIT_TABLE} is append-only'); END""",
 )
-
-POSTGRES_SCHEMA: Final = (
-    _TABLE_DDL,
-    # Both trigger functions pin search_path and reach the table through the
-    # trigger's own schema and name, so a temporary table of the same name cannot
-    # stand in for the audit table.
-    f"""CREATE FUNCTION {AUDIT_TABLE}_refuse_change() RETURNS trigger LANGUAGE plpgsql
-    SET search_path = pg_catalog, pg_temp AS $$
-    BEGIN RAISE EXCEPTION '{AUDIT_TABLE} is append-only'; END $$""",
-    f"""CREATE TRIGGER {UPDATE_DELETE_TRIGGER} BEFORE UPDATE OR DELETE ON {AUDIT_TABLE}
-    FOR EACH ROW EXECUTE FUNCTION {AUDIT_TABLE}_refuse_change()""",
-    f"""CREATE TRIGGER {TRUNCATE_TRIGGER} BEFORE TRUNCATE ON {AUDIT_TABLE}
-    FOR EACH STATEMENT EXECUTE FUNCTION {AUDIT_TABLE}_refuse_change()""",
-    f"""CREATE FUNCTION {AUDIT_TABLE}_append_at_end() RETURNS trigger LANGUAGE plpgsql
-    SET search_path = pg_catalog, pg_temp AS $$
-    DECLARE last_seq bigint;
-    BEGIN
-        EXECUTE format('SELECT COALESCE(MAX(seq), 0) FROM %I.%I', TG_TABLE_SCHEMA, TG_TABLE_NAME)
-            INTO last_seq;
-        IF NEW.seq <> last_seq + 1 THEN
-            RAISE EXCEPTION '{AUDIT_TABLE} is append-only';
-        END IF;
-        RETURN NEW;
-    END $$""",
-    f"""CREATE TRIGGER {APPEND_TRIGGER} BEFORE INSERT ON {AUDIT_TABLE}
-    FOR EACH ROW EXECUTE FUNCTION {AUDIT_TABLE}_append_at_end()""",
-    f"REVOKE ALL ON {AUDIT_TABLE} FROM PUBLIC",
-)
-
-
-def postgres_grants(app_role: str) -> tuple[str, ...]:
-    """The app role may read and append, nothing else."""
-    return (f'GRANT SELECT, INSERT ON {AUDIT_TABLE} TO "{app_role}"',)
 
 
 class SQLAuditLog:

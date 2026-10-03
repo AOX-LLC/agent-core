@@ -71,12 +71,6 @@ _PENDING_INDEX_DDL = (
     f"CREATE INDEX agent_core_approvals_pending ON {APPROVALS_TABLE} (status, created_at, id)"
 )
 
-SCHEMA: Final = (
-    _TABLE_DDL,
-    _PENDING_INDEX_DDL,
-    f"REVOKE ALL ON {APPROVALS_TABLE} FROM PUBLIC",
-)
-
 DEFAULT_PENDING_LIMIT = 100
 # Pages read while a custom policy filters; larger than most limits, so a policy
 # that rejects many requests needs few round trips.
@@ -94,11 +88,6 @@ _DENIAL_ERRORS: Final[Mapping[DenialReason, type[ApprovalError]]] = {
     DenialReason.NOT_PENDING: ApprovalAlreadyResolvedError,
     DenialReason.EXPIRED: ApprovalExpiredError,
 }
-
-
-def postgres_grants(app_role: str) -> tuple[str, ...]:
-    """The app role reads, adds and updates requests; it never deletes them."""
-    return (f'GRANT SELECT, INSERT, UPDATE ON {APPROVALS_TABLE} TO "{app_role}"',)
 
 
 def approval_payload_hash(action: str, payload: Mapping[str, JsonValue]) -> str:
