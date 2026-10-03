@@ -4,14 +4,14 @@ agent-core is a small Python library for routed Claude model calls, structured o
 
 ## Status
 
-`v0.1.0a4`, the fourth pre-release. What works:
+`v0.1.0a5`, the fifth pre-release. What works:
 
 - routed Claude calls with cost-based tiers, structured outputs, cost and OpenTelemetry tracing;
 - versioned prompts (`PromptRef`) and PNG, JPEG and PDF attachments;
 - record and replay keyed by content, so projects run and test with no API key; recordings in this repository were made against the live API;
 - a `RunContext` that ties calls, audit records and approvals to the host's run;
 - an append-only, hash-chained audit log on SQLite or Postgres, async, with batch appends and, on Postgres, writes inside a host's own transaction;
-- a human-approval queue with a role policy, single-use approvals, an optional stored payload bound to the request's hash, and, on Postgres, approval transitions enforced by the database;
+- a human-approval queue with a role policy, single-use approvals, one open request per requester, action and payload, an optional stored payload bound to the request's hash that can be purged after a retention period, and, on Postgres, approval transitions enforced by the database;
 - an eval runner with JSON and Markdown scorecards.
 
 Not yet: the Bedrock provider is an interface only. The API may still change before `v0.1.0`.
@@ -56,22 +56,22 @@ An attachment's type is read from its first bytes, never from its name, and is c
 
 ## Install
 
-The distribution is named `aox-agent-core`. Replace `vX.Y.Z` with a release tag. The examples use `v0.1.0a4`.
+The distribution is named `aox-agent-core`. Replace `vX.Y.Z` with a release tag. The examples use `v0.1.0a5`.
 
 ```sh
-pip install "aox-agent-core @ git+https://github.com/AOX-LLC/agent-core@v0.1.0a4"
+pip install "aox-agent-core @ git+https://github.com/AOX-LLC/agent-core@v0.1.0a5"
 ```
 
 With extras:
 
 ```sh
-pip install "aox-agent-core[postgres,otel] @ git+https://github.com/AOX-LLC/agent-core@v0.1.0a4"
+pip install "aox-agent-core[postgres,otel] @ git+https://github.com/AOX-LLC/agent-core@v0.1.0a5"
 ```
 
 With uv:
 
 ```sh
-uv add "aox-agent-core @ git+https://github.com/AOX-LLC/agent-core" --tag v0.1.0a4
+uv add "aox-agent-core @ git+https://github.com/AOX-LLC/agent-core" --tag v0.1.0a5
 ```
 
 | Extra      | Adds                                         |
@@ -184,9 +184,11 @@ Keep the head from `await audit_log.head()` somewhere the application cannot wri
 
 Pass `context=RunContext(...)` to `AuditEvent`, `submit`, `resolve` and `consume`: the run is stored with the record and covered by its hash (audit schema 2 and later). Tables created by `v0.1.0a1` cannot be upgraded and are refused with a `ConfigError`; keep that database to check its records with `v0.1.0a1`, and point this version at a new one. `ApprovalQueue` and `AuditLog` are protocols, so a host can supply its own backends, and `SQLApprovalQueue` accepts any `AuditLog`.
 
-`submit(..., include_payload=True)` stores the exact payload with the request, at most 8192 bytes of canonical JSON under the audit log's rules, and `ApprovalRequest.payload` holds it. Every `get`, `list_pending` and `resolve` checks it against `payload_sha256` and the rules a submit applies (a malformed or rule-breaking one hides only its own request): `get` raises `ApprovalIntegrityError`, `list_pending` omits the request, and `resolve` refuses it and audits `approval.resolve_denied`. `consume`, `cancel` and `expire_due` return `payload=None`. The payload is never copied into the audit log, and nothing purges it. `summary` is written by the requester and is not covered by the hash, so show `payload` to approvers when it is present.
+`submit(..., include_payload=True)` stores the exact payload with the request, at most 8192 bytes of canonical JSON under the audit log's rules, and `ApprovalRequest.payload` holds it. Every `get`, `list_pending` and `resolve` checks it against `payload_sha256` and the rules a submit applies (a malformed or rule-breaking one hides only its own request): `get` raises `ApprovalIntegrityError`, `list_pending` omits the request, and `resolve` refuses it and audits `approval.resolve_denied`. `consume`, `cancel` and `expire_due` return `payload=None`. The payload is never copied into the audit log, and `purge_payloads(principal=..., older_than=...)` drops it from finished requests older than the retention period (the approver role's job, never before the installed floor, 24 hours by default), keeping `payload_sha256`; a purged request reads `payload=None` with `payload_purged_at` set, a request that never stored one reads both `None`. `summary` is written by the requester and is not covered by the hash, so show `payload` to approvers when it is present.
 
-Each approval authorizes one run: call `consume(..., principal=...)` right before acting. Only the requester may consume it, unless `submit(..., delegates={...})` named other principals (at most 16, fixed for the request and shown to the approver); anyone else gets `NotTheRequesterError`. The requester can withdraw a pending request with `cancel(...)`. `expire_due(principal=...)` stores EXPIRED on pending requests past their lifetime. `get()` reports such a request as expired whether or not the sweep has run.
+Each approval authorizes one run: call `consume(..., principal=...)` right before acting. Only the requester may consume it, unless `submit(..., delegates={...})` named other principals (at most 16, fixed for the request and shown to the approver); anyone else gets `NotTheRequesterError`. The requester can withdraw a pending request with `cancel(...)`. `expire_due(principal=...)` stores EXPIRED on pending and approved-unused requests past their lifetime. `get()` reports such a request as expired whether or not the sweep has run.
+
+Submitting is idempotent: at most one request is open (pending, or approved and not yet used) for each requester, action and payload, enforced by a unique index so it holds when calls race. An exact repeat returns the open request and writes no audit event; a repeat with another `required_role`, lifetime or set of delegates raises `ApprovalConflictError`, which names the open request. The approver may be neither the requester nor one of its delegates.
 
 On Postgres, the database enforces who may do what. An operator creates two roles, then runs `storage.install_postgres_schema(owner_url, requester_role="...", approver_role="...")` once as the owner. The requester role (the agent side) submits, consumes and cancels. The approver role (the decision side) approves and rejects. A guard trigger on the approvals table checks every insert and update against a fixed transition table, so a role holding only its own credentials cannot approve a request with plain SQL. A deployment runs two queues, one connected as each role. Before its first statement, a queue checks the setup and raises `ConfigError` if it is wrong. The database cannot know principals, so "the approver is a human holding the required role" and "the consumer is the requester or a delegate" stay library rules. The requester writes `required_role` when it submits, so the approver side decides: `RoleApproverPolicy(roles_by_action={...})` lists the role each action needs, and a request for an unlisted action, or whose stored role differs, is refused and audited. The default policy, with no map, refuses everything. `RoleApproverPolicy(trust_requester_role=True)` takes the requester's role as given, for local development only. Pass `schema="..."` to `SQLAuditLog` and `SQLApprovalQueue` to use a Postgres schema other than `public`.
 
@@ -194,7 +196,7 @@ Each audit record carries `db_role`, the database role that inserted it, set by 
 
 SQLite has no roles and is not a trust boundary: anyone who can write the file is fully trusted, and the library's checks are all it has. A SQLite queue acts for both sides.
 
-See [docs/upgrade-0.1.0a3.md](docs/upgrade-0.1.0a3.md) for the role layout, the transition table, setup and the upgrade from `v0.1.0a2`, which let one app role set a request to approved with plain SQL. To go from `v0.1.0a3` to `v0.1.0a4`, see [docs/upgrading.md](docs/upgrading.md): the operator re-runs `install_postgres_schema` as the owner, and an a3 schema is refused until then. `examples/control_layer_demo.py` walks through the audit log and approvals, and `evals/run_triage_eval.py` runs the synthetic eval suite and prints its scorecard.
+See [docs/upgrade-0.1.0a3.md](docs/upgrade-0.1.0a3.md) for the role layout, the transition table, setup and the upgrade from `v0.1.0a2`, which let one app role set a request to approved with plain SQL. To go from `v0.1.0a4` to `v0.1.0a5` (or from a3), see [docs/upgrading.md](docs/upgrading.md): the operator re-runs `install_postgres_schema` as the owner, and an older schema is refused until then. `examples/control_layer_demo.py` walks through the audit log and approvals, and `evals/run_triage_eval.py` runs the synthetic eval suite and prints its scorecard.
 
 ## Bedrock
 

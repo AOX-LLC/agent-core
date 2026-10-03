@@ -170,7 +170,7 @@ async def test_an_a3_approvals_table_is_refused_by_the_queue_until_the_installer
         load_a3_schema(database)
         queue = split_queue(database)
 
-        with pytest.raises(ConfigError, match="payload_json"):
+        with pytest.raises(ConfigError, match=r"install_postgres_schema from 0\.1\.0a5"):
             await queue.submit(
                 action="crm.update_contact",
                 summary="s",

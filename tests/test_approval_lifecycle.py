@@ -1,6 +1,7 @@
 """Cancelling, expiring and reading approval requests, on SQLite and Postgres."""
 
 import asyncio
+import itertools
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -33,17 +34,23 @@ NOW = datetime.now(UTC).replace(microsecond=0)
 
 class Clock:
     def __init__(self) -> None:
-        self.now = NOW
+        # Fresh for each test: the Postgres guard bounds a decision's time by its own clock.
+        self.start = datetime.now(UTC).replace(microsecond=0)
+        self.now = self.start
 
     def __call__(self) -> datetime:
         return self.now
 
 
+_submitted = itertools.count(1001)
+
+
 async def submit(queue: SplitQueue, **options: Any) -> ApprovalRequest:
+    """A request with a payload of its own: only one request may be open for the same one."""
     return await queue.submit(
         action="crm.update_contact",
         summary="Update the sample contact",
-        payload={"contact_id": "c-1001"},
+        payload=options.pop("payload", {"contact_id": f"c-{next(_submitted)}"}),
         requested_by=REQUESTER,
         required_role="ops.approver",
         ttl_seconds=3_600,
@@ -60,9 +67,9 @@ async def audit_trail(database: ControlDatabase) -> list[tuple[str, str, Any, An
 
 async def expired_requests(queue: SplitQueue, clock: Clock, count: int) -> list[ApprovalRequest]:
     """Requests submitted two hours ago with a one-hour lifetime: over by any clock."""
-    clock.now = NOW - timedelta(hours=2)
+    clock.now = clock.start - timedelta(hours=2)
     requests = [await submit(queue, context=RUN) for _ in range(count)]
-    clock.now = NOW
+    clock.now = clock.start
     return requests
 
 

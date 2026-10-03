@@ -23,6 +23,7 @@ from collections.abc import Awaitable, Callable, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import AbstractAsyncContextManager, AsyncExitStack, asynccontextmanager
 from dataclasses import dataclass
+from datetime import timedelta
 from enum import StrEnum
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol, TypeVar
@@ -588,7 +589,7 @@ async def bring_table_up_to_date(
 ) -> None:
     """Refuse a 0.1.0a1 table; add the columns later releases added, or ask for the installer.
 
-    `additions` maps each column added in 0.1.0a3 or 0.1.0a4 to its SQLite type. On SQLite,
+    `additions` maps each column added in 0.1.0a3 to 0.1.0a5 to its SQLite type. On SQLite,
     where the library owns its tables, missing columns are added in place. On
     Postgres the application role cannot alter tables, so a missing column means
     the schema predates this release and the installer must upgrade it.
@@ -603,7 +604,7 @@ async def bring_table_up_to_date(
     if session.dialect is Dialect.POSTGRES:
         raise ConfigError(
             f"Table {table} was created by an earlier agent-core and has no {', '.join(missing)} "
-            "column. As the owner role, run install_postgres_schema from 0.1.0a4 with the "
+            "column. As the owner role, run install_postgres_schema from 0.1.0a5 with the "
             "requester and approver roles: it upgrades the schema in place and keeps every row."
         )
     for column in missing:
@@ -638,6 +639,8 @@ def install_postgres_schema(
     approver_role: str,
     schema: str = "public",
     close_unaudited_approvals: bool = False,
+    close_duplicates: bool = False,
+    payload_retention_floor: timedelta = timedelta(hours=24),
 ) -> InstallReport:
     """Create or upgrade the audit and approval tables in `schema`, as the owner role.
 
@@ -655,7 +658,20 @@ def install_postgres_schema(
     for the operator to revoke, and the approved, unused requests that no
     approval.resolved audit event approves (what plain SQL could have approved
     under 0.1.0a2). With close_unaudited_approvals=True it also cancels those,
-    in the same transaction, and lists them as closed. Raises ConfigError for
+    in the same transaction, and lists them as closed.
+
+    `payload_retention_floor` is the shortest retention the guard allows
+    SQLApprovalQueue.purge_payloads: a stored payload may be purged only from a finished
+    request whose finish time is further back than this by the database's clock. It is
+    written into the guard, so running the installer again with another value changes it.
+
+    The schema allows one open (pending or approved) request per requester, action and
+    payload hash, by a unique index. A database that already holds duplicates (what
+    0.1.0a4 allowed) is refused with ConfigError, nothing changed, and the duplicates
+    listed. With close_duplicates=True the run keeps each group's approved request, or
+    else its oldest, and cancels the other pending ones, listing them as closed; a group
+    with two approved requests is still refused, since which approval stands is a human's
+    call. Raises ConfigError for
     tables from 0.1.0a1, for role names other than those an earlier run
     recorded, for roles that overlap, or while the requester role can create
     objects in the schema or in public. Needs Postgres 16 or later.
@@ -678,12 +694,20 @@ def install_postgres_schema(
         await _refuse_tables_from_0_1_0a1(session, schema)
         if not await session.execute("SELECT 1 FROM pg_namespace WHERE nspname = ?", (schema,)):
             await session.execute(f"CREATE SCHEMA {layout.identifier(schema, what='schema')}")
+        approvals_before = await table_columns(session, layout.APPROVALS_TABLE, schema=schema)
         for statement in (*layout.audit_ddl(schema), *layout.approvals_tables_ddl(schema)):
             await session.execute(statement)
+        closed_duplicates = await _settle_open_duplicates(session, schema, close=close_duplicates)
+        await session.execute(layout.open_request_index_ddl(schema))
         # Checked before the guard is written: a run with other role names must not
         # get as far as rewriting it with them.
         await _record_roles(session, schema, requester_role, approver_role)
-        for statement in layout.approvals_guard_ddl(schema, requester_role, approver_role):
+        for statement in layout.approvals_guard_ddl(
+            schema,
+            requester_role,
+            approver_role,
+            payload_retention_floor_seconds=int(payload_retention_floor.total_seconds()),
+        ):
             await session.execute(statement)
         for role, role_layout in (
             (requester_role, layout.REQUESTER_LAYOUT),
@@ -713,6 +737,15 @@ def install_postgres_schema(
                     f"GRANT USAGE ON SCHEMA {layout.identifier(schema, what='schema')} "
                     f"TO {layout.identifier(role, what='role')}"
                 )
+        # A schema from before 0.1.0a5 already holds the approver's other grants, so the
+        # loop above skips it: the purge columns are added to it here, once. A later run
+        # does not give back what an operator revoked.
+        if approvals_before and "payload_purged_at" not in approvals_before:
+            await session.execute(
+                f"GRANT UPDATE ({', '.join(layout.PURGE_COLUMNS)}) ON "
+                f"{layout.identifier(schema, what='schema')}.{layout.APPROVALS_TABLE} "
+                f"TO {layout.identifier(approver_role, what='role')}"
+            )
         unaudited = await _unaudited_approvals(session, schema, approver_role)
         if close_unaudited_approvals and unaudited:
             await _refuse_closing_without_local_audit(session, schema, approver_role)
@@ -726,6 +759,7 @@ def install_postgres_schema(
             ),
             unaudited_approvals=tuple(unaudited),
             closed_approvals=tuple(unaudited) if close_unaudited_approvals else (),
+            closed_duplicates=tuple(closed_duplicates),
         )
 
     async def run() -> InstallReport:
@@ -789,6 +823,92 @@ async def _refuse_closing_without_local_audit(
             f"close_unaudited_approvals needs the approval.resolved events in {schema}'s "
             "audit table, and it holds none: the audit log may live elsewhere. Nothing was "
             "changed. Check the listed requests yourself instead."
+        )
+
+
+_OPEN_DUPLICATES_SQL = """
+SELECT array_agg(id ORDER BY created_at, id), array_agg(status ORDER BY created_at, id)
+FROM {approvals}
+WHERE status IN ('pending', 'approved')
+GROUP BY requested_by, action, payload_sha256
+HAVING count(*) > 1
+ORDER BY min(created_at), min(id)
+"""
+_LISTED_GROUPS = 10
+
+
+async def _settle_open_duplicates(session: Session, schema: str, *, close: bool) -> list[str]:
+    """Refuse, or with `close` cancel, requests that share a requester, action and payload hash
+    while open: the unique index cannot be built over them. Returns the ids it cancelled."""
+    approvals = _qualified_tables(schema)["approvals"]
+    if not (await session.execute("SELECT to_regclass(?) IS NOT NULL", (approvals,)))[0][0]:
+        return []
+    groups = [
+        (list(ids), list(statuses))
+        for ids, statuses in await session.execute(_OPEN_DUPLICATES_SQL.format(approvals=approvals))
+    ]
+    if not groups:
+        return []
+    listed = "; ".join(", ".join(ids) for ids, _ in groups[:_LISTED_GROUPS])
+    more = (
+        f" (and {len(groups) - _LISTED_GROUPS} more groups)" if len(groups) > _LISTED_GROUPS else ""
+    )
+    if not close:
+        raise ConfigError(
+            f"{len(groups)} group(s) of open approval requests share a requester, action and "
+            f"payload, which a unique index now forbids: {listed}{more}. Nothing was changed. "
+            "Cancel the extra ones, or run again with close_duplicates=True to keep each "
+            "group's approved request (else its oldest) and cancel the other pending ones."
+        )
+    to_cancel: list[tuple[str, str]] = []
+    for ids, statuses in groups:
+        approved = [
+            request_id
+            for request_id, status in zip(ids, statuses, strict=True)
+            if status == "approved"
+        ]
+        if len(approved) > 1:
+            raise ConfigError(
+                f"Requests {', '.join(approved)} are all approved for the same requester, "
+                "action and payload. Which approval stands is a decision for a person: "
+                "cancel or consume the others, then run again. Nothing was changed."
+            )
+        keeper = approved[0] if approved else ids[0]
+        to_cancel += [(request_id, keeper) for request_id in ids if request_id != keeper]
+    await _cancel_duplicates_as_owner(session, schema, to_cancel)
+    return [request_id for request_id, _ in to_cancel]
+
+
+async def _cancel_duplicates_as_owner(
+    session: Session, schema: str, requests: list[tuple[str, str]]
+) -> None:
+    """Cancel pending duplicates (id, the request kept), with the guard off for these statements.
+
+    The guard may not exist yet (a 0.1.0a2 table) or may predate this release; the owner
+    switches it off if it is there, and back on before the transaction commits.
+    """
+    table = f"{layout.identifier(schema, what='schema')}.{layout.APPROVALS_TABLE}"
+    guarded = bool(
+        await session.execute(
+            "SELECT 1 FROM pg_trigger WHERE tgrelid = to_regclass(?) AND tgname = ?",
+            (table, layout.APPROVALS_GUARD_TRIGGER),
+        )
+    )
+    if guarded:
+        await session.execute(
+            f"ALTER TABLE {table} DISABLE TRIGGER {layout.APPROVALS_GUARD_TRIGGER}"
+        )
+    for request_id, keeper in requests:
+        await session.execute(
+            f"UPDATE {table} SET status = 'cancelled', "
+            "reason = left('Cancelled by install_postgres_schema: a duplicate of ' || ?, 500), "
+            "closed_at = to_char(statement_timestamp() AT TIME ZONE 'UTC', "
+            "'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') WHERE id = ? AND status = 'pending'",
+            (keeper, request_id),
+        )
+    if guarded:
+        await session.execute(
+            f"ALTER TABLE {table} ENABLE TRIGGER {layout.APPROVALS_GUARD_TRIGGER}"
         )
 
 

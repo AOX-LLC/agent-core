@@ -6,13 +6,23 @@ from enum import StrEnum
 from typing import Annotated, Self
 from uuid import UUID
 
-from pydantic import AwareDatetime, JsonValue, StringConstraints, model_validator
+from pydantic import (
+    AfterValidator,
+    AwareDatetime,
+    JsonValue,
+    StringConstraints,
+    model_validator,
+)
 
 from aox_agent_core._model import ActionName, FrozenModel, PrincipalId, Sha256Hex
+from aox_agent_core._text import require_safe_text
 from aox_agent_core.context import RunContext
 
 RoleName = Annotated[str, StringConstraints(pattern=r"^[a-z][a-z0-9_.-]{0,63}$")]
-ShortText = Annotated[str, StringConstraints(min_length=1, max_length=500)]
+# Free text for people to read: no control, bidirectional or other format characters.
+ShortText = Annotated[
+    str, StringConstraints(min_length=1, max_length=500), AfterValidator(require_safe_text)
+]
 
 TTL_SECONDS_MAX = 7 * 24 * 60 * 60
 MAX_DELEGATES = 16
@@ -44,7 +54,9 @@ class ApprovalStatus(StrEnum):
     A pending request becomes CANCELLED when its requester withdraws it, and
     EXPIRED when expire_due() stores its expiry. Expiry does not wait for that
     sweep: it is judged from expires_at whenever a request is read, resolved or
-    used, so a pending request past its lifetime reads as EXPIRED either way.
+    used, so a pending or approved request past its lifetime reads as EXPIRED either
+    way. An approval that lapsed unused is EXPIRED and keeps its decision (approve),
+    resolved_by and resolved_at.
     """
 
     PENDING = "pending"
@@ -75,15 +87,15 @@ class Decision(StrEnum):
     REJECT = "reject"
 
 
-# The decision each status implies. A request has resolved_by and resolved_at
-# exactly when it has a decision.
-_DECISION_FOR_STATUS: Mapping[ApprovalStatus, Decision | None] = {
-    ApprovalStatus.PENDING: None,
-    ApprovalStatus.APPROVED: Decision.APPROVE,
-    ApprovalStatus.REJECTED: Decision.REJECT,
-    ApprovalStatus.CONSUMED: Decision.APPROVE,
-    ApprovalStatus.EXPIRED: None,
-    ApprovalStatus.CANCELLED: None,
+# The decisions each status allows. A request has resolved_by and resolved_at exactly when
+# it has a decision. An approval that lapsed unused is EXPIRED and keeps its decision.
+_DECISIONS_FOR_STATUS: Mapping[ApprovalStatus, frozenset[Decision | None]] = {
+    ApprovalStatus.PENDING: frozenset({None}),
+    ApprovalStatus.APPROVED: frozenset({Decision.APPROVE}),
+    ApprovalStatus.REJECTED: frozenset({Decision.REJECT}),
+    ApprovalStatus.CONSUMED: frozenset({Decision.APPROVE}),
+    ApprovalStatus.EXPIRED: frozenset({None, Decision.APPROVE}),
+    ApprovalStatus.CANCELLED: frozenset({None}),
 }
 
 
@@ -108,6 +120,11 @@ class ApprovalRequest(FrozenModel):
     so what an approver sees there is what the hash binds. It is None when the
     requester did not store it, and on what consume(), cancel() and expire_due()
     work on: they check nothing about a stored payload, so they return none.
+
+    `payload_purged_at` tells a payload that was dropped from one never stored: after
+    purge_payloads() on a finished request the payload is gone, this holds when, and
+    payload_sha256 still binds what it was. A request that never stored a payload has
+    both None.
     """
 
     id: UUID
@@ -128,6 +145,7 @@ class ApprovalRequest(FrozenModel):
     run_context: RunContext | None = None
     delegates: frozenset[PrincipalId] = frozenset()
     payload: dict[str, JsonValue] | None = None
+    payload_purged_at: AwareDatetime | None = None
 
     @model_validator(mode="after")
     def _few_delegates(self) -> Self:
@@ -146,7 +164,7 @@ class ApprovalRequest(FrozenModel):
 
     @model_validator(mode="after")
     def _state_is_consistent(self) -> Self:
-        if self.decision != _DECISION_FOR_STATUS[self.status]:
+        if self.decision not in _DECISIONS_FOR_STATUS[self.status]:
             raise ValueError(f"status {self.status.value} does not match decision {self.decision}")
 
         is_resolved = self.decision is not None
@@ -156,6 +174,17 @@ class ApprovalRequest(FrozenModel):
             raise ValueError("resolved_by and resolved_at are set exactly when there is a decision")
         if self.resolved_by is not None and self.resolved_by == self.requested_by:
             raise ValueError("a request cannot be resolved by the principal who made it")
+        if self.payload_purged_at is not None and (
+            self.payload is not None
+            or self.status
+            not in {
+                ApprovalStatus.CONSUMED,
+                ApprovalStatus.REJECTED,
+                ApprovalStatus.CANCELLED,
+                ApprovalStatus.EXPIRED,
+            }
+        ):
+            raise ValueError("only a finished request has its payload purged, and then has none")
         if self.resolved_at is not None and self.resolved_at < self.created_at:
             raise ValueError("resolved_at is earlier than created_at")
 
@@ -176,6 +205,7 @@ class DenialReason(StrEnum):
     NOT_HUMAN = "not_human"
     MISSING_ROLE = "missing_role"
     SELF_APPROVAL = "self_approval"
+    DELEGATE_APPROVAL = "delegate_approval"
     NOT_PENDING = "not_pending"
     NOT_REQUESTER = "not_requester"
     UNKNOWN_ACTION = "unknown_action"

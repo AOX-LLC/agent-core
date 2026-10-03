@@ -398,13 +398,16 @@ async def test_cancelling_an_append_that_waits_for_the_lock_leaves_the_pool_and_
 ) -> None:
     import asyncio
 
-    from aox_agent_core.audit.sql import APPEND_LOCK_KEY
+    from aox_agent_core import _postgres_schema
 
     log = SQLAuditLog(PostgresDatabase.from_pool(pool))
     await log.append(event(0))
 
     async with pool.connection() as holder, holder.transaction():
-        await holder.execute("SELECT pg_advisory_xact_lock(%s)", (APPEND_LOCK_KEY,))
+        await holder.execute(
+            "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
+            (_postgres_schema.audit_lock_name("public"),),
+        )
         waiting = asyncio.create_task(log.append(event(1)))
         await asyncio.sleep(0.3)  # it is now blocked on the lock the holder has
         waiting.cancel()

@@ -269,3 +269,35 @@ def test_scorecard_failures_include_errors_and_failed_scores() -> None:
 def test_eval_runner_needs_a_scorer() -> None:
     with pytest.raises(ValueError, match="at least one scorer"):
         EvalRunner([])
+
+
+def test_an_approval_that_lapsed_unused_is_expired_and_keeps_its_decision() -> None:
+    now = datetime.now(UTC)
+    base: dict[str, Any] = {
+        "id": uuid4(),
+        "action": "crm.update_contact",
+        "summary": "s",
+        "payload_sha256": "a" * 64,
+        "requested_by": "agent-intake",
+        "required_role": "ops.approver",
+        "created_at": now - timedelta(hours=2),
+        "expires_at": now - timedelta(hours=1),
+        "closed_at": now,
+    }
+    lapsed = ApprovalRequest(
+        **base,
+        status=ApprovalStatus.EXPIRED,
+        decision=Decision.APPROVE,
+        resolved_by="user-17",
+        resolved_at=now - timedelta(hours=1, minutes=30),
+    )
+    assert lapsed.decision is Decision.APPROVE
+    # A rejection never lapses into expiry, and a pending request has no decision.
+    with pytest.raises(ValidationError):
+        ApprovalRequest(
+            **base,
+            status=ApprovalStatus.EXPIRED,
+            decision=Decision.REJECT,
+            resolved_by="user-17",
+            resolved_at=now - timedelta(hours=1, minutes=30),
+        )

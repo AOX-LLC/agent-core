@@ -16,7 +16,7 @@ chain on its own; compare against a head kept elsewhere (verify's expected_head)
 import asyncio
 import json
 from collections.abc import AsyncIterator, Sequence
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from functools import partial
 from typing import Any, Final
 from uuid import UUID, uuid4
@@ -38,6 +38,7 @@ from aox_agent_core.audit.types import (
 )
 from aox_agent_core.errors import (
     AuditIntegrityError,
+    AuditLockTimeoutError,
     AuditPayloadRejectedError,
     AuditTimeRejectedError,
     ConfigError,
@@ -49,6 +50,7 @@ from aox_agent_core.storage import (
     Session,
     TableName,
     bring_table_up_to_date,
+    driver_errors,
 )
 
 AUDIT_TABLE: Final = layout.AUDIT_TABLE
@@ -63,8 +65,9 @@ APPEND_TRIGGER: Final = layout.AUDIT_APPEND_TRIGGER
 SQLITE_TRIGGERS: Final = frozenset({UPDATE_TRIGGER, DELETE_TRIGGER, APPEND_TRIGGER})
 POSTGRES_TRIGGERS: Final = layout.AUDIT_TRIGGERS
 
-# pg_advisory_xact_lock key that serializes appends (see _postgres_schema).
-APPEND_LOCK_KEY: Final = layout.AUDIT_APPEND_LOCK_KEY
+# How long a library-owned append waits for the append lock (see _postgres_schema): a role
+# that holds it can stall writers only this long. Set per log with `lock_timeout`.
+DEFAULT_LOCK_TIMEOUT: Final = timedelta(seconds=5)
 
 READ_BATCH_SIZE = 500
 # Most events one append_many takes: it holds the append lock for the whole batch.
@@ -124,6 +127,13 @@ class SQLAuditLog:
     own the table, and cannot UPDATE, DELETE or TRUNCATE it; otherwise it raises
     ConfigError and writes nothing. `schema` names the Postgres schema the table
     was installed in (public by default); SQLite has none.
+
+    An append takes a database-wide advisory lock for its schema and waits for it at most
+    `lock_timeout` (5 seconds by default) before raising AuditLockTimeoutError, writing
+    nothing: a transaction that holds the lock, or a role that took it, stalls writers
+    only that long. The bound covers the library's own append transactions; in a host's
+    transaction (`connection=`) it is applied for the append and the host's own setting
+    is put back after.
     """
 
     def __init__(
@@ -132,7 +142,11 @@ class SQLAuditLog:
         *,
         scrubber: Scrubber | None = None,
         schema: str | None = None,
+        lock_timeout: timedelta = DEFAULT_LOCK_TIMEOUT,
     ) -> None:
+        if lock_timeout < timedelta(milliseconds=1):
+            raise ValueError("lock_timeout must be at least a millisecond")
+        self._lock_timeout = f"{int(lock_timeout.total_seconds() * 1000)}ms"
         self.database = database
         self._scrubber = scrubber if scrubber is not None else PatternScrubber()
         self._table = TableName.on(database, AUDIT_TABLE, schema)
@@ -206,16 +220,19 @@ class SQLAuditLog:
         return (await self.append_many_in(session, [event]))[0]
 
     async def append_many_in(
-        self, session: Session, events: Sequence[AuditEvent]
+        self, session: Session, events: Sequence[AuditEvent], *, lock_timeout: str | None = None
     ) -> list[AuditRecord]:
         """append_many within a write transaction on this log's database.
 
         The events must already have passed checked_event(). The caller holds the
-        append lock from here until its transaction ends.
+        append lock from here until its transaction ends. The wait for it is bounded by
+        this log's lock_timeout, or by `lock_timeout`, a Postgres interval such as "2s";
+        AuditLockTimeoutError if it is not free in time.
         """
         await self._ensure_protected(session)
+        previous_timeout: str | None = None
         if session.dialect is Dialect.POSTGRES:
-            await session.execute("SELECT pg_advisory_xact_lock(?)", (APPEND_LOCK_KEY,))
+            previous_timeout = await self._take_lock(session, lock_timeout or self._lock_timeout)
         head, database_now = await _head_and_now(session, self._table)
         for event in events:
             _check_occurred_at(event.occurred_at, database_now)
@@ -237,7 +254,41 @@ class SQLAuditLog:
             record = AuditRecord(**unsealed.model_dump(), record_hash=compute_record_hash(unsealed))
             records.append(record)
             previous = AuditHead(seq=record.seq, record_hash=record.record_hash)
-        return await self._insert(session, records, database_now)
+        written = await self._insert(session, records, database_now)
+        if previous_timeout is not None:
+            # The host's own setting, back for the rest of its transaction.
+            await session.execute("SELECT set_config('lock_timeout', ?, true)", (previous_timeout,))
+        return written
+
+    async def lock_in(self, session: Session) -> None:
+        """Take the append lock now, in a write transaction on this log's database.
+
+        For a caller that will append later in the same transaction and also changes other
+        rows there: taking the lock first keeps the order (append lock, then rows) the same
+        for everyone, which is what stops two such transactions from deadlocking. It is held
+        until the transaction ends, and waited for at most this log's lock_timeout. That
+        setting stays for the rest of the transaction, so a wait for a row held by another
+        transaction is bounded too; use it only in a transaction the library owns. A no-op
+        on SQLite, whose write transactions already exclude each other.
+        """
+        await self._ensure_protected(session)
+        if session.dialect is Dialect.POSTGRES:
+            await self._take_lock(session, self._lock_timeout)
+
+    async def _take_lock(self, session: Session, wait: str) -> str:
+        """Take this schema's append lock, waiting at most `wait`; return the old setting."""
+        previous = str((await session.execute("SELECT current_setting('lock_timeout')"))[0][0])
+        await session.execute("SELECT set_config('lock_timeout', ?, true)", (wait,))
+        name = layout.audit_lock_name(self._table.schema or layout.DEFAULT_SCHEMA)
+        try:
+            await session.execute("SELECT pg_advisory_xact_lock(hashtextextended(?, 0))", (name,))
+        except driver_errors() as error:
+            if getattr(error, "sqlstate", None) == AuditLockTimeoutError.sqlstate:
+                raise AuditLockTimeoutError(
+                    f"The audit log's append lock was not free within {wait}; nothing was written."
+                ) from error
+            raise
+        return previous
 
     async def _insert(
         self, session: Session, records: list[AuditRecord], database_now: datetime
@@ -334,6 +385,14 @@ class SQLAuditLog:
             _require_triggers(
                 session, await _postgres_triggers(session, self._table), POSTGRES_TRIGGERS
             )
+            revision = await layout.audit_trigger_revision(session, self._table.sql)
+            if revision != layout.AUDIT_TRIGGER_REVISION:
+                raise ConfigError(
+                    f"The audit insert trigger on {self._table} is older than this release "
+                    f"(revision {revision or 'before 5'}, this release needs "
+                    f"{layout.AUDIT_TRIGGER_REVISION}). As the owner role, run "
+                    "install_postgres_schema from 0.1.0a5 with the requester and approver roles."
+                )
         await bring_table_up_to_date(session, AUDIT_TABLE, ADDED_COLUMNS, schema=self._table.schema)
         self._protections_checked = True
 

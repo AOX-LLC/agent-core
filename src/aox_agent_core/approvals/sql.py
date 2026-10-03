@@ -20,6 +20,7 @@ from pydantic import JsonValue, ValidationError
 
 from aox_agent_core import _postgres_schema as layout
 from aox_agent_core._canonical import canonical_json, sha256_of
+from aox_agent_core._text import check_short_text, neutralized
 from aox_agent_core._validation import STORED_RECORD
 from aox_agent_core.approvals.policy import ApproverPolicy, RoleApproverPolicy
 from aox_agent_core.approvals.types import (
@@ -39,6 +40,7 @@ from aox_agent_core.audit.types import AuditEvent, check_payload, exceeds_depth
 from aox_agent_core.context import RunContext
 from aox_agent_core.errors import (
     ApprovalAlreadyResolvedError,
+    ApprovalConflictError,
     ApprovalError,
     ApprovalExpiredError,
     ApprovalIntegrityError,
@@ -46,6 +48,7 @@ from aox_agent_core.errors import (
     ApprovalNotGrantedError,
     ApprovalPayloadMismatchError,
     ApprovalPayloadRejectedError,
+    AuditLockTimeoutError,
     AuditPayloadRejectedError,
     ConfigError,
     NotAuthorizedToResolveError,
@@ -86,18 +89,32 @@ CREATE TABLE {APPROVALS_TABLE} (
     run_context TEXT,
     closed_at TEXT,
     delegates TEXT NOT NULL DEFAULT '[]',
-    payload_json TEXT
+    payload_json TEXT,
+    payload_purged_at TEXT
 )"""
 # Columns added in 0.1.0a3 and 0.1.0a4, with their SQLite types.
 ADDED_COLUMNS: Final = {
     "closed_at": "TEXT",
     "delegates": "TEXT NOT NULL DEFAULT '[]'",
     "payload_json": "TEXT",
+    "payload_purged_at": "TEXT",
 }
 
 _PENDING_INDEX_DDL = (
     f"CREATE INDEX agent_core_approvals_pending ON {APPROVALS_TABLE} (status, created_at, id)"
 )
+
+# One open request per requester, action and payload hash (see _postgres_schema for the
+# Postgres side). SQLite builds it on first submit, once it has checked for duplicates.
+_OPEN_INDEX_DDL = (
+    f"CREATE UNIQUE INDEX {layout.OPEN_REQUEST_INDEX} ON {APPROVALS_TABLE} "
+    f"({', '.join(layout.OPEN_REQUEST_COLUMNS)}) "
+    f"WHERE status IN ({', '.join(repr(s) for s in layout.OPEN_REQUEST_STATUSES)})"
+)
+# How many times submit looks again after the open request it met closed or lapsed under it.
+SUBMIT_ATTEMPTS: Final = 3
+_OPEN_STATUSES: Final = frozenset({ApprovalStatus.PENDING, ApprovalStatus.APPROVED})
+_OPEN_STATUS_LIST: Final = ", ".join(repr(status) for status in layout.OPEN_REQUEST_STATUSES)
 
 DEFAULT_PENDING_LIMIT = 100
 # Pages read while a custom policy filters; larger than most limits, so a policy
@@ -107,11 +124,16 @@ PENDING_PAGE_SIZE = 500
 _COLUMNS = (
     "id, action, summary, payload_sha256, requested_by, required_role, created_at, "
     "expires_at, status, decision, resolved_by, resolved_at, consumed_at, reason, run_context, "
-    "delegates, closed_at, payload_json"
+    "delegates, closed_at, payload_json, payload_purged_at"
 )
+_ROW_MARKS: Final = ", ".join("?" for _ in _COLUMNS.split(","))
 _COLUMN_INDEX: Final = {name.strip(): i for i, name in enumerate(_COLUMNS.split(","))}
 DELEGATES_COLUMN: Final = "delegates"
 PAYLOAD_COLUMN: Final = "payload_json"
+_FINISHED_STATUSES: Final = ("consumed", "rejected", "cancelled", "expired")
+# When a finished request finished: consumed, decided (rejected) or closed (cancelled, expired).
+_FINISHED_AT: Final = layout.FINISHED_AT_EXPRESSION
+_CANONICAL_STAMP: Final = r"'^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:]{8}[.][0-9]{6}Z$'"
 # Seconds an independent audit write waits for the append lock before falling back.
 DENIAL_LOCK_TIMEOUT: Final = "2s"
 # Seconds an independent audit write waits for a pooled connection before falling back.
@@ -124,6 +146,7 @@ _DENIAL_ERRORS: Final[Mapping[DenialReason, type[ApprovalError]]] = {
     DenialReason.NOT_HUMAN: NotAuthorizedToResolveError,
     DenialReason.MISSING_ROLE: NotAuthorizedToResolveError,
     DenialReason.SELF_APPROVAL: NotAuthorizedToResolveError,
+    DenialReason.DELEGATE_APPROVAL: NotAuthorizedToResolveError,
     DenialReason.NOT_PENDING: ApprovalAlreadyResolvedError,
     DenialReason.UNKNOWN_ACTION: NotAuthorizedToResolveError,
     DenialReason.ROLE_MISMATCH: NotAuthorizedToResolveError,
@@ -146,6 +169,7 @@ class _Outcome:
     events: list[AuditEvent] = field(default_factory=list)
     # How many requests an expiry batch stored as expired, and whether it was full.
     expired: int = 0
+    purged: int = 0
     batch_full: bool = False
 
 
@@ -257,6 +281,14 @@ class SQLApprovalQueue:
         event. Only requested_by may consume the approval, unless `delegates` names
         other principals allowed to: an explicit choice, shown to the approver.
 
+        One request may be open (pending, or approved and not yet used) for each requester,
+        action and payload: a database index enforces it, so it holds when calls race. An
+        exact repeat (same summary, required_role, lifetime and delegates, and the payload
+        stored if it asked for it) returns the existing request, with no new audit event;
+        one that differs in any of those raises ApprovalConflictError and is audited as
+        approval.submit_conflict. `context` is not compared: the first submit's stays. An open
+        request already past its lifetime is closed as expired, and this one is queued.
+
         With `connection`, a psycopg AsyncConnection already in a transaction, the
         request and its audit event are written in that transaction.
         """
@@ -284,24 +316,63 @@ class SQLApprovalQueue:
             await require_current_table(
                 session, APPROVALS_TABLE, RUN_CONTEXT_COLUMN, schema=self._table.schema
             )
-            await session.execute(
-                f"INSERT INTO {self._table.sql} ({_COLUMNS}) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                _row_values(request),
-            )
-            event = _event(
-                "approval.requested",
-                requested_by.id,
-                request,
-                context,
-                required_role=required_role,
-                payload_sha256=request.payload_sha256,
-            )
-            if request.delegates:
-                event = event.model_copy(
-                    update={"payload": {**event.payload, "delegates": sorted(request.delegates)}}
+            events: list[AuditEvent] = []
+            for _ in range(SUBMIT_ATTEMPTS):
+                inserted = await session.execute_count(
+                    f"INSERT INTO {self._table.sql} ({_COLUMNS}) "
+                    f"VALUES ({_ROW_MARKS}) "
+                    f"ON CONFLICT ({', '.join(layout.OPEN_REQUEST_COLUMNS)}) "
+                    f"WHERE status IN ({_OPEN_STATUS_LIST}) DO NOTHING",
+                    _row_values(request),
                 )
-            return _Outcome(request=request, events=[event])
+                if inserted == 1:
+                    return _Outcome(request=request, events=[*events, _requested_event(request)])
+                row = await _open_row(session, self._table, request)
+                if row is None:
+                    continue  # closed since the insert met it: look again
+                try:
+                    existing, payload_text = _parse_row(row)
+                except _StoredRowError as stored:
+                    return _refused_repeat(
+                        stored, row[0], requested_by.id, context, ("row",), stored.reason, events
+                    )
+                if await _is_due(session, self._table, existing, now):
+                    events += await self._expire_lapsed(session, existing, requested_by.id, now)
+                    continue
+                try:
+                    existing = _with_payload(existing, payload_text, self._scrubber)
+                except _StoredRowError as stored:
+                    return _refused_repeat(
+                        stored,
+                        row[0],
+                        requested_by.id,
+                        context,
+                        ("payload",),
+                        stored.reason,
+                        events,
+                    )
+                differs = _terms_that_differ(existing, request, wants_payload=include_payload)
+                if differs:
+                    return _refused_repeat(
+                        ApprovalConflictError(
+                            f"Request {existing.id} is already open for this requester, action "
+                            f"and payload, with a different {', '.join(differs)}. Cancel it, or "
+                            "repeat the call with the same terms.",
+                            existing=existing.id,
+                            differs=differs,
+                        ),
+                        str(existing.id),
+                        requested_by.id,
+                        context,
+                        differs,
+                        "conflict",
+                        events,
+                    )
+                return _Outcome(request=existing, events=events)
+            raise ApprovalError(
+                "Could not queue the request: the open request for this requester, action and "
+                "payload kept changing. Try again."
+            )
 
         return await self._write(insert, connection=connection)
 
@@ -315,9 +386,6 @@ class SQLApprovalQueue:
             raise ApprovalPayloadRejectedError(
                 f"The payload cannot be stored: more than {layout.MAX_STORED_PAYLOAD_BYTES} bytes."
             )
-        if _contains_nul(checked):
-            # Postgres text cannot hold NUL; refuse it here rather than at the insert.
-            raise ApprovalPayloadRejectedError("The payload cannot be stored: it contains NUL.")
         findings = self._scrubber.find_secrets({"payload": checked})
         if findings:
             located = ", ".join(f"{finding.rule} at {finding.path}" for finding in findings)
@@ -325,6 +393,19 @@ class SQLApprovalQueue:
                 f"The payload cannot be stored: it contains {located}."
             )
         return checked
+
+    async def _expire_lapsed(
+        self, session: Session, existing: ApprovalRequest, actor_id: str, now: datetime
+    ) -> list[AuditEvent]:
+        """Store EXPIRED on an open request past its lifetime; its audit events (none if
+        another transaction closed it first)."""
+        closed_at = await _close(session, self._table, existing, ApprovalStatus.EXPIRED, now)
+        if closed_at is None:
+            return []
+        expired = existing.model_copy(
+            update={"status": ApprovalStatus.EXPIRED, "closed_at": closed_at}
+        )
+        return [_expired_event(actor_id, expired, existing.status, existing.run_context)]
 
     async def get(self, request_id: UUID, *, connection: Any = None) -> ApprovalRequest:
         """Return the request; raises ApprovalNotFoundError if there is none, and
@@ -337,7 +418,7 @@ class SQLApprovalQueue:
         request = await self._run(read, write=False, connection=connection)
         if request is None:
             raise ApprovalNotFoundError(f"No approval request {request_id}.")
-        if request.status is ApprovalStatus.PENDING and request.is_expired(self._now()):
+        if request.status in _OPEN_STATUSES and request.is_expired(self._now()):
             # Reported as the sweep would store it, without writing anything.
             return request.model_copy(
                 update={"status": ApprovalStatus.EXPIRED, "closed_at": request.expires_at}
@@ -618,13 +699,9 @@ class SQLApprovalQueue:
                     ),
                 )
 
-            consumed = ApprovalRequest.model_validate(
-                {**request.model_dump(), "status": ApprovalStatus.CONSUMED, "consumed_at": now},
-                context={STORED_RECORD: True},
-            )
-            changed = await session.execute_count(
+            rows = await session.execute(
                 f"UPDATE {self._table.sql} SET status = ?, consumed_at = ? "
-                "WHERE id = ? AND status = ?",
+                "WHERE id = ? AND status = ? RETURNING consumed_at",
                 (
                     ApprovalStatus.CONSUMED.value,
                     canonical_timestamp(now),
@@ -632,7 +709,7 @@ class SQLApprovalQueue:
                     ApprovalStatus.APPROVED.value,
                 ),
             )
-            if changed != 1:
+            if not rows:
                 return _denied(
                     ApprovalAlreadyResolvedError(f"Request {request_id} was used meanwhile."),
                     _event(
@@ -643,6 +720,15 @@ class SQLApprovalQueue:
                         reason="not_open",
                     ),
                 )
+            # The time as stored: on Postgres the database's own stamp, not `now`.
+            consumed = ApprovalRequest.model_validate(
+                {
+                    **request.model_dump(),
+                    "status": ApprovalStatus.CONSUMED,
+                    "consumed_at": datetime.fromisoformat(rows[0][0]),
+                },
+                context={STORED_RECORD: True},
+            )
             event = _event("approval.consumed", principal.id, consumed, event_context)
             return _Outcome(request=consumed, events=[event])
 
@@ -665,8 +751,8 @@ class SQLApprovalQueue:
         if the request is no longer pending, ApprovalExpiredError if it has
         expired, and ApprovalNotFoundError if it does not exist; each is audited.
         """
-        if reason is not None and not 0 < len(reason) <= 500:
-            raise ValueError("reason must be 1 to 500 characters")
+        if reason is not None:
+            check_short_text(reason, what="reason")
         details = {"cancel_reason": reason} if reason is not None else {}
 
         async def withdraw(session: Session) -> _Outcome:
@@ -704,10 +790,8 @@ class SQLApprovalQueue:
                         reason=denial,
                     ),
                 )
-            cancelled = request.model_copy(
-                update={"status": ApprovalStatus.CANCELLED, "closed_at": now}
-            )
-            if not await _close(session, self._table, request, ApprovalStatus.CANCELLED, now):
+            closed_at = await _close(session, self._table, request, ApprovalStatus.CANCELLED, now)
+            if closed_at is None:
                 return _denied(
                     ApprovalAlreadyResolvedError(f"Request {request_id} was resolved meanwhile."),
                     _event(
@@ -718,6 +802,9 @@ class SQLApprovalQueue:
                         reason=DenialReason.NOT_PENDING.value,
                     ),
                 )
+            cancelled = request.model_copy(
+                update={"status": ApprovalStatus.CANCELLED, "closed_at": closed_at}
+            )
             event = _event("approval.cancelled", principal.id, cancelled, event_context, **details)
             return _Outcome(request=cancelled, events=[event])
 
@@ -731,7 +818,8 @@ class SQLApprovalQueue:
         limit: int = 500,
         connection: Any = None,
     ) -> int:
-        """Store EXPIRED on every pending request whose lifetime is over; return how many.
+        """Store EXPIRED on every pending or approved-unused request whose lifetime is over;
+        return how many.
 
         Reads already report such requests as expired, so this only makes the
         stored state match, with one approval.expired audit event per request
@@ -750,6 +838,8 @@ class SQLApprovalQueue:
             if not await _table_exists(session, self._table):
                 return _Outcome()
             due, rows_read, unreadable = await _load_due(session, self._table, moment, limit)
+            if due:
+                await self._lock_after_reading(session, connection)
             if unreadable:
                 _LOG.warning(
                     "%d due approval request(s) are stored in a form this library will not read "
@@ -759,13 +849,16 @@ class SQLApprovalQueue:
                 )
             events = []
             for request in due:
-                if await _close(session, self._table, request, ApprovalStatus.EXPIRED, moment):
+                closed_at = await _close(
+                    session, self._table, request, ApprovalStatus.EXPIRED, moment
+                )
+                if closed_at is not None:
                     expired = request.model_copy(
-                        update={"status": ApprovalStatus.EXPIRED, "closed_at": moment}
+                        update={"status": ApprovalStatus.EXPIRED, "closed_at": closed_at}
                     )
                     # The sweep belongs to no run; the event carries the request's own.
                     events.append(
-                        _event("approval.expired", principal.id, expired, request.run_context)
+                        _expired_event(principal.id, expired, request.status, request.run_context)
                     )
             # A full batch of unreadable rows must not loop: go on only if some expired.
             return _Outcome(
@@ -774,10 +867,114 @@ class SQLApprovalQueue:
 
         total = 0
         while True:
-            outcome = await self._write_outcome(sweep, connection=connection, stored_context=True)
+            outcome = await self._write_outcome(
+                sweep, connection=connection, stored_context=True, lock_first=False
+            )
             total += outcome.expired
             if not outcome.batch_full:
                 return total
+
+    async def purge_payloads(
+        self,
+        *,
+        principal: Principal,
+        older_than: timedelta,
+        limit: int = 500,
+        connection: Any = None,
+    ) -> int:
+        """Drop the stored payload of finished requests older than `older_than`; return how many.
+
+        Only requests that are consumed, rejected, cancelled or expired, and whose finish
+        time (consumed_at, resolved_at or closed_at) is further back than `older_than`
+        by the database's clock (the application's on SQLite), lose their payload_json.
+        payload_sha256 is never touched, so what was approved stays provable; the request
+        reads with payload None and payload_purged_at set, which tells it from one that
+        never stored a payload. One approval.payload_purged event per request, naming
+        `principal`, in the same transaction. Works in batches of `limit`, each its own
+        transaction, and a second run finds nothing more.
+
+        Approver side only (ConfigError otherwise): the decision side holds the right,
+        the requester role has no UPDATE on the column. On Postgres `older_than` may not
+        be shorter than the retention floor the installer wrote into the guard
+        (install_postgres_schema(payload_retention_floor=...), 24 hours by default),
+        else ValueError, and the guard refuses anything shorter whatever the library
+        says. Nothing else purges a payload: count it in your retention plan.
+        """
+        if older_than <= timedelta(0):
+            raise ValueError("older_than must be positive")
+        if limit < 1:
+            raise ValueError(f"limit must be at least 1, got {limit}")
+        moment = self._now()
+
+        async def sweep(session: Session) -> _Outcome:
+            await self._require_side(session, "purge payloads", ApprovalSide.APPROVER)
+            if not await _table_exists(session, self._table):
+                return _Outcome()
+            if session.dialect is Dialect.POSTGRES:
+                floor = await layout.payload_retention_floor_seconds(session, self._schema)
+                if older_than.total_seconds() < floor:
+                    raise ValueError(
+                        f"older_than is shorter than this schema's payload retention floor of "
+                        f"{floor} seconds."
+                    )
+            candidates, rows_read, unreadable = await _load_purgeable(
+                session, self._table, moment, older_than, limit
+            )
+            if unreadable:
+                _LOG.warning(
+                    "%d finished approval request(s) are stored in a form this library will not "
+                    "read and were not purged (first id %s).",
+                    len(unreadable),
+                    unreadable[0],
+                )
+            if candidates:
+                await self._lock_after_reading(session, connection)
+            events = []
+            for request in candidates:
+                changed = await session.execute_count(
+                    f"UPDATE {self._table.sql} SET payload_json = NULL, payload_purged_at = ? "
+                    "WHERE id = ? AND status = ? AND payload_json IS NOT NULL "
+                    "AND payload_purged_at IS NULL",
+                    (canonical_timestamp(moment), str(request.id), request.status.value),
+                )
+                if changed == 1:
+                    events.append(
+                        _event(
+                            "approval.payload_purged",
+                            principal.id,
+                            request,
+                            request.run_context,
+                            payload_sha256=request.payload_sha256,
+                            request_status=request.status.value,
+                        )
+                    )
+            return _Outcome(
+                events=events, purged=len(events), batch_full=rows_read == limit and bool(events)
+            )
+
+        total = 0
+        while True:
+            outcome = await self._write_outcome(
+                sweep, connection=connection, stored_context=True, lock_first=False
+            )
+            total += outcome.purged
+            if not outcome.batch_full:
+                return total
+
+    async def _lock_after_reading(self, session: Session, connection: Any) -> None:
+        """Take the audit append lock now, in a sweep that read its candidates first.
+
+        A sweep scans before it changes anything, so it holds the schema-wide lock only for
+        its writes, not for the scan. The order is still lock, then rows (see
+        _write_outcome). A host's `connection` is never locked early.
+        """
+        log = self._audit_log
+        if (
+            connection is None
+            and isinstance(log, SQLAuditLog)
+            and log.database.same_database(self.database)
+        ):
+            await log.lock_in(session)
 
     async def _write(
         self,
@@ -802,6 +999,7 @@ class SQLApprovalQueue:
         *,
         connection: Any = None,
         stored_context: bool = False,
+        lock_first: bool = True,
     ) -> _Outcome:
         """Run `work` in a write transaction and audit its events.
 
@@ -837,6 +1035,11 @@ class SQLApprovalQueue:
             )
 
         async def in_transaction(session: Session) -> _Outcome:
+            if lock_first and connection is None and checked_log is not None and shares_database:
+                # Append lock first, then the request's row: a host that appended before it
+                # changes a request takes them in that order, so no pair of transactions
+                # can wait for each other (Postgres would abort one with 40P01).
+                await checked_log.lock_in(session)
             outcome = await work(session)
             # Checked before the commit, so an event the log would refuse stops the change.
             if checked_log is not None:
@@ -873,23 +1076,19 @@ class SQLApprovalQueue:
         described = _describe(events)
 
         async def apart(session: Session) -> list[Any]:
-            if session.dialect is Dialect.POSTGRES:
-                # Waits only briefly for the append lock: the host's own transaction
-                # may hold it already, and it is waiting for us.
-                await session.execute(f"SET LOCAL lock_timeout = '{DENIAL_LOCK_TIMEOUT}'")
-            return await log.append_many_in(session, events)
+            # Waits only briefly for the append lock: the host's own transaction may hold
+            # it already, and it is waiting for us.
+            return await log.append_many_in(session, events, lock_timeout=DENIAL_LOCK_TIMEOUT)
 
         async def inside(session: Session) -> list[Any]:
-            if session.dialect is not Dialect.POSTGRES:
-                return await log.append_many_in(session, events)
-            # The same bound, for this savepoint only: put back before the host goes on.
-            previous = (await session.execute("SELECT current_setting('lock_timeout')"))[0][0]
-            await session.execute(f"SET LOCAL lock_timeout = '{DENIAL_LOCK_TIMEOUT}'")
-            records = await log.append_many_in(session, events)
-            await session.execute("SELECT set_config('lock_timeout', ?, true)", (previous,))
-            return records
+            # The same bound, for this savepoint only: the host's setting is put back.
+            return await log.append_many_in(session, events, lock_timeout=DENIAL_LOCK_TIMEOUT)
 
-        failures: tuple[type[Exception], ...] = (*driver_errors(), TimeoutError)
+        failures: tuple[type[Exception], ...] = (
+            *driver_errors(),
+            TimeoutError,
+            AuditLockTimeoutError,
+        )
         try:
             await log.database.run(apart, write=True, acquire_timeout=DENIAL_ACQUIRE_TIMEOUT)
         except failures as failure:
@@ -943,23 +1142,6 @@ def _checked_or_without_context(log: SQLAuditLog, event: AuditEvent) -> AuditEve
             update={"context": None, "payload": {**event.payload, "run_context_dropped": "true"}}
         )
         return log.checked_event(stripped)
-
-
-def _contains_nul(value: JsonValue) -> bool:
-    """True when any key or string in `value` holds a NUL character."""
-    stack: list[JsonValue] = [value]
-    while stack:
-        item = stack.pop()
-        if isinstance(item, str):
-            if "\x00" in item:
-                return True
-        elif isinstance(item, dict):
-            if any("\x00" in key for key in item):
-                return True
-            stack.extend(item.values())
-        elif isinstance(item, list):
-            stack.extend(item)
-    return False
 
 
 def _sqlstate(error: BaseException) -> str | None:
@@ -1043,13 +1225,16 @@ async def _close(
     request: ApprovalRequest,
     status: ApprovalStatus,
     now: datetime,
-) -> bool:
-    """Move a pending request to `status` (expired or cancelled); False if it moved meanwhile."""
-    changed = await session.execute_count(
-        f"UPDATE {table.sql} SET status = ?, closed_at = ? WHERE id = ? AND status = ?",
-        (status.value, canonical_timestamp(now), str(request.id), ApprovalStatus.PENDING.value),
+) -> datetime | None:
+    """Move a request from its stored status to `status` (cancelled, or expired for an
+    approval that lapsed too). Returns the closed_at that was stored, which on Postgres is
+    the database's own stamp and not `now`; None if the request moved meanwhile."""
+    rows = await session.execute(
+        f"UPDATE {table.sql} SET status = ?, closed_at = ? WHERE id = ? AND status = ? "
+        "RETURNING closed_at",
+        (status.value, canonical_timestamp(now), str(request.id), request.status.value),
     )
-    return changed == 1
+    return datetime.fromisoformat(rows[0][0]) if rows else None
 
 
 # The database's clock as a canonical timestamp, so the sweep picks only what the
@@ -1062,7 +1247,8 @@ _POSTGRES_STATEMENT_NOW_TEXT = (
 async def _load_due(
     session: Session, table: TableName, now: datetime, limit: int
 ) -> tuple[list[ApprovalRequest], int, list[str]]:
-    """Up to `limit` pending requests whose lifetime ended by `now`, oldest expiry first.
+    """Up to `limit` pending or approved requests whose lifetime ended by `now`, oldest
+    expiry first.
 
     Returns the requests this library can read, how many rows it read, and the ids of
     the rows it cannot read, which the sweep leaves as they are.
@@ -1073,9 +1259,9 @@ async def _load_due(
         else ""
     )
     rows = await session.execute(
-        f"SELECT {_COLUMNS} FROM {table.sql} WHERE status = ? AND expires_at <= ?"
-        f"{database_clock} ORDER BY expires_at, id LIMIT ?",
-        (ApprovalStatus.PENDING.value, canonical_timestamp(now), limit),
+        f"SELECT {_COLUMNS} FROM {table.sql} WHERE status IN ({_OPEN_STATUS_LIST}) "
+        f"AND expires_at <= ?{database_clock} ORDER BY expires_at, id LIMIT ?",
+        (canonical_timestamp(now), limit),
     )
     readable: list[ApprovalRequest] = []
     unreadable: list[str] = []
@@ -1085,6 +1271,149 @@ async def _load_due(
         except _StoredRowError:
             unreadable.append(row[0])
     return readable, len(rows), unreadable
+
+
+async def _load_purgeable(
+    session: Session, table: TableName, now: datetime, older_than: timedelta, limit: int
+) -> tuple[list[ApprovalRequest], int, list[str]]:
+    """Up to `limit` finished requests holding a payload that finished more than `older_than`
+    ago, oldest first: by the database's clock on Postgres, the application's on SQLite.
+
+    Returns the requests this library can read, how many rows it read, and the ids of the
+    rows it cannot read, which a purge leaves as they are.
+    """
+    statuses = ", ".join(f"'{status}'" for status in _FINISHED_STATUSES)
+    if session.dialect is Dialect.POSTGRES:
+        cutoff = (
+            "to_char((statement_timestamp() - make_interval(secs => ?)) AT TIME ZONE 'UTC', "
+            '\'YYYY-MM-DD"T"HH24:MI:SS.US"Z"\')'
+        )
+        parameters: tuple[Any, ...] = (older_than.total_seconds(), limit)
+        shaped = f" AND ({_FINISHED_AT}) ~ {_CANONICAL_STAMP}"
+    else:
+        cutoff = "?"
+        parameters = (canonical_timestamp(now - older_than), limit)
+        shaped = ""
+    rows = await session.execute(
+        f"SELECT {_COLUMNS} FROM {table.sql} WHERE status IN ({statuses}) "
+        "AND payload_json IS NOT NULL AND payload_purged_at IS NULL"
+        f"{shaped} AND ({_FINISHED_AT}) <= {cutoff} ORDER BY ({_FINISHED_AT}), id LIMIT ?",
+        parameters,
+    )
+    readable: list[ApprovalRequest] = []
+    unreadable: list[str] = []
+    for row in rows:
+        try:
+            readable.append(_request_from_row(row))
+        except _StoredRowError:
+            unreadable.append(row[0])
+    return readable, len(rows), unreadable
+
+
+async def _open_row(
+    session: Session, table: TableName, request: ApprovalRequest
+) -> tuple[Any, ...] | None:
+    """The row of the open request (pending or approved) holding this requester, action and
+    payload hash, unparsed, or None if there is none."""
+    rows = await session.execute(
+        f"SELECT {_COLUMNS} FROM {table.sql} WHERE requested_by = ? AND action = ? "
+        f"AND payload_sha256 = ? AND status IN ({_OPEN_STATUS_LIST})",
+        (request.requested_by, request.action, request.payload_sha256),
+    )
+    return rows[0] if rows else None
+
+
+def _refused_repeat(
+    error: ApprovalError,
+    existing_id: str,
+    actor_id: str,
+    context: RunContext | None,
+    differs: tuple[str, ...],
+    reason: str,
+    earlier_events: list[AuditEvent],
+) -> _Outcome:
+    """A repeat submit refused: the open request has other terms, or cannot be read or shown.
+
+    Audited as approval.submit_conflict naming the open request, so a requester that finds
+    itself locked out has a record and an id to cancel. Events already made in this
+    transaction (a lapsed request it expired) are kept.
+    """
+    if not isinstance(error, ApprovalConflictError):
+        error = ApprovalConflictError(
+            f"Request {existing_id} is already open for this requester, action and payload, "
+            f"and cannot be used ({reason}). Cancel it, then submit again.",
+            existing=UUID(existing_id),
+            differs=differs,
+        )
+    event = _missing_event(
+        "approval.submit_conflict", actor_id, UUID(existing_id), context, reason=reason
+    )
+    event = event.model_copy(update={"payload": {**event.payload, "differs": ",".join(differs)}})
+    refusal = _denied(error, event)
+    refusal.events = [*earlier_events, *refusal.events]
+    return refusal
+
+
+async def _is_due(
+    session: Session, table: TableName, existing: ApprovalRequest, now: datetime
+) -> bool:
+    """Whether an open request's lifetime is over: by the database's clock on Postgres, as the
+    guard judges it, so an application clock that runs ahead cannot close a live request."""
+    if session.dialect is Dialect.SQLITE:
+        return existing.is_expired(now)
+    rows = await session.execute(
+        f"SELECT 1 FROM {table.sql} WHERE id = ? AND expires_at <= {_POSTGRES_STATEMENT_NOW_TEXT}",
+        (str(existing.id),),
+    )
+    return bool(rows)
+
+
+def _terms_that_differ(
+    existing: ApprovalRequest, asked: ApprovalRequest, *, wants_payload: bool
+) -> tuple[str, ...]:
+    """What a repeat submit asks for that the open request does not have.
+
+    A caller that asks for the payload to be stored (include_payload) must find that very
+    payload stored: otherwise the approver would be shown something else.
+    """
+    lifetime_differs = (
+        existing.expires_at - existing.created_at != asked.expires_at - asked.created_at
+    )
+    return tuple(
+        name
+        for name, differs in (
+            ("delegates", existing.delegates != asked.delegates),
+            ("lifetime", lifetime_differs),
+            ("payload", wants_payload and existing.payload != asked.payload),
+            ("required_role", existing.required_role != asked.required_role),
+            ("summary", existing.summary != asked.summary),
+        )
+        if differs
+    )
+
+
+def _requested_event(request: ApprovalRequest) -> AuditEvent:
+    event = _event(
+        "approval.requested",
+        request.requested_by,
+        request,
+        request.run_context,
+        required_role=request.required_role,
+        payload_sha256=request.payload_sha256,
+    )
+    if request.delegates:
+        event = event.model_copy(
+            update={"payload": {**event.payload, "delegates": sorted(request.delegates)}}
+        )
+    return event
+
+
+def _expired_event(
+    actor_id: str, expired: ApprovalRequest, previous: ApprovalStatus, context: RunContext | None
+) -> AuditEvent:
+    """approval.expired, saying so when an approval lapsed unused rather than a pending request."""
+    details = {"previous_status": previous.value} if previous is ApprovalStatus.APPROVED else {}
+    return _event("approval.expired", actor_id, expired, context, **details)
 
 
 def _denied(error: ApprovalError, event: AuditEvent) -> _Outcome:
@@ -1145,6 +1474,37 @@ async def _ensure_table(session: Session) -> None:
         await session.execute(
             _PENDING_INDEX_DDL.replace("CREATE INDEX", "CREATE INDEX IF NOT EXISTS", 1)
         )
+        await _ensure_open_index(session)
+        await session.execute(
+            f"CREATE INDEX IF NOT EXISTS {layout.PURGEABLE_INDEX} ON {APPROVALS_TABLE} "
+            f"(({layout.FINISHED_AT_EXPRESSION}), id) WHERE {layout.PURGEABLE_PREDICATE}"
+        )
+
+
+async def _ensure_open_index(session: Session) -> None:
+    """Build the unique open-request index on SQLite, or refuse while duplicates stand.
+
+    Duplicates are what 0.1.0a4 allowed. They are listed, nothing is changed, and
+    get, cancel and the other calls still work, so the extras can be cancelled.
+    """
+    if await session.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = ?",
+        (layout.OPEN_REQUEST_INDEX,),
+    ):
+        return
+    groups = await session.execute(
+        f"SELECT group_concat(id || ' (' || status || ')', ', ') FROM {APPROVALS_TABLE} "
+        f"WHERE status IN ({_OPEN_STATUS_LIST}) "
+        f"GROUP BY {', '.join(layout.OPEN_REQUEST_COLUMNS)} HAVING count(*) > 1 LIMIT 10"
+    )
+    if groups:
+        raise ConfigError(
+            "Open approval requests share a requester, action and payload, which a unique "
+            f"index now forbids: {'; '.join(row[0] for row in groups)}. Until only one of "
+            "each group is open, no request can be submitted: cancel the extra pending ones "
+            "with cancel(), consume the approved ones, or let them lapse and run expire_due()."
+        )
+    await session.execute(_OPEN_INDEX_DDL)
 
 
 async def _table_exists(session: Session, table: TableName) -> bool:
@@ -1199,6 +1559,12 @@ def _with_payload(
     row, the requester with plain SQL included, anything else is an integrity error:
     the approver is shown nothing the hash does not bind.
     """
+    if request.payload_purged_at is not None and payload_text is not None:
+        # Purged means gone: a payload beside the mark was put there after it.
+        raise _StoredRowError(
+            f"Request {request.id} is marked purged but still holds a payload.",
+            reason="payload_integrity",
+        )
     if payload_text is None:
         return request
     try:
@@ -1319,6 +1685,7 @@ def _row_values(request: ApprovalRequest) -> tuple[Any, ...]:
         json.dumps(sorted(request.delegates)),
         timestamp(request.closed_at),
         (canonical_json(request.payload).decode("utf-8") if request.payload is not None else None),
+        timestamp(request.payload_purged_at),
     )
 
 
@@ -1333,6 +1700,11 @@ def _parse_row(row: tuple[Any, ...]) -> tuple[ApprovalRequest, str | None]:
     # NULL columns are dropped so the model's defaults apply.
     names = [name.strip() for name in _COLUMNS.split(",")]
     fields = {name: value for name, value in zip(names, row, strict=True) if value is not None}
+    # Free text a requester or approver wrote before control characters were refused, or
+    # with plain SQL: shown with each replaced, so no UI or terminal is driven by it.
+    for column in ("summary", "reason"):
+        if isinstance(fields.get(column), str):
+            fields[column] = neutralized(fields[column])
     payload_text = fields.pop(PAYLOAD_COLUMN, None)
     try:
         if RUN_CONTEXT_COLUMN in fields:

@@ -9,6 +9,9 @@ The hierarchy is public API: consumers catch these classes, so a class is never
 renamed or moved to a different parent without a major version.
 """
 
+from typing import Any
+from uuid import UUID
+
 
 class AgentCoreError(Exception):
     """Base class for every error raised by aox_agent_core."""
@@ -143,6 +146,31 @@ class ApprovalIntegrityError(ApprovalError):
     """
 
 
+class ApprovalConflictError(ApprovalError):
+    """An open request for this requester, action and payload already exists, with other terms.
+
+    An exact repeat of a submit returns the existing request. A repeat that differs in
+    required_role, lifetime or delegates raises this instead, so a caller never holds an
+    approval granted on terms it did not ask for. `existing` is the open request's id and
+    `differs` names what differs.
+    """
+
+    def __init__(self, message: str, *, existing: UUID, differs: tuple[str, ...]) -> None:
+        super().__init__(message)
+        self.existing = existing
+        self.differs = differs
+
+    def __reduce__(self) -> tuple[Any, ...]:
+        return (_conflict_error, (self.args[0], self.existing, self.differs))
+
+
+def _conflict_error(
+    message: str, existing: UUID, differs: tuple[str, ...]
+) -> ApprovalConflictError:
+    """Rebuild an ApprovalConflictError, for pickling and copying."""
+    return ApprovalConflictError(message, existing=existing, differs=differs)
+
+
 class ApprovalPayloadRejectedError(ApprovalError):
     """A payload offered for storage with a request is too large, has a forbidden
     key, a float, or text that looks like a secret."""
@@ -154,6 +182,17 @@ class AuditError(AgentCoreError):
 
 class AuditIntegrityError(AuditError):
     """The audit chain failed verification or does not match the expected head."""
+
+
+class AuditLockTimeoutError(AuditError):
+    """The audit log's append lock was not free within the log's lock_timeout.
+
+    Another transaction holds it: a long host transaction that appended earlier, or a role
+    that took the lock on purpose. Nothing was written. `sqlstate` is Postgres'
+    lock_not_available, 55P03.
+    """
+
+    sqlstate = "55P03"
 
 
 class AuditWriteError(AuditError):

@@ -1,7 +1,7 @@
 """The approval queue: submit, resolve, and check before acting."""
 
 from collections.abc import Collection, Mapping, Sequence
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Protocol
 from uuid import UUID
 
@@ -42,6 +42,22 @@ class ApprovalQueue(Protocol):
         every read checks it against the hash, so an approver is shown what the
         hash binds (`ApprovalRequest.payload`). Only the requester may consume the
         approval, unless `delegates` names others.
+
+        Submitting is idempotent. At most one request is open (pending, or approved and
+        not yet consumed) for each (requested_by, action, payload hash), and an
+        implementation must hold that when calls race, as a unique index does:
+
+        - a repeat with the same summary, required_role, lifetime (ttl_seconds) and
+          delegates returns the existing request and records no event;
+        - a repeat that differs in any of those raises ApprovalConflictError, naming the
+          open request and what differs, and is audited (approval.submit_conflict);
+        - a caller that asks for the payload to be stored (`include_payload`) must find
+          that payload stored, or it is a conflict too;
+        - `context` is not compared: the first call's stays;
+        - an open request already past its lifetime does not count: it is closed as expired
+          and the new one is queued.
+
+        An approver may be neither the requester nor one of the delegates.
         """
         ...
 
@@ -113,8 +129,23 @@ class ApprovalQueue(Protocol):
     async def expire_due(
         self, *, principal: Principal, now: datetime | None = None, limit: int = 500
     ) -> int:
-        """Store EXPIRED on pending requests past their lifetime and return how many.
+        """Store EXPIRED on pending and approved-unused requests past their lifetime and
+        return how many.
 
-        Reads must treat such requests as expired whether or not this has run.
+        Reads must treat such requests as expired whether or not this has run. An
+        approval that lapsed unused is EXPIRED and keeps its decision.
+        """
+        ...
+
+    async def purge_payloads(
+        self, *, principal: Principal, older_than: timedelta, limit: int = 500
+    ) -> int:
+        """Drop the stored payload of finished requests older than `older_than`; return how many.
+
+        Only requests that are consumed, rejected, cancelled or expired are touched, and
+        payload_sha256 is never changed. A purged request reads with payload None and
+        payload_purged_at set, so "purged" differs from "never stored". One audit event
+        per purged request. An implementation applies this retention rule itself; an
+        approver-side operation, so the decision side holds the right.
         """
         ...
