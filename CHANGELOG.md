@@ -8,6 +8,35 @@ Pre-releases are spelled the PEP 440 way, so tags look like `v0.1.0a1`.
 
 ## [Unreleased]
 
+## [0.1.0a3] - 2026-10-02
+
+Approvals enforced by Postgres itself, not only by the library.
+
+### Security
+
+- In 0.1.0a2, Postgres approvals relied on library checks only. `install_postgres_schema` gave one application role SELECT, INSERT and UPDATE on the approvals table, so that role could set a request approved with plain SQL, bypassing the rule that only a human holding the required role may resolve it. 0.1.0a3 adds database enforcement: separate requester and approver roles, column grants, and a guard trigger that checks every insert and update against the allowed transitions using the database's own role membership and clock. A host on 0.1.0a2 should upgrade (see docs/upgrade-0.1.0a3.md) and check its approved requests against the audit log with the query given there.
+- `consume()` accepted any principal. It now requires the requester, or a delegate the request names.
+- Both roles may append audit records and `actor_id` is supplied by the library, so a record could claim the wrong actor. Audit records now carry `db_role`, set by the database to the inserting role.
+
+### Changed (breaking)
+
+- `install_postgres_schema(owner_url, *, requester_role, approver_role, schema="public")` replaces `app_role=`, returns an `InstallReport`, and needs Postgres 14 or later. It is idempotent, schema-qualified and upgrades a 0.1.0a2 schema in place.
+- On Postgres a queue connects as the requester role (the agent side: submit, consume, cancel) or the approver role (the decision side: approve, reject); a call from the wrong side raises `ConfigError`. A queue refuses to start if the schema predates 0.1.0a3, lost its guard, or the roles are set up wrongly.
+- `consume()` raises `NotTheRequesterError` for anyone but the requester or a named delegate.
+- The `ApprovalQueue` protocol gains `cancel()` and `expire_due()`, and `submit()` a `delegates` keyword. A host's own queue must add them.
+- `ApprovalRequest` gains `closed_at`, set exactly when the status is `EXPIRED` or `CANCELLED`, and `delegates`. Both statuses are now stored.
+- Audit schema 3: `AuditRecord.db_role`, outside the hash. Version 2 records in an upgraded chain keep their version and still verify. `UnsealedAuditRecord.schema_version` accepts 2 or 3.
+- Postgres tables from 0.1.0a2 are refused until the 0.1.0a3 installer upgrades them; a SQLite file from 0.1.0a2 gains the new columns in place.
+
+### Added
+
+- `cancel(request_id, *, principal, reason=None, context=None)`: the requester withdraws a pending request; audited, refusals included.
+- `expire_due(*, principal, now=None, limit=500)`: stores EXPIRED on pending requests past their lifetime, audited per request; either side may run it. Reads still report such requests as expired without it.
+- `submit(..., delegates=...)`: up to 16 principals allowed to consume in the requester's place, fixed and shown to the approver.
+- `schema=` on `SQLAuditLog` and `SQLApprovalQueue`, and `--schema` on `aox-agent-core audit verify`.
+- `ApprovalSide`, `SQLApprovalQueue.side()`, `NotTheRequesterError`, `DenialReason.NOT_REQUESTER`, `storage.InstallReport` and `storage.Grant`.
+- docs/upgrade-0.1.0a3.md: the role layout, the transition table, setup, and the upgrade from 0.1.0a2.
+
 ## [0.1.0a2] - 2026-10-02
 
 What a consuming project needs to key replay by prompt, send images and PDFs, and tie calls, approvals and audit records to its own runs.
@@ -58,6 +87,7 @@ The first pre-release. Projects can pin it; the API may still change before 0.1.
 - Extras `bedrock`, `postgres`, `otel` and `testing`; examples for a routed call and for the control layer.
 - CI on every pull request (lint, types, tests on Python 3.11 to 3.14 with Postgres, package check, gitleaks) and a tag-driven release workflow.
 
-[Unreleased]: https://github.com/AOX-LLC/agent-core/compare/v0.1.0a2...HEAD
+[Unreleased]: https://github.com/AOX-LLC/agent-core/compare/v0.1.0a3...HEAD
+[0.1.0a3]: https://github.com/AOX-LLC/agent-core/compare/v0.1.0a2...v0.1.0a3
 [0.1.0a2]: https://github.com/AOX-LLC/agent-core/compare/v0.1.0a1...v0.1.0a2
 [0.1.0a1]: https://github.com/AOX-LLC/agent-core/releases/tag/v0.1.0a1
