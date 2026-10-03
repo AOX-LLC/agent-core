@@ -1,6 +1,6 @@
 """The append-only audit log interface."""
 
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Sequence
 from typing import Protocol
 
 from aox_agent_core.audit.types import AuditEvent, AuditHead, AuditRecord
@@ -19,7 +19,18 @@ class AuditLog(Protocol):
 
         The event is re-validated first, since its payload dict may have been
         changed after construction. Raises AuditPayloadRejectedError if a payload
-        string looks like a secret.
+        string looks like a secret, and AuditTimeRejectedError if a supplied
+        `occurred_at` is too far from the database's clock.
+        """
+        ...
+
+    async def append_many(self, events: Sequence[AuditEvent]) -> list[AuditRecord]:
+        """Append every event in one transaction, as consecutive records, or none of them.
+
+        One lock, one head read, one commit: the chain stays gapless and the cost
+        of a commit is paid once. Each event is validated as append() does it
+        first, and a refusal names the index of the offending event. Returns the
+        records in order. An empty sequence writes nothing.
         """
         ...
 

@@ -15,7 +15,7 @@ chain on its own; compare against a head kept elsewhere (verify's expected_head)
 
 import asyncio
 import json
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Sequence
 from datetime import UTC, datetime
 from functools import partial
 from typing import Any, Final
@@ -29,12 +29,19 @@ from aox_agent_core._validation import STORED_RECORD
 from aox_agent_core.audit.chain import canonical_timestamp, compute_record_hash
 from aox_agent_core.audit.types import (
     GENESIS_HASH,
+    OCCURRED_AT_MAX_FUTURE,
+    OCCURRED_AT_MAX_PAST,
     AuditEvent,
     AuditHead,
     AuditRecord,
     UnsealedAuditRecord,
 )
-from aox_agent_core.errors import AuditIntegrityError, AuditPayloadRejectedError, ConfigError
+from aox_agent_core.errors import (
+    AuditIntegrityError,
+    AuditPayloadRejectedError,
+    AuditTimeRejectedError,
+    ConfigError,
+)
 from aox_agent_core.replay.scrub import PatternScrubber, Scrubber
 from aox_agent_core.storage import (
     Database,
@@ -56,17 +63,19 @@ APPEND_TRIGGER: Final = layout.AUDIT_APPEND_TRIGGER
 SQLITE_TRIGGERS: Final = frozenset({UPDATE_TRIGGER, DELETE_TRIGGER, APPEND_TRIGGER})
 POSTGRES_TRIGGERS: Final = layout.AUDIT_TRIGGERS
 
-# pg_advisory_xact_lock key that serializes appends: ASCII "agentcor" as an int64.
-APPEND_LOCK_KEY: Final = 0x6167656E74636F72
+# pg_advisory_xact_lock key that serializes appends (see _postgres_schema).
+APPEND_LOCK_KEY: Final = layout.AUDIT_APPEND_LOCK_KEY
 
 READ_BATCH_SIZE = 500
+# Most events one append_many takes: it holds the append lock for the whole batch.
+MAX_APPEND_BATCH = 1000
 
 COLUMNS = (
     "seq, schema_version, event_id, occurred_at, action, actor_id, subject_id, payload, "
-    "run_context, prev_hash, record_hash, db_role"
+    "run_context, prev_hash, record_hash, db_role, recorded_at"
 )
-# Columns added in 0.1.0a3, with their SQLite types.
-ADDED_IN_A3: Final = {"db_role": "TEXT"}
+# Columns added in 0.1.0a3 and 0.1.0a4, with their SQLite types.
+ADDED_COLUMNS: Final = {"db_role": "TEXT", "recorded_at": "TEXT"}
 
 _TABLE_DDL = f"""
 CREATE TABLE {AUDIT_TABLE} (
@@ -81,8 +90,18 @@ CREATE TABLE {AUDIT_TABLE} (
     run_context TEXT,
     prev_hash TEXT NOT NULL,
     record_hash TEXT NOT NULL,
-    db_role TEXT
+    db_role TEXT,
+    recorded_at TEXT
 )"""
+
+# Inserts land only right after the last record: the next seq, linked to the last
+# record's hash, with an event_id not seen before. Besides keeping the chain
+# gapless and linked, this stops INSERT OR REPLACE, which deletes the row it
+# conflicts with (on seq or event_id) without firing the delete trigger.
+_SQLITE_APPEND_CONDITION = f"""WHEN NEW.seq <> (SELECT COALESCE(MAX(seq), 0) FROM {AUDIT_TABLE}) + 1
+        OR NEW.prev_hash <> COALESCE(
+            (SELECT record_hash FROM {AUDIT_TABLE} ORDER BY seq DESC LIMIT 1), '{GENESIS_HASH}')
+        OR EXISTS (SELECT 1 FROM {AUDIT_TABLE} WHERE event_id = NEW.event_id)"""
 
 SQLITE_SCHEMA: Final = (
     _TABLE_DDL,
@@ -90,13 +109,8 @@ SQLITE_SCHEMA: Final = (
     BEGIN SELECT RAISE(ABORT, '{AUDIT_TABLE} is append-only'); END""",
     f"""CREATE TRIGGER {DELETE_TRIGGER} BEFORE DELETE ON {AUDIT_TABLE}
     BEGIN SELECT RAISE(ABORT, '{AUDIT_TABLE} is append-only'); END""",
-    # Inserts land only right after the last record, with an event_id not seen
-    # before. Besides keeping the sequence gapless, this stops INSERT OR REPLACE,
-    # which deletes the row it conflicts with (on seq or event_id) without firing
-    # the delete trigger.
     f"""CREATE TRIGGER {APPEND_TRIGGER} BEFORE INSERT ON {AUDIT_TABLE}
-    WHEN NEW.seq <> (SELECT COALESCE(MAX(seq), 0) FROM {AUDIT_TABLE}) + 1
-        OR EXISTS (SELECT 1 FROM {AUDIT_TABLE} WHERE event_id = NEW.event_id)
+    {_SQLITE_APPEND_CONDITION}
     BEGIN SELECT RAISE(ABORT, '{AUDIT_TABLE} is append-only'); END""",
 )
 
@@ -124,10 +138,44 @@ class SQLAuditLog:
         self._table = TableName.on(database, AUDIT_TABLE, schema)
         self._protections_checked = False
 
-    async def append(self, event: AuditEvent) -> AuditRecord:
-        """Validate and scrub the event, then add it to the chain in its own transaction."""
-        checked = self.checked_event(event)
-        return await self.database.run(lambda session: self.append_in(session, checked), write=True)
+    async def append(self, event: AuditEvent, *, connection: Any = None) -> AuditRecord:
+        """Validate and scrub the event, then add it to the chain in its own transaction.
+
+        With `connection`, a psycopg AsyncConnection already in a transaction, the
+        event is written inside that transaction instead, and committed or rolled
+        back with it; see PostgresDatabase.run_on for what that requires.
+        """
+        return (await self.append_many([event], connection=connection))[0]
+
+    async def append_many(
+        self, events: Sequence[AuditEvent], *, connection: Any = None
+    ) -> list[AuditRecord]:
+        """Append every event in one transaction, under one lock, as consecutive records.
+
+        All or nothing: every event is validated and scanned before anything is
+        written, an error names the index of the event it refused, and a failure
+        at any point stores none of them. At most MAX_APPEND_BATCH events. Returns
+        the records in order; with `connection` they are provisional until the
+        host's transaction commits.
+        """
+        if not events:
+            return []
+        if len(events) > MAX_APPEND_BATCH:
+            raise ValueError(f"append_many takes at most {MAX_APPEND_BATCH} events")
+        checked = [self._checked_at(index, event) for index, event in enumerate(events)]
+
+        async def write(session: Session) -> list[AuditRecord]:
+            return await self.append_many_in(session, checked)
+
+        if connection is None:
+            return await self.database.run(write, write=True)
+        return await self.database.run_on(connection, write)
+
+    def _checked_at(self, index: int, event: AuditEvent) -> AuditEvent:
+        try:
+            return self.checked_event(event)
+        except AuditPayloadRejectedError as error:
+            raise AuditPayloadRejectedError(f"Event {index}: {error}") from error
 
     def checked_event(self, event: AuditEvent) -> AuditEvent:
         """Re-validate an event and scan its payload strings for secrets.
@@ -149,36 +197,80 @@ class SQLAuditLog:
             raise AuditPayloadRejectedError(f"The audit event contains {located}.")
         return revalidated
 
-    def append_in(self, session: Session, event: AuditEvent) -> AuditRecord:
+    async def append_in(self, session: Session, event: AuditEvent) -> AuditRecord:
         """Append within a write transaction on this log's database.
 
         For callers that must write their own change and its audit event together.
         The event must already have passed checked_event().
         """
-        self._ensure_protected(session)
+        return (await self.append_many_in(session, [event]))[0]
+
+    async def append_many_in(
+        self, session: Session, events: Sequence[AuditEvent]
+    ) -> list[AuditRecord]:
+        """append_many within a write transaction on this log's database.
+
+        The events must already have passed checked_event(). The caller holds the
+        append lock from here until its transaction ends.
+        """
+        await self._ensure_protected(session)
         if session.dialect is Dialect.POSTGRES:
-            session.execute("SELECT pg_advisory_xact_lock(?)", (APPEND_LOCK_KEY,))
-        head = _head_in(session, self._table)
-        unsealed = UnsealedAuditRecord(
-            seq=head.seq + 1,
-            event_id=uuid4(),
-            occurred_at=datetime.now(UTC),
-            action=event.action,
-            actor_id=event.actor_id,
-            subject_id=event.subject_id,
-            payload=event.payload,
-            run_context=event.context,
-            prev_hash=head.record_hash,
+            await session.execute("SELECT pg_advisory_xact_lock(?)", (APPEND_LOCK_KEY,))
+        head, database_now = await _head_and_now(session, self._table)
+        for event in events:
+            _check_occurred_at(event.occurred_at, database_now)
+
+        records: list[AuditRecord] = []
+        previous = head
+        for event in events:
+            unsealed = UnsealedAuditRecord(
+                seq=previous.seq + 1,
+                event_id=uuid4(),
+                occurred_at=event.occurred_at if event.occurred_at is not None else database_now,
+                action=event.action,
+                actor_id=event.actor_id,
+                subject_id=event.subject_id,
+                payload=event.payload,
+                run_context=event.context,
+                prev_hash=previous.record_hash,
+            )
+            record = AuditRecord(**unsealed.model_dump(), record_hash=compute_record_hash(unsealed))
+            records.append(record)
+            previous = AuditHead(seq=record.seq, record_hash=record.record_hash)
+        return await self._insert(session, records, database_now)
+
+    async def _insert(
+        self, session: Session, records: list[AuditRecord], database_now: datetime
+    ) -> list[AuditRecord]:
+        row_marks = "(" + ", ".join("?" for _ in COLUMNS.split(",")) + ")"
+        if session.dialect is Dialect.SQLITE:
+            # SQLite has no roles and no clock apart from the writer's: the library
+            # writes recorded_at, and db_role stays empty.
+            stored = [record.model_copy(update={"recorded_at": database_now}) for record in records]
+            for record in stored:
+                await session.execute(
+                    f"INSERT INTO {self._table.sql} ({COLUMNS}) VALUES {row_marks}",
+                    _row_values(record),
+                )
+            return stored
+        # One statement for the whole batch. The insert trigger sets db_role and
+        # recorded_at, whatever is sent, and checks the chain link of every row.
+        rows = await session.execute(
+            f"INSERT INTO {self._table.sql} ({COLUMNS}) VALUES "
+            + ", ".join(row_marks for _ in records)
+            + " RETURNING seq, db_role, recorded_at",
+            [value for record in records for value in _row_values(record)],
         )
-        record = AuditRecord(**unsealed.model_dump(), record_hash=compute_record_hash(unsealed))
-        # On Postgres the insert trigger sets db_role to the inserting role, whatever
-        # is sent; SQLite has no roles and leaves it empty.
-        rows = session.execute(
-            f"INSERT INTO {self._table.sql} ({COLUMNS}) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
-            + (" RETURNING db_role" if session.dialect is Dialect.POSTGRES else ""),
-            _row_values(record),
-        )
-        return record.model_copy(update={"db_role": rows[0][0]}) if rows else record
+        written = {seq: (role, recorded) for seq, role, recorded in rows}
+        return [
+            record.model_copy(
+                update={
+                    "db_role": written[record.seq][0],
+                    "recorded_at": datetime.fromisoformat(written[record.seq][1]),
+                }
+            )
+            for record in records
+        ]
 
     async def iter_records(self, *, after_seq: int = 0) -> AsyncIterator[AuditRecord]:
         """Yield records with seq greater than after_seq, in order, read in batches."""
@@ -207,25 +299,22 @@ class SQLAuditLog:
         expected_head, shows the log has not been rewritten or cut short since that
         head was taken. Raises AuditIntegrityError on any mismatch.
         """
-        return await asyncio.to_thread(self._verify_sync, expected_head)
+        return await self._walk(expected_head)
 
-    def _verify_sync(self, expected_head: AuditHead | None) -> AuditHead:
-        """The walk itself, on a worker thread and in batches, so a long log neither
-        blocks the event loop nor has to fit in memory."""
+    async def _walk(self, expected_head: AuditHead | None) -> AuditHead:
+        """The walk itself, in batches, so a long log does not have to fit in memory."""
         head = AuditHead(seq=0, record_hash=GENESIS_HASH)
         anchored_hash = (
             GENESIS_HASH if expected_head is not None and expected_head.seq == 0 else None
         )
         while True:
-            rows = self.database.run_sync(
+            rows = await self.database.run(
                 partial(_rows_after, table=self._table, after_seq=head.seq, limit=READ_BATCH_SIZE)
             )
-            for row in rows:
-                record = record_from_row(row)
-                _check_link(record, head)
-                head = AuditHead(seq=record.seq, record_hash=record.record_hash)
-                if expected_head is not None and record.seq == expected_head.seq:
-                    anchored_hash = record.record_hash
+            # Parsing and hashing a batch is CPU work, so it runs off the event loop.
+            head, anchored_hash = await asyncio.to_thread(
+                _check_batch, rows, head, expected_head, anchored_hash
+            )
             if len(rows) < READ_BATCH_SIZE:
                 break
 
@@ -233,17 +322,36 @@ class SQLAuditLog:
             _check_anchor(head, expected_head, anchored_hash)
         return head
 
-    def _ensure_protected(self, session: Session) -> None:
+    async def _ensure_protected(self, session: Session) -> None:
         # Checked once per log object; a role or trigger change later is not noticed.
         if self._protections_checked:
             return
         if session.dialect is Dialect.SQLITE:
-            _ensure_sqlite_schema(session)
+            await _ensure_sqlite_schema(session)
         else:
-            _check_postgres_role(session, self._table)
-            _require_triggers(session, _postgres_triggers(session, self._table), POSTGRES_TRIGGERS)
-        bring_table_up_to_date(session, AUDIT_TABLE, ADDED_IN_A3, schema=self._table.schema)
+            await layout.require_postgres_version(session)
+            await _check_postgres_role(session, self._table)
+            _require_triggers(
+                session, await _postgres_triggers(session, self._table), POSTGRES_TRIGGERS
+            )
+        await bring_table_up_to_date(session, AUDIT_TABLE, ADDED_COLUMNS, schema=self._table.schema)
         self._protections_checked = True
+
+
+def _check_batch(
+    rows: list[tuple[Any, ...]],
+    head: AuditHead,
+    expected_head: AuditHead | None,
+    anchored_hash: str | None,
+) -> tuple[AuditHead, str | None]:
+    """Check each row of a batch follows `head`; return the new head and the anchored hash."""
+    for row in rows:
+        record = record_from_row(row)
+        _check_link(record, head)
+        head = AuditHead(seq=record.seq, record_hash=record.record_hash)
+        if expected_head is not None and record.seq == expected_head.seq:
+            anchored_hash = record.record_hash
+    return head, anchored_hash
 
 
 def _check_link(record: AuditRecord, previous: AuditHead) -> None:
@@ -254,13 +362,24 @@ def _check_link(record: AuditRecord, previous: AuditHead) -> None:
         )
     if record.prev_hash != previous.record_hash:
         raise AuditIntegrityError(f"Record {record.seq} does not link to record {previous.seq}.")
-    if compute_record_hash(record) != record.record_hash:
-        raise AuditIntegrityError(f"Record {record.seq} was altered after it was written.")
+    try:
+        hash_holds = compute_record_hash(record) == record.record_hash
+    except (ValueError, RecursionError) as error:
+        # Content the hash cannot be taken of, such as a number JSON cannot spell.
+        raise AuditIntegrityError(f"Record {record.seq} cannot be hashed.") from error
+    if not hash_holds:
+        # A row the database accepted with a wrong hash shows who inserted it.
+        by = (
+            f" (its db_role column reads {record.db_role}; the hash does not cover it)"
+            if record.db_role
+            else ""
+        )
+        raise AuditIntegrityError(f"Record {record.seq} was altered after it was written{by}.")
 
 
-def audit_table_exists(database: Database, *, schema: str | None = None) -> bool:
+async def audit_table_exists(database: Database, *, schema: str | None = None) -> bool:
     """True when the database holds an audit table, so a check of it means something."""
-    return database.run_sync(
+    return await database.run(
         partial(_table_is_readable, table=TableName.on(database, AUDIT_TABLE, schema))
     )
 
@@ -278,20 +397,31 @@ def _check_anchor(head: AuditHead, expected: AuditHead, anchored_hash: str | Non
         )
 
 
-def _ensure_sqlite_schema(session: Session) -> None:
+async def _ensure_sqlite_schema(session: Session) -> None:
     """Create the table and triggers in a new database; refuse a table that lost them."""
-    if not _sqlite_table_exists(session):
+    if not await _sqlite_table_exists(session):
         for statement in SQLITE_SCHEMA:
-            session.execute(statement)
+            await session.execute(statement)
         return
     triggers = {
         row[0]
-        for row in session.execute(
+        for row in await session.execute(
             "SELECT name FROM sqlite_master WHERE type = 'trigger' AND tbl_name = ?",
             (AUDIT_TABLE,),
         )
     }
     _require_triggers(session, triggers, SQLITE_TRIGGERS)
+    await _upgrade_sqlite_append_trigger(session)
+
+
+async def _upgrade_sqlite_append_trigger(session: Session) -> None:
+    """Replace a 0.1.0a3 append trigger, which checked only seq, with the linking one."""
+    rows = await session.execute(
+        "SELECT sql FROM sqlite_master WHERE type = 'trigger' AND name = ?", (APPEND_TRIGGER,)
+    )
+    if rows and "prev_hash" not in rows[0][0]:
+        await session.execute(f"DROP TRIGGER {APPEND_TRIGGER}")
+        await session.execute(SQLITE_SCHEMA[3])
 
 
 def _require_triggers(session: Session, present: set[str], required: frozenset[str]) -> None:
@@ -330,8 +460,8 @@ LEFT JOIN pg_class c ON c.oid = target.oid
 """
 
 
-def _check_postgres_role(session: Session, table: TableName) -> None:
-    table_exists, can_change = session.execute(_ROLE_CHECK_SQL, (table.sql,))[0]
+async def _check_postgres_role(session: Session, table: TableName) -> None:
+    table_exists, can_change = (await session.execute(_ROLE_CHECK_SQL, (table.sql,)))[0]
     if not table_exists:
         raise ConfigError(
             f"Table {table} does not exist; install it with "
@@ -346,10 +476,10 @@ def _check_postgres_role(session: Session, table: TableName) -> None:
         )
 
 
-def _postgres_triggers(session: Session, table: TableName) -> set[str]:
+async def _postgres_triggers(session: Session, table: TableName) -> set[str]:
     return {
         row[0]
-        for row in session.execute(
+        for row in await session.execute(
             "SELECT tgname FROM pg_trigger "
             "WHERE tgrelid = to_regclass(?) AND NOT tgisinternal AND tgenabled <> 'D'",
             (table.sql,),
@@ -357,40 +487,86 @@ def _postgres_triggers(session: Session, table: TableName) -> set[str]:
     }
 
 
-def _sqlite_table_exists(session: Session) -> bool:
+async def _sqlite_table_exists(session: Session) -> bool:
     return bool(
-        session.execute(
+        await session.execute(
             "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?", (AUDIT_TABLE,)
         )
     )
 
 
-def _table_is_readable(session: Session, table: TableName) -> bool:
+async def _table_is_readable(session: Session, table: TableName) -> bool:
     if session.dialect is Dialect.SQLITE:
-        return _sqlite_table_exists(session)
-    return bool(session.execute("SELECT to_regclass(?) IS NOT NULL", (table.sql,))[0][0])
+        return await _sqlite_table_exists(session)
+    return bool((await session.execute("SELECT to_regclass(?) IS NOT NULL", (table.sql,)))[0][0])
 
 
-def _head_in(session: Session, table: TableName) -> AuditHead:
+async def _head_in(session: Session, table: TableName) -> AuditHead:
     # A missing table means nothing was ever written, which is an empty log, not an error.
-    if not _table_is_readable(session, table):
+    if not await _table_is_readable(session, table):
         return AuditHead(seq=0, record_hash=GENESIS_HASH)
-    rows = session.execute(f"SELECT seq, record_hash FROM {table.sql} ORDER BY seq DESC LIMIT 1")
+    rows = await session.execute(
+        f"SELECT seq, record_hash FROM {table.sql} ORDER BY seq DESC LIMIT 1"
+    )
     if not rows:
         return AuditHead(seq=0, record_hash=GENESIS_HASH)
     seq, record_hash = rows[0]
     return AuditHead(seq=seq, record_hash=record_hash)
 
 
-def _rows_after(
+_POSTGRES_NOW_TEXT = (
+    "to_char(clock_timestamp() AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"')"
+)
+
+
+async def _head_and_now(session: Session, table: TableName) -> tuple[AuditHead, datetime]:
+    """The chain head and the database's clock, in one round trip on Postgres.
+
+    Called after the append lock is held, as a statement of its own: each
+    statement in READ COMMITTED takes a fresh snapshot, which is what makes the
+    head it reads the one the lock protects. On SQLite the clock is the writer's.
+    """
+    if session.dialect is Dialect.SQLITE:
+        return await _head_in(session, table), datetime.now(UTC)
+    rows = await session.execute(
+        f"SELECT h.seq, h.record_hash, {_POSTGRES_NOW_TEXT} FROM (SELECT 1) x "
+        f"LEFT JOIN LATERAL (SELECT seq, record_hash FROM {table.sql} "
+        "ORDER BY seq DESC LIMIT 1) h ON TRUE"
+    )
+    seq, record_hash, now_text = rows[0]
+    head = (
+        AuditHead(seq=0, record_hash=GENESIS_HASH)
+        if seq is None
+        else AuditHead(seq=seq, record_hash=record_hash)
+    )
+    return head, datetime.fromisoformat(now_text)
+
+
+def _check_occurred_at(occurred_at: datetime | None, database_now: datetime) -> None:
+    """Refuse a caller-supplied time too far from the database's clock."""
+    if occurred_at is None:
+        return
+    if occurred_at > database_now + OCCURRED_AT_MAX_FUTURE:
+        raise AuditTimeRejectedError(
+            f"occurred_at {canonical_timestamp(occurred_at)} is more than "
+            f"{OCCURRED_AT_MAX_FUTURE} ahead of the database's clock."
+        )
+    if occurred_at < database_now - OCCURRED_AT_MAX_PAST:
+        raise AuditTimeRejectedError(
+            f"occurred_at {canonical_timestamp(occurred_at)} is more than "
+            f"{OCCURRED_AT_MAX_PAST} behind the database's clock."
+        )
+
+
+async def _rows_after(
     session: Session, table: TableName, after_seq: int, limit: int | None
 ) -> list[tuple[Any, ...]]:
     # limit is formatted in, not bound, and int() keeps that safe.
-    if not _table_is_readable(session, table):
+    if not await _table_is_readable(session, table):
         return []
-    bring_table_up_to_date(session, AUDIT_TABLE, ADDED_IN_A3, schema=table.schema)
+    await bring_table_up_to_date(session, AUDIT_TABLE, ADDED_COLUMNS, schema=table.schema)
     limit_clause = f" LIMIT {int(limit)}" if limit is not None else ""
-    return session.execute(
+    return await session.execute(
         f"SELECT {COLUMNS} FROM {table.sql} WHERE seq > ? ORDER BY seq{limit_clause}",
         (after_seq,),
     )
@@ -414,13 +590,14 @@ def _row_values(record: AuditRecord) -> tuple[Any, ...]:
         record.prev_hash,
         record.record_hash,
         None,
+        canonical_timestamp(record.recorded_at) if record.recorded_at is not None else None,
     )
 
 
 def record_from_row(row: tuple[Any, ...]) -> AuditRecord:
     """Rebuild a record from a COLUMNS-ordered row; AuditIntegrityError if it is malformed."""
     seq, schema_version, event_id, occurred_at, action, actor_id, subject_id = row[:7]
-    payload, run_context, prev_hash, record_hash, db_role = row[7:]
+    payload, run_context, prev_hash, record_hash, db_role, recorded_at = row[7:]
     try:
         return AuditRecord.model_validate(
             {
@@ -436,8 +613,11 @@ def record_from_row(row: tuple[Any, ...]) -> AuditRecord:
                 "prev_hash": prev_hash,
                 "record_hash": record_hash,
                 "db_role": db_role,
+                "recorded_at": (
+                    datetime.fromisoformat(recorded_at) if recorded_at is not None else None
+                ),
             },
             context={STORED_RECORD: True},
         )
-    except (ValueError, TypeError, ValidationError) as error:
+    except (ValueError, TypeError, ValidationError, RecursionError) as error:
         raise AuditIntegrityError(f"Record {seq} is malformed and cannot be checked.") from error

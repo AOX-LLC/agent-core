@@ -6,7 +6,7 @@ from enum import StrEnum
 from typing import Annotated, Self
 from uuid import UUID
 
-from pydantic import AwareDatetime, StringConstraints, model_validator
+from pydantic import AwareDatetime, JsonValue, StringConstraints, model_validator
 
 from aox_agent_core._model import ActionName, FrozenModel, PrincipalId, Sha256Hex
 from aox_agent_core.context import RunContext
@@ -100,6 +100,14 @@ class ApprovalRequest(FrozenModel):
     Only requested_by may consume it, unless it names delegates: principals the
     requester allowed to consume in its place, fixed when it is submitted and
     shown to whoever decides it.
+
+    `summary` is free text the requester wrote. It is NOT bound by payload_sha256:
+    never decide from it alone. `payload` is the exact payload the hash covers,
+    present only when the requester asked for it to be stored (include_payload);
+    the queue has checked it against payload_sha256 before returning the request,
+    so what an approver sees there is what the hash binds. It is None when the
+    requester did not store it, and on what consume(), cancel() and expire_due()
+    work on: they check nothing about a stored payload, so they return none.
     """
 
     id: UUID
@@ -119,6 +127,7 @@ class ApprovalRequest(FrozenModel):
     reason: ShortText | None = None
     run_context: RunContext | None = None
     delegates: frozenset[PrincipalId] = frozenset()
+    payload: dict[str, JsonValue] | None = None
 
     @model_validator(mode="after")
     def _few_delegates(self) -> Self:

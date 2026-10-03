@@ -76,6 +76,10 @@ class InMemoryAuditLog:
         self.records.append(record)
         return record
 
+    async def append_many(self, events: Sequence[AuditEvent]) -> list[AuditRecord]:
+        # A host with one in-process list has no transaction to share, so a loop is atomic.
+        return [await self.append(event) for event in events]
+
     async def iter_records(self, *, after_seq: int = 0) -> AsyncIterator[AuditRecord]:
         for record in self.records[after_seq:]:
             yield record
@@ -116,6 +120,7 @@ class InMemoryApprovalQueue:
         ttl_seconds: int,
         delegates: Collection[str] = (),
         context: RunContext | None = None,
+        include_payload: bool = False,
     ) -> ApprovalRequest:
         now = datetime.now(UTC)
         request = ApprovalRequest(
@@ -129,6 +134,7 @@ class InMemoryApprovalQueue:
             expires_at=now + timedelta(seconds=ttl_seconds),
             run_context=context,
             delegates=frozenset(delegates),
+            payload=dict(payload) if include_payload else None,
         )
         self._requests[request.id] = request
         await self._audit("approval.requested", requested_by, request, context)

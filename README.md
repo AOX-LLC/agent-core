@@ -4,14 +4,14 @@ agent-core is a small Python library for routed Claude model calls, structured o
 
 ## Status
 
-`v0.1.0a3`, the third pre-release. What works:
+`v0.1.0a4`, the fourth pre-release. What works:
 
 - routed Claude calls with cost-based tiers, structured outputs, cost and OpenTelemetry tracing;
 - versioned prompts (`PromptRef`) and PNG, JPEG and PDF attachments;
 - record and replay keyed by content, so projects run and test with no API key; recordings in this repository were made against the live API;
 - a `RunContext` that ties calls, audit records and approvals to the host's run;
-- an append-only, hash-chained audit log on SQLite or Postgres;
-- a human-approval queue with a role policy, single-use approvals, and, on Postgres, approval transitions enforced by the database;
+- an append-only, hash-chained audit log on SQLite or Postgres, async, with batch appends and, on Postgres, writes inside a host's own transaction;
+- a human-approval queue with a role policy, single-use approvals, an optional stored payload bound to the request's hash, and, on Postgres, approval transitions enforced by the database;
 - an eval runner with JSON and Markdown scorecards.
 
 Not yet: the Bedrock provider is an interface only. The API may still change before `v0.1.0`.
@@ -56,28 +56,28 @@ An attachment's type is read from its first bytes, never from its name, and is c
 
 ## Install
 
-The distribution is named `aox-agent-core`. Replace `vX.Y.Z` with a release tag. The examples use `v0.1.0a3`.
+The distribution is named `aox-agent-core`. Replace `vX.Y.Z` with a release tag. The examples use `v0.1.0a4`.
 
 ```sh
-pip install "aox-agent-core @ git+https://github.com/AOX-LLC/agent-core@v0.1.0a3"
+pip install "aox-agent-core @ git+https://github.com/AOX-LLC/agent-core@v0.1.0a4"
 ```
 
 With extras:
 
 ```sh
-pip install "aox-agent-core[postgres,otel] @ git+https://github.com/AOX-LLC/agent-core@v0.1.0a3"
+pip install "aox-agent-core[postgres,otel] @ git+https://github.com/AOX-LLC/agent-core@v0.1.0a4"
 ```
 
 With uv:
 
 ```sh
-uv add "aox-agent-core @ git+https://github.com/AOX-LLC/agent-core" --tag v0.1.0a3
+uv add "aox-agent-core @ git+https://github.com/AOX-LLC/agent-core" --tag v0.1.0a4
 ```
 
 | Extra      | Adds                                         |
 | ---------- | -------------------------------------------- |
 | `bedrock`  | Amazon Bedrock support for the Anthropic SDK |
-| `postgres` | Postgres backend for the audit log           |
+| `postgres` | Postgres backend (psycopg 3 and its pool)    |
 | `otel`     | OpenTelemetry SDK and OTLP HTTP exporter     |
 | `testing`  | pytest, for the test helpers                 |
 
@@ -140,20 +140,51 @@ def test_triage(use_cassette):
 ## Audit log, approvals and evals
 
 ```python
-from aox_agent_core.storage import open_database
-from aox_agent_core.audit import SQLAuditLog
 from aox_agent_core.approvals import RoleApproverPolicy, SQLApprovalQueue
+from aox_agent_core.audit import AuditEvent, SQLAuditLog
+from aox_agent_core.storage import open_database
 
-database = open_database("sqlite:///control.sqlite3")
-audit_log = SQLAuditLog(database)
-# On the approver side, the policy decides which role each action needs.
-policy = RoleApproverPolicy(roles_by_action={"crm.update_contact": "ops.approver"})
-approvals = SQLApprovalQueue(database, audit_log=audit_log, policy=policy)
+
+async def main() -> None:
+    async with open_database("sqlite:///control.sqlite3") as database:
+        audit_log = SQLAuditLog(database)
+        # On the approver side, the policy decides which role each action needs.
+        policy = RoleApproverPolicy(roles_by_action={"crm.update_contact": "ops.approver"})
+        approvals = SQLApprovalQueue(database, audit_log=audit_log, policy=policy)
+        records = await audit_log.append_many(
+            [AuditEvent(action="crm.contact_viewed", actor_id="agent-intake") for _ in range(3)]
+        )
 ```
 
-Keep the head from `await audit_log.head()` somewhere the application cannot write, and check against it with `await audit_log.verify(expected_head=...)` or `aox-agent-core audit verify`: the chain on its own cannot show that it was not rewritten or cut short.
+Storage is async. A Postgres `Database` owns a connection pool (`max_connections`, default 10) that opens on first use, on the running event loop: use one `Database` per event loop, and close it with `await database.aclose()` or `async with`. `PostgresDatabase.from_pool(pool)` borrows a pool you own and never closes it. SQLite keeps one connection per `Database` on a worker thread, one transaction at a time. Postgres 16 or later is required, and the library refuses an older server with a `ConfigError`. Every statement runs with `prepare=False`, and isolation and `search_path` are set per transaction, so a transaction-mode pooler is the design target; it has not been tested against one.
+
+A script with no event loop of its own wraps a log or a queue in `aox_agent_core.sync`, which runs it on a background loop thread:
+
+```python
+from aox_agent_core.sync import SyncAuditLog
+
+with SyncAuditLog(SQLAuditLog(open_database(url))) as log:
+    record = log.append(event)
+```
+
+A facade raises `EventLoopRunningError` when called inside a running loop.
+
+`append_many(events)` writes up to 1000 events as consecutive records, all or nothing, under one lock and one commit. `AuditEvent.occurred_at` is when the event happened, if the caller knows better than the moment of the append; it is hashed, and must lie within 24 hours before and 5 minutes after the database's clock, or `AuditTimeRejectedError` is raised. Without it, Postgres uses its own clock. Each record also carries `recorded_at`, set by the Postgres insert trigger whatever the writer sends and outside the hash.
+
+On Postgres, pass your own psycopg `AsyncConnection` as `connection=` to `SQLAuditLog.append` and `append_many`, or to a queue's methods, to commit the library's writes with yours:
+
+```python
+async with pool.connection() as connection, connection.transaction():
+    await audit_log.append(event, connection=connection)
+```
+
+The connection must already be in a READ COMMITTED transaction. The library works in a savepoint and never commits, rolls back or closes it. The audit lock is held until your transaction ends, so write audit events late in it, and records returned inside it are provisional until you commit. A refusal (a denied `consume`, `resolve` or `cancel`) is audited on a separate connection and committed at once, so a rollback does not erase it; see [docs/upgrading.md](docs/upgrading.md) for what happens when that write cannot be made.
+
+Keep the head from `await audit_log.head()` somewhere the application cannot write (not one taken inside a host transaction), and check against it with `await audit_log.verify(expected_head=...)` or `aox-agent-core audit verify`: the chain on its own cannot show that it was not rewritten or cut short.
 
 Pass `context=RunContext(...)` to `AuditEvent`, `submit`, `resolve` and `consume`: the run is stored with the record and covered by its hash (audit schema 2 and later). Tables created by `v0.1.0a1` cannot be upgraded and are refused with a `ConfigError`; keep that database to check its records with `v0.1.0a1`, and point this version at a new one. `ApprovalQueue` and `AuditLog` are protocols, so a host can supply its own backends, and `SQLApprovalQueue` accepts any `AuditLog`.
+
+`submit(..., include_payload=True)` stores the exact payload with the request, at most 8192 bytes of canonical JSON under the audit log's rules, and `ApprovalRequest.payload` holds it. Every `get`, `list_pending` and `resolve` checks it against `payload_sha256` and the rules a submit applies (a malformed or rule-breaking one hides only its own request): `get` raises `ApprovalIntegrityError`, `list_pending` omits the request, and `resolve` refuses it and audits `approval.resolve_denied`. `consume`, `cancel` and `expire_due` return `payload=None`. The payload is never copied into the audit log, and nothing purges it. `summary` is written by the requester and is not covered by the hash, so show `payload` to approvers when it is present.
 
 Each approval authorizes one run: call `consume(..., principal=...)` right before acting. Only the requester may consume it, unless `submit(..., delegates={...})` named other principals (at most 16, fixed for the request and shown to the approver); anyone else gets `NotTheRequesterError`. The requester can withdraw a pending request with `cancel(...)`. `expire_due(principal=...)` stores EXPIRED on pending requests past their lifetime. `get()` reports such a request as expired whether or not the sweep has run.
 
@@ -163,7 +194,7 @@ Each audit record carries `db_role`, the database role that inserted it, set by 
 
 SQLite has no roles and is not a trust boundary: anyone who can write the file is fully trusted, and the library's checks are all it has. A SQLite queue acts for both sides.
 
-See [docs/upgrade-0.1.0a3.md](docs/upgrade-0.1.0a3.md) for the role layout, the transition table, setup and the upgrade from `v0.1.0a2`, which let one app role set a request to approved with plain SQL. `examples/control_layer_demo.py` walks through the audit log and approvals, and `evals/run_triage_eval.py` runs the synthetic eval suite and prints its scorecard.
+See [docs/upgrade-0.1.0a3.md](docs/upgrade-0.1.0a3.md) for the role layout, the transition table, setup and the upgrade from `v0.1.0a2`, which let one app role set a request to approved with plain SQL. To go from `v0.1.0a3` to `v0.1.0a4`, see [docs/upgrading.md](docs/upgrading.md): the operator re-runs `install_postgres_schema` as the owner, and an a3 schema is refused until then. `examples/control_layer_demo.py` walks through the audit log and approvals, and `evals/run_triage_eval.py` runs the synthetic eval suite and prints its scorecard.
 
 ## Bedrock
 
@@ -181,6 +212,8 @@ docker compose up -d --wait postgres   # optional: the Postgres tests
 AGENT_CORE_TEST_POSTGRES_ADMIN_URL=postgresql://postgres@127.0.0.1:4202/postgres uv run pytest
 uvx pre-commit install
 ```
+
+`benchmarks/audit_throughput.py` times concurrent audit appends against Postgres; see [benchmarks/README.md](benchmarks/README.md).
 
 ## Releases
 

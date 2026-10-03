@@ -190,7 +190,7 @@ def _rewrite_actor_and_rehash(database: ControlDatabase, *, seq: int, actor_id: 
         if record.seq == seq:
             changes["actor_id"] = actor_id
         unsealed = UnsealedAuditRecord(
-            **{**record.model_dump(exclude={"record_hash", "db_role"}), **changes}
+            **{**record.model_dump(exclude={"record_hash", "db_role", "recorded_at"}), **changes}
         )
         record_hash = compute_record_hash(unsealed)
         database.raw(
@@ -321,11 +321,11 @@ async def test_verify_walks_in_batches_off_the_event_loop(
     [
         f"INSERT OR REPLACE INTO {audit_sql.AUDIT_TABLE} ({audit_sql.COLUMNS}) "
         "SELECT seq, schema_version, event_id, occurred_at, 'model.forged', actor_id, "
-        "subject_id, payload, run_context, prev_hash, record_hash, db_role "
+        "subject_id, payload, run_context, prev_hash, record_hash, db_role, recorded_at "
         f"FROM {audit_sql.AUDIT_TABLE} WHERE seq = 2",
         f"INSERT INTO {audit_sql.AUDIT_TABLE} ({audit_sql.COLUMNS}) "
         "SELECT 10, schema_version, 'forged-event', occurred_at, action, actor_id, "
-        "subject_id, payload, run_context, prev_hash, record_hash, db_role "
+        "subject_id, payload, run_context, prev_hash, record_hash, db_role, recorded_at "
         f"FROM {audit_sql.AUDIT_TABLE} WHERE seq = 3",
     ],
     ids=["insert-or-replace", "insert-out-of-order"],
@@ -390,7 +390,7 @@ async def test_insert_or_replace_on_an_existing_event_id_is_refused(tmp_path: Pa
         database.raw(
             f"INSERT OR REPLACE INTO {audit_sql.AUDIT_TABLE} ({audit_sql.COLUMNS}) "
             "SELECT 4, schema_version, event_id, occurred_at, action, actor_id, subject_id, "
-            "payload, run_context, prev_hash, record_hash, db_role "
+            "payload, run_context, prev_hash, record_hash, db_role, recorded_at "
             f"FROM {audit_sql.AUDIT_TABLE} WHERE seq = 2"
         )
 
@@ -407,7 +407,7 @@ async def test_a_temporary_table_cannot_stand_in_for_the_audit_table(
     forge_after_gap = (
         f"INSERT INTO public.{audit_sql.AUDIT_TABLE} ({audit_sql.COLUMNS}) "
         "SELECT 1001, schema_version, 'forged-event', occurred_at, action, actor_id, "
-        "subject_id, payload, run_context, prev_hash, record_hash, db_role "
+        "subject_id, payload, run_context, prev_hash, record_hash, db_role, recorded_at "
         f"FROM public.{audit_sql.AUDIT_TABLE} "
         "WHERE seq = 3"
     )
@@ -427,11 +427,11 @@ async def test_reading_a_missing_sqlite_file_does_not_create_it(tmp_path: Path) 
     assert not missing.parent.exists()
 
 
-def test_a_write_sent_as_a_read_on_a_missing_file_fails_loudly(tmp_path: Path) -> None:
+async def test_a_write_sent_as_a_read_on_a_missing_file_fails_loudly(tmp_path: Path) -> None:
     database = open_database(f"sqlite:///{tmp_path / 'absent.sqlite3'}")
 
     with pytest.raises(sqlite3.OperationalError, match="readonly"):
-        database.run_sync(lambda session: session.execute("CREATE TABLE stray (a INTEGER)"))
+        await database.run(lambda session: session.execute("CREATE TABLE stray (a INTEGER)"))
 
 
 def test_too_old_sqlite_is_refused(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -503,5 +503,5 @@ async def test_an_a2_postgres_table_asks_for_the_installer(
         pytest.skip("only Postgres refuses; SQLite upgrades its own file")
     control_database.raw(f"ALTER TABLE {audit_sql.AUDIT_TABLE} DROP COLUMN db_role")
 
-    with pytest.raises(ConfigError, match=r"0\.1\.0a2 .* install_postgres_schema"):
+    with pytest.raises(ConfigError, match=r"earlier agent-core .* install_postgres_schema"):
         await SQLAuditLog(control_database.database).append(event(1))
