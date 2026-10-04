@@ -1,6 +1,7 @@
 """A routed call, its trace and cost, then a human-approved action and a verified audit log.
 
-Run it from the repository root; it needs no API key and no network:
+Run it from the repository root; with AGENT_CORE_MODE unset or `replay` it needs no API
+key and no network (it forces replay mode, so a recording is never overwritten):
 
     uv run --extra otel python examples/approval_flow.py
 
@@ -10,9 +11,10 @@ The steps, in order:
    examples/routed_call.py, answered from the recording in examples/replays.
 2. Its trace id, span attributes and cost.
 3. An approval to pay the extracted invoice. An AGENT principal submits it; a HUMAN
-   principal holding the required role resolves it (an agent cannot, and nobody can
-   approve their own request); the agent then consumes it right before acting. One
-   approval authorizes one run, so a second use is refused.
+   principal holding the required role resolves it (the policy refuses a principal
+   marked as an agent, and an approver may not be the requester); the agent then
+   consumes it right before acting. One approval authorizes one run, so a second use
+   is refused.
 4. The audit log, walked and verified from the first record to the last.
 
 The database is a temporary SQLite file. SQLite is not a trust boundary: it has no
@@ -48,11 +50,16 @@ from aox_agent_core.errors import (
     NotAuthorizedToResolveError,
     ReplayMissError,
 )
-from aox_agent_core.storage import open_database
+from aox_agent_core.storage import Database, open_database
 
 PAY_ACTION = "invoice.pay"
 REQUIRED_ROLE = "ap.approver"
 EXTRACTION_AGENT = Principal(id="agent-extract", kind=PrincipalKind.AGENT)
+# Both identities are built here only so the example can run in one process. The "human"
+# mark is only as trustworthy as the code that builds the Principal: in a deployment the
+# approver side builds it from its own authenticated session, never in the agent's
+# process, and on Postgres the agent's queue connects as the requester role while the
+# approval UI connects as the approver role.
 APPROVER = Principal(id="user-21", kind=PrincipalKind.HUMAN, roles=frozenset({REQUIRED_ROLE}))
 # The run id extract_invoice puts on its span, so the call and the approval share a run.
 RUN = RunContext(run_id="example-run-1", external_ids={"source": "examples"})
@@ -70,7 +77,11 @@ def print_trace_and_cost(result: CallResult[InvoiceFields], spans: InMemorySpanE
 
 async def approve_payment(database_path: Path, result: CallResult[InvoiceFields]) -> bool:
     """Request, decide and use one approval, then verify the audit log. True if it verified."""
-    database = open_database(f"sqlite:///{database_path}")
+    async with open_database(f"sqlite:///{database_path}") as database:
+        return await run_approval(database, result)
+
+
+async def run_approval(database: Database, result: CallResult[InvoiceFields]) -> bool:
     log = SQLAuditLog(database)
     # The approver side decides which role each action needs; the requester cannot.
     policy = RoleApproverPolicy(roles_by_action={PAY_ACTION: REQUIRED_ROLE})
@@ -140,7 +151,6 @@ async def approve_payment(database_path: Path, result: CallResult[InvoiceFields]
     # the log was never rewritten: for that, keep log.head() somewhere the log's writers
     # cannot reach and pass it back as expected_head.
     report = await log.verify_report()
-    await database.aclose()
     if report.ok:
         print(f"audit log verified: {report.records_checked} records, head seq {report.head.seq}")
     else:
@@ -157,7 +167,7 @@ def main() -> None:
     trace.set_tracer_provider(tracer_provider)
 
     # call_sync owns an event loop, so the routed call runs before the async approval steps.
-    with AgentClient(load_config(CONFIG_PATH)) as client:
+    with AgentClient(load_config(CONFIG_PATH, environ={})) as client:
         try:
             result = extract_invoice(client)
         except ReplayMissError as error:
