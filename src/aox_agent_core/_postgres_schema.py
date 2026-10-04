@@ -362,10 +362,12 @@ def logins_ddl(schema: str, requester_role: str, approver_role: str) -> tuple[st
             -- Privileges do not decide this: a member of pg_write_all_data passes every
             -- grant check. Only the owner, connected as itself, writes the table. This
             -- function is not SECURITY DEFINER, so both names are the caller's.
+            -- Roles are matched by exact name in pg_roles. A ::regrole cast parses its text
+            -- as an identifier and folds case, so a login named "OWNER" would pass as owner.
             IF (SELECT relowner FROM pg_class WHERE oid = TG_RELID)
-               IS DISTINCT FROM session_user::text::regrole::oid
+               IS DISTINCT FROM (SELECT oid FROM pg_roles WHERE rolname = session_user)
                OR (SELECT relowner FROM pg_class WHERE oid = TG_RELID)
-               IS DISTINCT FROM current_user::text::regrole::oid THEN
+               IS DISTINCT FROM (SELECT oid FROM pg_roles WHERE rolname = current_user) THEN
                 RAISE EXCEPTION
                     'login mappings are written only by the table owner, connected as itself';
             END IF;

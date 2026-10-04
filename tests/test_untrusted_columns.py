@@ -1405,6 +1405,30 @@ def test_a_mapping_is_written_only_by_the_owner_connected_as_itself(
     assert [row[0] for row in active_mappings(control_database)] == sorted([mapped, unmapped])
 
 
+def test_a_login_named_like_the_owner_in_another_case_is_not_the_owner(
+    control_database: ControlDatabase,
+) -> None:
+    """The guard compares role names exactly: a cast would fold "OWNER" to the owner's name."""
+    if control_database.superuser_url is None:
+        pytest.skip("the mapping table exists only on Postgres")
+    mapped, _ = approver_login(control_database)
+    unmapped, _ = approver_login(control_database)
+    bind_logins(control_database, (mapped, "user-17"), on=False)
+    lookalike = OWNER_ROLE.upper()
+    assert lookalike != OWNER_ROLE
+    control_database.superuser_raw(f'CREATE ROLE "{lookalike}" LOGIN INHERIT')
+    control_database.roles.append(lookalike)
+    control_database.superuser_raw(f'GRANT pg_read_all_data, pg_write_all_data TO "{lookalike}"')
+
+    with pytest.raises(psycopg.Error, match="written only by the table owner"):
+        runner_as(
+            login_url(control_database, lookalike),
+            f"INSERT INTO {LOGINS} (login, login_oid, principal) "
+            f"SELECT '{unmapped}', oid, 'user-99' FROM pg_roles WHERE rolname = '{unmapped}'",
+        )
+    assert active_mappings(control_database) == [(mapped, "user-17", True)]
+
+
 async def test_a_queue_refuses_to_connect_as_a_pg_write_all_data_member(
     control_database: ControlDatabase,
 ) -> None:
