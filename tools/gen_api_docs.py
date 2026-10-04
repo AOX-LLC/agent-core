@@ -236,6 +236,10 @@ def entry(name: str, value: object, *, brief: bool, module: str) -> list[str]:
 
 
 def block_body(module_name: str, options: list[str]) -> str:
+    if module_name != "aox_agent_core" and not module_name.startswith("aox_agent_core."):
+        raise SystemExit(
+            f"refusing to import {module_name}: only aox_agent_core modules are documented"
+        )
     module = importlib.import_module(module_name)
     brief = "brief" in options
     names = [option for option in options if option != "brief"] or list(module.__all__)

@@ -20,6 +20,7 @@ DOCUMENTED_MODULES = [
     "aox_agent_core.tracing",
     "aox_agent_core.approvals",
     "aox_agent_core.audit",
+    "aox_agent_core.storage",
     "aox_agent_core.evals",
     "aox_agent_core.sync",
 ]
