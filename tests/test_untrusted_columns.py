@@ -1331,6 +1331,135 @@ def test_a_privilege_for_any_other_role_stops_the_installer(
         bind_logins(control_database, on=False)
 
 
+def login_url(database: ControlDatabase, role: str) -> str:
+    assert database.superuser_url is not None
+    return database.superuser_url.replace("postgres@", f"{role}@", 1)
+
+
+def active_mappings(database: ControlDatabase) -> list[tuple[Any, ...]]:
+    return database.raw(f"SELECT login, principal, removed_at IS NULL FROM {LOGINS} ORDER BY login")
+
+
+def test_a_pg_write_all_data_member_cannot_insert_or_update_a_mapping(
+    control_database: ControlDatabase,
+) -> None:
+    """It passes every grant check, so only the guard stands between it and the table."""
+    if control_database.superuser_url is None:
+        pytest.skip("the mapping table exists only on Postgres")
+    mapped, _ = approver_login(control_database)
+    unmapped, _ = approver_login(control_database)
+    bind_logins(control_database, (mapped, "user-17"), on=False)
+    writer = probe_role(control_database, "LOGIN INHERIT")
+    # A backup or ETL login: it can read and write every table without any grant.
+    control_database.superuser_raw(f"GRANT pg_read_all_data, pg_write_all_data TO {writer}")
+    url = login_url(control_database, writer)
+    before = active_mappings(control_database)
+
+    # The premise: no grant stops it.
+    assert control_database.superuser_raw(
+        f"SELECT has_table_privilege('{writer}', '{LOGINS}', 'INSERT'), "
+        f"has_table_privilege('{writer}', '{LOGINS}', 'UPDATE')"
+    ) == [(True, True)]
+    for statement in (
+        f"INSERT INTO {LOGINS} (login, login_oid, principal) "
+        f"SELECT '{unmapped}', oid, 'user-99' FROM pg_roles WHERE rolname = '{unmapped}'",
+        f"UPDATE {LOGINS} SET removed_at = now() WHERE login = '{mapped}'",
+        f"UPDATE {LOGINS} SET principal = 'user-99' WHERE login = '{mapped}'",
+    ):
+        with pytest.raises(psycopg.Error, match="written only by the table owner"):
+            runner_as(url, statement)
+
+    assert active_mappings(control_database) == before
+
+
+def test_a_mapping_is_written_only_by_the_owner_connected_as_itself(
+    control_database: ControlDatabase,
+) -> None:
+    """The guard judges session_user and current_user: each must be the owner."""
+    if control_database.superuser_url is None:
+        pytest.skip("the mapping table exists only on Postgres")
+    mapped, _ = approver_login(control_database)
+    unmapped, _ = approver_login(control_database)
+    bind_logins(control_database, (mapped, "user-17"), on=False)
+    insert = (
+        f"INSERT INTO {LOGINS} (login, login_oid, principal) "
+        f"SELECT '{unmapped}', oid, 'user-99' FROM pg_roles WHERE rolname = '{unmapped}'"
+    )
+    # A member of the owner role passes the privilege checks after SET ROLE, but its
+    # session_user is not the owner.
+    member = probe_role(control_database, "LOGIN INHERIT")
+    control_database.superuser_raw(f"GRANT {OWNER_ROLE} TO {member}")
+    # An owner session that SETs ROLE to a role holding the bypass: current_user is not the owner.
+    bypass = probe_role(control_database, "NOLOGIN")
+    control_database.superuser_raw(f"GRANT pg_write_all_data TO {bypass}")
+    control_database.superuser_raw(f"GRANT {bypass} TO {OWNER_ROLE}")
+    assert control_database.owner_url is not None
+
+    with pytest.raises(psycopg.Error, match="written only by the table owner"):
+        runner_as(login_url(control_database, member), f"SET ROLE {OWNER_ROLE}", insert)
+    with pytest.raises(psycopg.Error, match="written only by the table owner"):
+        runner_as(control_database.owner_url, f"SET ROLE {bypass}", insert)
+    assert active_mappings(control_database) == [(mapped, "user-17", True)]
+    # The owner as itself still maps and unmaps.
+    runner_as(control_database.owner_url, insert)
+    assert [row[0] for row in active_mappings(control_database)] == sorted([mapped, unmapped])
+
+
+async def test_a_queue_refuses_to_connect_as_a_pg_write_all_data_member(
+    control_database: ControlDatabase,
+) -> None:
+    if control_database.superuser_url is None:
+        pytest.skip("login binding exists only on Postgres")
+    login, url = approver_login(control_database, also_member_of=("pg_write_all_data",))
+    bind_logins(control_database, (login, "user-17"))
+
+    with pytest.raises(
+        ConfigError, match="is a superuser, owns the approvals table, or can delete"
+    ):
+        await approver_queue_at(control_database, url).side()
+
+
+async def test_a_queue_refuses_when_its_own_other_role_can_bypass_the_mapping_grants(
+    control_database: ControlDatabase,
+) -> None:
+    """The approver side connects as a clean login, but the requester role is a bypass role.
+
+    The queue's role check already refuses it, because pg_write_all_data can write the
+    approvals table too; this pins that, so the mapping is not the only thing in the way.
+    """
+    if control_database.superuser_url is None:
+        pytest.skip("login binding exists only on Postgres")
+    login, url = approver_login(control_database)
+    bind_logins(control_database, (login, "user-17"))
+    assert await approver_queue_at(control_database, url).side() is ApprovalSide.APPROVER
+    # The roles are shared by the whole test run, so undo the grant whatever happens.
+    control_database.superuser_raw(f"GRANT pg_write_all_data TO {REQUESTER_ROLE}")
+    try:
+        with pytest.raises(ConfigError, match=r"The requester role .* can update decision"):
+            await approver_queue_at(control_database, url).side()
+    finally:
+        control_database.superuser_raw(f"REVOKE pg_write_all_data FROM {REQUESTER_ROLE}")
+
+
+async def test_a_mapping_guard_older_than_0_1_0_is_refused_until_the_installer_runs(
+    control_database: ControlDatabase,
+) -> None:
+    """0.1.0a7's guard checked no writer; a queue with binding on will not trust it."""
+    if control_database.superuser_url is None:
+        pytest.skip("login binding exists only on Postgres")
+    login, url = approver_login(control_database)
+    bind_logins(control_database, (login, "user-17"))
+    name = f"{control_database.schema}.{LOGINS}_guard"
+    definition = control_database.raw(f"SELECT pg_get_functiondef('{name}()'::regprocedure)")[0][0]
+    assert "login mapping guard revision 2" in definition
+    control_database.raw(definition.replace("guard revision 2", "guard revision 1"))
+
+    with pytest.raises(ConfigError, match=r"login mapping guard .* is out of date"):
+        await approver_queue_at(control_database, url).side()
+    bind_logins(control_database, on=True)
+    assert await approver_queue_at(control_database, url).side() is ApprovalSide.APPROVER
+
+
 def test_with_binding_off_the_guard_does_not_call_the_lookup_so_a6_behaviour_holds(
     control_database: ControlDatabase,
 ) -> None:

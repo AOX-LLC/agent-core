@@ -92,6 +92,11 @@ ROLES_TABLE: Final = "agent_core_approval_roles"
 LOGINS_TABLE: Final = "agent_core_approver_logins"
 LOGINS_TRIGGER: Final = "agent_core_approver_logins_guard"
 LOGINS_TRUNCATE_TRIGGER: Final = "agent_core_approver_logins_no_truncate"
+# Revision 2 (0.1.0): the guard refuses an INSERT or UPDATE unless session_user and
+# current_user are both the table's owner, so a role that reaches the table without a grant
+# (a member of pg_write_all_data) cannot map a login. Revision 1 shipped in 0.1.0a7.
+LOGINS_GUARD_REVISION: Final = 2
+LOGINS_GUARD_MARKER: Final = "-- agent-core login mapping guard revision"
 LOGINS_TRIGGERS: Final = frozenset({LOGINS_TRIGGER, LOGINS_TRUNCATE_TRIGGER})
 BOUND_PRINCIPAL_FUNCTION: Final = "agent_core_bound_principal"
 BINDING_MARKER: Final = "-- agent-core login binding"
@@ -349,9 +354,20 @@ def logins_ddl(schema: str, requester_role: str, approver_role: str) -> tuple[st
         )""",
         f"""CREATE OR REPLACE FUNCTION {quoted_schema}.{LOGINS_TABLE}_guard()
         RETURNS trigger LANGUAGE plpgsql SET search_path = pg_catalog, pg_temp AS $$
+        {LOGINS_GUARD_MARKER} {LOGINS_GUARD_REVISION}
         BEGIN
             IF TG_OP IN ('DELETE', 'TRUNCATE') THEN
                 RAISE EXCEPTION 'login mappings are never deleted; set removed_at to end one';
+            END IF;
+            -- Privileges do not decide this: a member of pg_write_all_data passes every
+            -- grant check. Only the owner, connected as itself, writes the table. This
+            -- function is not SECURITY DEFINER, so both names are the caller's.
+            IF (SELECT relowner FROM pg_class WHERE oid = TG_RELID)
+               IS DISTINCT FROM session_user::text::regrole::oid
+               OR (SELECT relowner FROM pg_class WHERE oid = TG_RELID)
+               IS DISTINCT FROM current_user::text::regrole::oid THEN
+                RAISE EXCEPTION
+                    'login mappings are written only by the table owner, connected as itself';
             END IF;
             IF TG_OP = 'INSERT' THEN
                 NEW.mapped_at := now();
@@ -1053,6 +1069,19 @@ async def _require_login_mapping(
             f"({LOGINS_TABLE}, {BOUND_PRINCIPAL_FUNCTION}() and the table's triggers). As the "
             "owner role, run install_postgres_schema from 0.1.0a7, then map each approver "
             "login with bind_approver_login."
+        )
+    guard_source = (
+        await session.execute(
+            "SELECT prosrc FROM pg_proc WHERE oid = to_regprocedure(?)",
+            (f"{quoted_schema}.{LOGINS_TABLE}_guard()",),
+        )
+    )[0][0]
+    found = re.search(rf"{re.escape(LOGINS_GUARD_MARKER)} (\d+)", guard_source)
+    if found is None or int(found[1]) < LOGINS_GUARD_REVISION:
+        raise ConfigError(
+            f"The login mapping guard in {schema} is out of date: it does not yet refuse a "
+            "write by a role that reaches the table without a grant, such as a member of "
+            "pg_write_all_data. As the owner role, run install_postgres_schema from 0.1.0."
         )
     await require_logins_made_by_owner(session, schema)
     roles = [requester_role, approver_role] + [
