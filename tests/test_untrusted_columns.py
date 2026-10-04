@@ -1460,6 +1460,41 @@ async def test_a_mapping_guard_older_than_0_1_0_is_refused_until_the_installer_r
     assert await approver_queue_at(control_database, url).side() is ApprovalSide.APPROVER
 
 
+def test_a_login_of_both_roles_is_not_listed_as_unmapped_because_it_can_never_be_mapped(
+    control_database: ControlDatabase,
+) -> None:
+    if control_database.superuser_url is None:
+        pytest.skip("the installer is Postgres only")
+    both, _ = approver_login(control_database, also_member_of=(REQUESTER_ROLE,))
+    approver_only, _ = approver_login(control_database)
+    assert control_database.owner_url is not None
+
+    report = install_postgres_schema(
+        control_database.owner_url,
+        requester_role=REQUESTER_ROLE,
+        approver_role=APPROVER_ROLE,
+        schema=control_database.schema,
+    )
+
+    assert approver_only in report.unmapped_logins
+    assert both not in report.unmapped_logins
+
+
+async def test_a_grant_to_public_is_named_and_the_grantor_is_told_to_revoke(
+    control_database: ControlDatabase,
+) -> None:
+    if control_database.superuser_url is None:
+        pytest.skip("login binding exists only on Postgres")
+    login, url = approver_login(control_database)
+    bind_logins(control_database, (login, "user-17"))
+    control_database.superuser_raw(f"GRANT SELECT ON {LOGINS} TO PUBLIC")
+
+    with pytest.raises(
+        ConfigError, match=rf"PUBLIC holds a privilege.*granted it \({OWNER_ROLE}\)"
+    ):
+        await approver_queue_at(control_database, url).side()
+
+
 def test_with_binding_off_the_guard_does_not_call_the_lookup_so_a6_behaviour_holds(
     control_database: ControlDatabase,
 ) -> None:

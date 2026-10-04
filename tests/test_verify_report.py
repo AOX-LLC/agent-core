@@ -1,5 +1,7 @@
 """verify_report: every problem in the chain, not the first, and where the walk goes on."""
 
+from typing import Any
+
 import pytest
 
 from aox_agent_core.audit import VerifyReport
@@ -158,15 +160,15 @@ async def test_the_report_changes_nothing(control_database: ControlDatabase) -> 
     assert control_database.raw(f"SELECT seq, record_hash FROM {TABLE} ORDER BY seq") == before
 
 
-@pytest.mark.parametrize("bad", [0, -1])
-async def test_a_max_problems_below_one_is_refused_not_reported_as_ok(
-    control_database: ControlDatabase, bad: int
+@pytest.mark.parametrize("bad", [0, -1, True, float("nan"), float("inf"), "3", None])
+async def test_a_max_problems_that_is_not_an_integer_of_one_or_more_is_refused(
+    control_database: ControlDatabase, bad: Any
 ) -> None:
     log = await filled_log(control_database, 3)
     drop_triggers(control_database)
     control_database.raw(f"UPDATE {TABLE} SET actor_id = 'someone-else' WHERE seq = 2")
 
-    with pytest.raises(ValueError, match="at least 1"):
+    with pytest.raises(ValueError, match="integer of at least 1"):
         await log.verify_report(max_problems=bad)
 
 

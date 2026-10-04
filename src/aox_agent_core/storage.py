@@ -780,7 +780,9 @@ def install_postgres_schema(
             closed_duplicates=tuple(closed_duplicates),
             backdated_finishes=tuple(await _backdated_finishes(session, schema)),
             login_binding=binding,
-            unmapped_logins=tuple(await _unmapped_logins(session, schema, approver_role)),
+            unmapped_logins=tuple(
+                await _unmapped_logins(session, schema, requester_role, approver_role)
+            ),
         )
 
     async def run() -> InstallReport:
@@ -1102,16 +1104,25 @@ async def _record_roles(
 _UNMAPPED_LOGINS = """
 SELECT r.rolname FROM pg_roles r
 WHERE r.rolcanlogin AND NOT r.rolsuper AND pg_has_role(r.oid, ?, 'MEMBER')
+  AND NOT pg_has_role(r.oid, ?, 'MEMBER')
   AND NOT EXISTS (SELECT 1 FROM {table} m
                   WHERE m.login_oid = r.oid AND m.login = r.rolname AND m.removed_at IS NULL)
 ORDER BY r.rolname
 """
 
 
-async def _unmapped_logins(session: Session, schema: str, approver_role: str) -> list[str]:
-    """Login roles that are members of the approver role and have no active mapping."""
+async def _unmapped_logins(
+    session: Session, schema: str, requester_role: str, approver_role: str
+) -> list[str]:
+    """Login roles of the approver role, not also of the requester role, with no mapping.
+
+    A login in both roles can never be mapped (the guard refuses it as an approver), so it
+    is left out rather than listed as something to do.
+    """
     table = f"{layout.identifier(schema, what='schema')}.{layout.LOGINS_TABLE}"
-    rows = await session.execute(_UNMAPPED_LOGINS.format(table=table), (approver_role,))
+    rows = await session.execute(
+        _UNMAPPED_LOGINS.format(table=table), (approver_role, requester_role)
+    )
     return [row[0] for row in rows]
 
 

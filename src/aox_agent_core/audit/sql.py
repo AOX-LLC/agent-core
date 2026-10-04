@@ -172,8 +172,8 @@ class SQLAuditLog:
         continues from the record's stored hash. It stops after `max_problems` (default
         1000) and says so. Read-only, in batches; it never repairs anything.
         """
-        if max_problems < 1:
-            raise ValueError("max_problems must be at least 1")
+        if isinstance(max_problems, bool) or not isinstance(max_problems, int) or max_problems < 1:
+            raise ValueError("max_problems must be an integer of at least 1")
         return await self._walk_report(expected_head, max_problems)
 
     async def _walk_report(
@@ -562,8 +562,8 @@ class _ReportState:
                 self._add(
                     expected.seq,
                     "anchor",
-                    f"Record {expected.seq} could not be read, so it cannot be matched to the "
-                    "anchor.",
+                    f"Record {expected.seq} is missing or could not be read, so it cannot be "
+                    "matched to the anchor.",
                 )
             elif self._anchored_hash != expected.record_hash:
                 self._add(

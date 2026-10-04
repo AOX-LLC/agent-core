@@ -389,7 +389,7 @@ def logins_ddl(schema: str, requester_role: str, approver_role: str) -> tuple[st
         f"""CREATE OR REPLACE TRIGGER {LOGINS_TRUNCATE_TRIGGER} BEFORE TRUNCATE ON {table}
         FOR EACH STATEMENT EXECUTE FUNCTION {quoted_schema}.{LOGINS_TABLE}_guard()""",
         f"REVOKE ALL ON {table} FROM PUBLIC",
-        # Table-level REVOKE also removes column grants.
+        # Table-level REVOKE also removes column grants the owner made, not another role's.
         f"REVOKE ALL ON {table} FROM {identifier(requester_role, what='role')}, {approver}",
         f"""CREATE OR REPLACE FUNCTION {function}() RETURNS text
         LANGUAGE sql STABLE SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $$
@@ -493,6 +493,9 @@ _GUARD_BODY = """
 -- agent-core guard revision <revision>
 -- agent-core payload retention floor <retention_floor> seconds
 -- agent-core login binding <binding>
+-- With binding on, a decision's resolved_by must be the principal the owner mapped to
+-- session_user (the login that authenticated, which SET ROLE does not change). The marker
+-- line above is what the library reads; nothing else in this function switches it.
 DECLARE
     requester_role text := '<requester>';
     approver_role text := '<approver>';
@@ -1066,6 +1069,7 @@ async def _require_login_mapping(
             "owner role, run install_postgres_schema from 0.1.0a7, then map each approver "
             "login with bind_approver_login."
         )
+    await require_logins_made_by_owner(session, schema)
     guard_source = (
         await session.execute(
             "SELECT prosrc FROM pg_proc WHERE oid = to_regprocedure(?)",
@@ -1079,7 +1083,6 @@ async def _require_login_mapping(
             "write by a role that reaches the table without a grant, such as a member of "
             "pg_write_all_data. As the owner role, run install_postgres_schema from 0.1.0."
         )
-    await require_logins_made_by_owner(session, schema)
     roles = [requester_role, approver_role] + [
         row[0] for row in await session.execute(_CONNECTING_ROLES)
     ]
@@ -1104,10 +1107,14 @@ async def _require_login_mapping(
 
 
 _LOGINS_ACL_SQL = """
-SELECT g.grantee::regrole::text FROM pg_class c, aclexplode(c.relacl) g
+SELECT CASE g.grantee WHEN 0 THEN 'PUBLIC' ELSE g.grantee::regrole::text END,
+       g.grantor::regrole::text
+FROM pg_class c, aclexplode(c.relacl) g
 WHERE c.oid = to_regclass(?) AND g.grantee <> c.relowner
 UNION ALL
-SELECT g.grantee::regrole::text FROM pg_attribute a, aclexplode(a.attacl) g, pg_class c
+SELECT CASE g.grantee WHEN 0 THEN 'PUBLIC' ELSE g.grantee::regrole::text END,
+       g.grantor::regrole::text
+FROM pg_attribute a, aclexplode(a.attacl) g, pg_class c
 WHERE a.attrelid = to_regclass(?) AND c.oid = a.attrelid AND a.attnum > 0
   AND NOT a.attisdropped AND g.grantee <> c.relowner
 """
@@ -1142,12 +1149,14 @@ async def require_logins_made_by_owner(session: "Session", schema: str) -> None:
             "search_path. Another role may have created them first. As the owner role, drop "
             "them and run install_postgres_schema again."
         )
-    grantees = [row[0] for row in await session.execute(_LOGINS_ACL_SQL, (table, table))]
-    if grantees:
+    grants = [(row[0], row[1]) for row in await session.execute(_LOGINS_ACL_SQL, (table, table))]
+    if grants:
+        grantees = ", ".join(sorted({grantee for grantee, _ in grants}))
+        grantors = ", ".join(sorted({grantor for _, grantor in grants}))
         raise ConfigError(
-            f"{', '.join(sorted(set(grantees)))} holds a privilege on the login mapping table in "
-            f"{schema}, directly, by column or by default privileges. Only the owner may. As the "
-            "owner role, REVOKE ALL on it from them."
+            f"{grantees} holds a privilege on the login mapping table in {schema}, directly, by "
+            f"column or by default privileges. Only the owner may. Revoke it as the role that "
+            f"granted it ({grantors}): the owner's REVOKE removes only the owner's own grants."
         )
 
 
