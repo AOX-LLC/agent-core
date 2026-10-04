@@ -439,7 +439,6 @@ def approvals_guard_ddl(
         .replace("<revision>", str(GUARD_REVISION))
         .replace("<retention_floor>", str(int(payload_retention_floor_seconds)))
         .replace("<binding>", "on" if bind_logins else "off")
-        .replace("<bind_logins>", "true" if bind_logins else "false")
         .replace("<binding_check>", _binding_check(quoted_schema) if bind_logins else "")
     )
     return (
@@ -495,9 +494,6 @@ _GUARD_BODY = """
 -- agent-core payload retention floor <retention_floor> seconds
 -- agent-core login binding <binding>
 DECLARE
-    -- Login binding: with it on, a decision's resolved_by must be the principal the owner
-    -- mapped to session_user (the login that authenticated, which SET ROLE does not change).
-    bind_logins boolean := <bind_logins>;
     requester_role text := '<requester>';
     approver_role text := '<approver>';
     -- The shapes the library writes; rows of any other shape are refused, so
