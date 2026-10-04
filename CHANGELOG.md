@@ -10,7 +10,7 @@ Pre-releases are spelled the PEP 440 way, so tags look like `v0.1.0a1`.
 
 ## [0.1.0] - 2026-10-03
 
-The first release. It rolls up the pre-releases 0.1.0a1 to 0.1.0a7 and changes no code under `src/` since 0.1.0a7. Upgrade from 0.1.0a7 by changing the tag: no reinstall and no schema change. From 0.1.0a6, do the 0.1.0a7 operator steps (stop the a6 processes, run `install_postgres_schema` as the owner); see docs/upgrading.md.
+The first release. It rolls up the pre-releases 0.1.0a1 to 0.1.0a7 and makes one security fix to them (below). Upgrade from 0.1.0a7 by changing the tag and running `install_postgres_schema` as the owner role once: the fix is in the login mapping table's guard, which only the installer replaces. A queue with login binding on refuses the a7 guard until you have. From 0.1.0a6, do the 0.1.0a7 operator steps (stop the a6 processes, run `install_postgres_schema` as the owner); see docs/upgrading.md.
 
 ### What the pre-releases added
 
@@ -31,6 +31,17 @@ Recordings are format 2. No live recording was made in the release run; the reco
 - Added `examples/approval_flow.py`, an approval flow from request to use.
 - Added docs/api.md, an API reference with a generated outline.
 
+### Fixed in 0.1.0
+
+From the gatekeeper's review of 0.1.0a7.
+
+- **Login mapping writes (Medium).** The mapping table's guard refuses an INSERT or UPDATE unless `session_user` and `current_user` are both the table's owner. In 0.1.0a7 only grants were checked, and a member of the built-in `pg_write_all_data` role, which needs none, could map an approver login that had no mapping to another principal (reproduced on Postgres 16). The guard function carries a revision marker (revision 2); a queue with binding on refuses an older guard with a `ConfigError` until `install_postgres_schema` is run as the owner. A queue that connects as, or can switch to, a `pg_write_all_data` member was already refused, because that role can write the approvals table; tests now pin that.
+- The error for a privilege held on the mapping table names `PUBLIC` instead of `-` and names the grantor to revoke as; the owner's `REVOKE` removes only the owner's own grants.
+- `unmapped_logins` no longer lists a login that belongs to both the approver and requester roles (it can never be mapped).
+- `verify_report(max_problems=...)` accepts only an integer of at least 1: `True`, `nan`, `inf`, strings and `None` raise `ValueError`.
+- `verify_report` says a missing anchor record is "missing or could not be read".
+- The installed approvals guard no longer declares an unused `bind_logins` variable; the `-- agent-core login binding on|off` line is the only switch.
+
 ### Known limits
 
 - The Bedrock provider is an interface only. The small tier has no Bedrock default model.
@@ -42,8 +53,8 @@ Recordings are format 2. No live recording was made in the release run; the reco
 - The per-listing cost of requests the library hides or skips is unchanged: each costs a check on every listing, logged at most once a minute.
 - SQLite is not a trust boundary: any process that can write the file can change anything in it. Use it for local development and tests.
 - Some operator error messages still say "from 0.1.0a7" (for example, to run `install_postgres_schema`). The schema is identical in 0.1.0, so the advice holds for this release.
-- The owner-only check on the login mapping table reads ACL entries, and the built-in `pg_write_all_data` role grants access without one. A member of that role can write the mapping, and so bind an approver login that has no mapping yet to another principal (reproduced on Postgres 16); it cannot decide a request itself. Grant that role only deliberately. The 0.1.0a7 notes that say only the owner can touch the table, or that the installer revokes every table and column privilege, hold for the owner's own grants and ACL entries only: a column grant made by another role that holds a grant option survives the owner's REVOKE, the queue refuses to start on it, and the error's advice to REVOKE as the owner does not remove it (revoke as the grantor).
-- Small findings from the last review, not fixed in 0.1.0: `unmapped_logins` also lists a login that is a member of both the approver and requester roles, which can never be mapped; `verify_report(max_problems=...)` accepts `nan`, `inf` and `True`; `verify_report` words a record deleted from the middle of a chain as "could not be read"; `unbind_approver_login` matches by login name, so after a rename the old name is needed; a renamed-back login regains its mapping (same role OID); and an install over a table or function another role made fails with a driver error rather than a `ConfigError`.
+- Only the owner, connected as itself, can write the login mapping table; members of the built-in `pg_read_all_data` role can still read it (login names and principal ids). A binding-off installation keeps the 0.1.0a7 guard until the installer is re-run. A column grant made by another role that holds a grant option survives the owner's `REVOKE`; the queue refuses to start on it and names the grantor to revoke as. The owner role and superusers are trusted (a superuser can disable the guard).
+- Small findings from the 0.1.0a7 review, not fixed: `unbind_approver_login` matches by login name, so after a role rename the old name is needed; a login renamed back regains its mapping (same role OID); an OID collision after wraparound would be reported as a concurrent mapping; and an install over a table or function another role made fails with a driver error rather than a `ConfigError`.
 - Binding covers `resolved_by` only; the owner role and superusers are trusted; binding is only as strong as each login's authentication; a renamed login stops matching its mapping, and a removed mapping's login name must not be reused.
 - Login names are written to every audit row and to the mapping table, and both are append-only, so they cannot be erased. Use pseudonymous login names.
 
