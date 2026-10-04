@@ -390,6 +390,9 @@ def logins_ddl(schema: str, requester_role: str, approver_role: str) -> tuple[st
         FOR EACH ROW EXECUTE FUNCTION {quoted_schema}.{LOGINS_TABLE}_guard()""",
         f"""CREATE OR REPLACE TRIGGER {LOGINS_TRUNCATE_TRIGGER} BEFORE TRUNCATE ON {table}
         FOR EACH STATEMENT EXECUTE FUNCTION {quoted_schema}.{LOGINS_TABLE}_guard()""",
+        # ALWAYS: a session running with session_replication_role = replica must not skip them.
+        f"ALTER TABLE {table} ENABLE ALWAYS TRIGGER {LOGINS_TRIGGER}",
+        f"ALTER TABLE {table} ENABLE ALWAYS TRIGGER {LOGINS_TRUNCATE_TRIGGER}",
         f"REVOKE ALL ON {table} FROM PUBLIC",
         # Table-level REVOKE also removes column grants the owner made, not another role's.
         f"REVOKE ALL ON {table} FROM {identifier(requester_role, what='role')}, {approver}",
@@ -1060,7 +1063,7 @@ async def _require_login_mapping(
         row[0]
         for row in await session.execute(
             "SELECT tgname FROM pg_trigger "
-            "WHERE tgrelid = to_regclass(?) AND NOT tgisinternal AND tgenabled <> 'D'",
+            "WHERE tgrelid = to_regclass(?) AND NOT tgisinternal AND tgenabled = 'A'",
             (table,),
         )
     }
@@ -1072,12 +1075,13 @@ async def _require_login_mapping(
             "login with bind_approver_login."
         )
     await require_logins_made_by_owner(session, schema)
-    guard_source = (
-        await session.execute(
-            "SELECT prosrc FROM pg_proc WHERE oid = to_regprocedure(?)",
-            (f"{quoted_schema}.{LOGINS_TABLE}_guard()",),
-        )
-    )[0][0]
+    # The function the trigger really calls, not whatever carries the guard's name.
+    guard_rows = await session.execute(
+        "SELECT p.prosrc FROM pg_trigger t JOIN pg_proc p ON p.oid = t.tgfoid "
+        "WHERE t.tgrelid = to_regclass(?) AND t.tgname = ?",
+        (table, LOGINS_TRIGGER),
+    )
+    guard_source = guard_rows[0][0] if guard_rows else ""
     found = re.search(rf"{re.escape(LOGINS_GUARD_MARKER)} (\d+)", guard_source)
     if found is None or int(found[1]) < LOGINS_GUARD_REVISION:
         raise ConfigError(

@@ -1429,6 +1429,86 @@ def test_a_login_named_like_the_owner_in_another_case_is_not_the_owner(
     assert active_mappings(control_database) == [(mapped, "user-17", True)]
 
 
+def test_no_other_write_route_gets_a_bypass_role_past_the_mapping_guard(
+    control_database: ControlDatabase,
+) -> None:
+    """ON CONFLICT, MERGE, COPY, a view and a SECURITY DEFINER function all fire the guard."""
+    if control_database.superuser_url is None or control_database.owner_url is None:
+        pytest.skip("the mapping table exists only on Postgres")
+    mapped, _ = approver_login(control_database)
+    unmapped, _ = approver_login(control_database)
+    bind_logins(control_database, (mapped, "user-17"), on=False)
+    writer = probe_role(control_database, "LOGIN INHERIT")
+    control_database.superuser_raw(f"GRANT pg_read_all_data, pg_write_all_data TO {writer}")
+    suffix = uuid4().hex[:8]
+    # What the owner might leave around: a view over the table, and a SECURITY DEFINER function
+    # that writes it, both made by the owner and reachable by the bypass role.
+    control_database.raw(f"CREATE VIEW mapping_view_{suffix} AS SELECT * FROM {LOGINS}")
+    control_database.raw(
+        f"CREATE FUNCTION map_it_{suffix}() RETURNS void LANGUAGE sql SECURITY DEFINER AS $$ "
+        f"INSERT INTO {LOGINS} (login, login_oid, principal) "
+        f"SELECT '{unmapped}', oid, 'user-99' FROM pg_roles WHERE rolname = '{unmapped}' $$"
+    )
+    control_database.raw(f"GRANT ALL ON mapping_view_{suffix} TO {writer}")
+    control_database.raw(f"GRANT EXECUTE ON FUNCTION map_it_{suffix}() TO {writer}")
+    url = login_url(control_database, writer)
+    values = f"SELECT '{unmapped}', oid, 'user-99' FROM pg_roles WHERE rolname = '{unmapped}'"
+    routes = (
+        f"INSERT INTO {LOGINS} (login, login_oid, principal) {values} "
+        "ON CONFLICT (login) DO UPDATE SET principal = EXCLUDED.principal",
+        f"INSERT INTO {LOGINS} (login, login_oid, principal) {values} "
+        f"ON CONFLICT (login) DO UPDATE SET removed_at = now()",
+        f"MERGE INTO {LOGINS} t USING (VALUES ('{mapped}')) v(login) ON t.login = v.login "
+        "WHEN MATCHED THEN UPDATE SET removed_at = now()",
+        f"INSERT INTO mapping_view_{suffix} (login, login_oid, principal) {values}",
+        f"UPDATE mapping_view_{suffix} SET removed_at = now()",
+        f"SELECT map_it_{suffix}()",
+    )
+
+    for statement in routes:
+        with pytest.raises(psycopg.Error, match="written only by the table owner"):
+            runner_as(url, statement)
+    with (
+        pytest.raises(psycopg.Error, match="written only by the table owner"),
+        psycopg.connect(url, autocommit=True) as connection,
+        connection.cursor().copy(f"COPY {LOGINS} (login, login_oid, principal) FROM STDIN") as copy,
+    ):
+        copy.write_row((unmapped, 1, "user-99"))
+    assert active_mappings(control_database) == [(mapped, "user-17", True)]
+
+
+async def test_a_guard_without_the_revision_marker_is_refused(
+    control_database: ControlDatabase,
+) -> None:
+    """0.1.0a7's guard carried no marker at all."""
+    if control_database.superuser_url is None:
+        pytest.skip("login binding exists only on Postgres")
+    login, url = approver_login(control_database)
+    bind_logins(control_database, (login, "user-17"))
+    name = f"{control_database.schema}.{LOGINS}_guard"
+    definition = control_database.raw(f"SELECT pg_get_functiondef('{name}()'::regprocedure)")[0][0]
+    control_database.raw(definition.replace("-- agent-core login mapping guard revision 2", ""))
+
+    with pytest.raises(ConfigError, match=r"login mapping guard .* is out of date"):
+        await approver_queue_at(control_database, url).side()
+
+
+async def test_a_mapping_trigger_that_fires_only_on_replicas_is_refused(
+    control_database: ControlDatabase,
+) -> None:
+    """ENABLE REPLICA never fires in a normal session, so it must not count as protection."""
+    if control_database.superuser_url is None:
+        pytest.skip("login binding exists only on Postgres")
+    login, url = approver_login(control_database)
+    bind_logins(control_database, (login, "user-17"))
+    control_database.raw(f"ALTER TABLE {LOGINS} ENABLE REPLICA TRIGGER {LOGINS}_guard")
+
+    with pytest.raises(ConfigError, match="missing or unprotected"):
+        await approver_queue_at(control_database, url).side()
+    bind_logins(control_database, on=True)  # the installer sets them to ALWAYS again
+    assert await approver_queue_at(control_database, url).side() is ApprovalSide.APPROVER
+
+
 async def test_a_queue_refuses_to_connect_as_a_pg_write_all_data_member(
     control_database: ControlDatabase,
 ) -> None:

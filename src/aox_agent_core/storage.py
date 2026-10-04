@@ -1131,7 +1131,9 @@ def bind_approver_login(
 ) -> None:
     """Map an approver login to the one principal id it may record as resolved_by.
 
-    Run as the owner role, never by the application. One login per principal and one
+    Run as the owner role, never by the application, and connected as the owner login
+    itself: the mapping guard refuses a session that reaches the owner through SET ROLE.
+    One login per principal and one
     principal per login, both ways, for ever: a mapping is ended with unbind_approver_login
     and neither the login nor the principal can be mapped again afterwards, so a later
     holder of the name cannot inherit the old one's decisions. The login must be a login
@@ -1194,8 +1196,9 @@ def unbind_approver_login(
 ) -> None:
     """End a login's mapping. Its login and principal can never be mapped again.
 
-    Run as the owner role. The row stays, with removed_at set. Raises ConfigError if the
-    login has no active mapping.
+    Run as the owner role, connected as the owner login itself (the mapping guard refuses a
+    session that reaches the owner through SET ROLE). The row stays, with removed_at set.
+    Raises ConfigError if the login has no active mapping.
     """
     _require_postgres_url(owner_url)
 
