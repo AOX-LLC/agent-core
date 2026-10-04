@@ -140,7 +140,7 @@ The role layout, the transition table and the setup are in [docs/upgrade-0.1.0a3
 - Postgres 16 or later is required; CI runs 16 and 17 only.
 - In a host's transaction (`connection=`), a queue call takes the request's row before the audit append lock, so a host that appends first and then calls the queue can be aborted by Postgres with `40P01`. Retry the transaction.
 - The database cannot force an audit event: with plain SQL a role can submit, decide, cancel, consume or purge without one.
-- Only the owner, connected as itself, can write the login mapping table (a guard on the table checks `session_user` and `current_user`, so a role with no grant, such as a member of `pg_write_all_data`, cannot). Members of `pg_read_all_data` can still read it. The owner role and superusers are trusted.
+- Writes to the login mapping table go through a guard that checks `session_user` and `current_user`, so a role with no grant, such as a member of `pg_write_all_data`, cannot write it. Members of `pg_read_all_data` can still read it. The owner role, its members and superusers are trusted: they can disable the guard.
 - Login binding is only as strong as each login's authentication.
 
 The full list, by release, is in [CHANGELOG.md](CHANGELOG.md).
