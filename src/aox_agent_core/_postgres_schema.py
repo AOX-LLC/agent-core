@@ -92,6 +92,11 @@ ROLES_TABLE: Final = "agent_core_approval_roles"
 LOGINS_TABLE: Final = "agent_core_approver_logins"
 LOGINS_TRIGGER: Final = "agent_core_approver_logins_guard"
 LOGINS_TRUNCATE_TRIGGER: Final = "agent_core_approver_logins_no_truncate"
+# Revision 2 (0.1.0): the guard refuses an INSERT or UPDATE unless session_user and
+# current_user are both the table's owner, so a role that reaches the table without a grant
+# (a member of pg_write_all_data) cannot map a login. Revision 1 shipped in 0.1.0a7.
+LOGINS_GUARD_REVISION: Final = 2
+LOGINS_GUARD_MARKER: Final = "-- agent-core login mapping guard revision"
 LOGINS_TRIGGERS: Final = frozenset({LOGINS_TRIGGER, LOGINS_TRUNCATE_TRIGGER})
 BOUND_PRINCIPAL_FUNCTION: Final = "agent_core_bound_principal"
 BINDING_MARKER: Final = "-- agent-core login binding"
@@ -349,9 +354,22 @@ def logins_ddl(schema: str, requester_role: str, approver_role: str) -> tuple[st
         )""",
         f"""CREATE OR REPLACE FUNCTION {quoted_schema}.{LOGINS_TABLE}_guard()
         RETURNS trigger LANGUAGE plpgsql SET search_path = pg_catalog, pg_temp AS $$
+        {LOGINS_GUARD_MARKER} {LOGINS_GUARD_REVISION}
         BEGIN
             IF TG_OP IN ('DELETE', 'TRUNCATE') THEN
                 RAISE EXCEPTION 'login mappings are never deleted; set removed_at to end one';
+            END IF;
+            -- Privileges do not decide this: a member of pg_write_all_data passes every
+            -- grant check. Only the owner, connected as itself, writes the table. This
+            -- function is not SECURITY DEFINER, so both names are the caller's.
+            -- Roles are matched by exact name in pg_roles. A ::regrole cast parses its text
+            -- as an identifier and folds case, so a login named "OWNER" would pass as owner.
+            IF (SELECT relowner FROM pg_class WHERE oid = TG_RELID)
+               IS DISTINCT FROM (SELECT oid FROM pg_roles WHERE rolname = session_user)
+               OR (SELECT relowner FROM pg_class WHERE oid = TG_RELID)
+               IS DISTINCT FROM (SELECT oid FROM pg_roles WHERE rolname = current_user) THEN
+                RAISE EXCEPTION
+                    'login mappings are written only by the table owner, connected as itself';
             END IF;
             IF TG_OP = 'INSERT' THEN
                 NEW.mapped_at := now();
@@ -372,8 +390,11 @@ def logins_ddl(schema: str, requester_role: str, approver_role: str) -> tuple[st
         FOR EACH ROW EXECUTE FUNCTION {quoted_schema}.{LOGINS_TABLE}_guard()""",
         f"""CREATE OR REPLACE TRIGGER {LOGINS_TRUNCATE_TRIGGER} BEFORE TRUNCATE ON {table}
         FOR EACH STATEMENT EXECUTE FUNCTION {quoted_schema}.{LOGINS_TABLE}_guard()""",
+        # ALWAYS: a session running with session_replication_role = replica must not skip them.
+        f"ALTER TABLE {table} ENABLE ALWAYS TRIGGER {LOGINS_TRIGGER}",
+        f"ALTER TABLE {table} ENABLE ALWAYS TRIGGER {LOGINS_TRUNCATE_TRIGGER}",
         f"REVOKE ALL ON {table} FROM PUBLIC",
-        # Table-level REVOKE also removes column grants.
+        # Table-level REVOKE also removes column grants the owner made, not another role's.
         f"REVOKE ALL ON {table} FROM {identifier(requester_role, what='role')}, {approver}",
         f"""CREATE OR REPLACE FUNCTION {function}() RETURNS text
         LANGUAGE sql STABLE SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $$
@@ -423,7 +444,6 @@ def approvals_guard_ddl(
         .replace("<revision>", str(GUARD_REVISION))
         .replace("<retention_floor>", str(int(payload_retention_floor_seconds)))
         .replace("<binding>", "on" if bind_logins else "off")
-        .replace("<bind_logins>", "true" if bind_logins else "false")
         .replace("<binding_check>", _binding_check(quoted_schema) if bind_logins else "")
     )
     return (
@@ -478,10 +498,10 @@ _GUARD_BODY = """
 -- agent-core guard revision <revision>
 -- agent-core payload retention floor <retention_floor> seconds
 -- agent-core login binding <binding>
+-- With binding on, a decision's resolved_by must be the principal the owner mapped to
+-- session_user (the login that authenticated, which SET ROLE does not change). The marker
+-- line above is what the library reads; nothing else in this function switches it.
 DECLARE
-    -- Login binding: with it on, a decision's resolved_by must be the principal the owner
-    -- mapped to session_user (the login that authenticated, which SET ROLE does not change).
-    bind_logins boolean := <bind_logins>;
     requester_role text := '<requester>';
     approver_role text := '<approver>';
     -- The shapes the library writes; rows of any other shape are refused, so
@@ -1043,7 +1063,7 @@ async def _require_login_mapping(
         row[0]
         for row in await session.execute(
             "SELECT tgname FROM pg_trigger "
-            "WHERE tgrelid = to_regclass(?) AND NOT tgisinternal AND tgenabled <> 'D'",
+            "WHERE tgrelid = to_regclass(?) AND NOT tgisinternal AND tgenabled = 'A'",
             (table,),
         )
     }
@@ -1055,6 +1075,20 @@ async def _require_login_mapping(
             "login with bind_approver_login."
         )
     await require_logins_made_by_owner(session, schema)
+    # The function the trigger really calls, not whatever carries the guard's name.
+    guard_rows = await session.execute(
+        "SELECT p.prosrc FROM pg_trigger t JOIN pg_proc p ON p.oid = t.tgfoid "
+        "WHERE t.tgrelid = to_regclass(?) AND t.tgname = ?",
+        (table, LOGINS_TRIGGER),
+    )
+    guard_source = guard_rows[0][0] if guard_rows else ""
+    found = re.search(rf"{re.escape(LOGINS_GUARD_MARKER)} (\d+)", guard_source)
+    if found is None or int(found[1]) < LOGINS_GUARD_REVISION:
+        raise ConfigError(
+            f"The login mapping guard in {schema} is out of date: it does not yet refuse a "
+            "write by a role that reaches the table without a grant, such as a member of "
+            "pg_write_all_data. As the owner role, run install_postgres_schema from 0.1.0."
+        )
     roles = [requester_role, approver_role] + [
         row[0] for row in await session.execute(_CONNECTING_ROLES)
     ]
@@ -1079,10 +1113,14 @@ async def _require_login_mapping(
 
 
 _LOGINS_ACL_SQL = """
-SELECT g.grantee::regrole::text FROM pg_class c, aclexplode(c.relacl) g
+SELECT CASE g.grantee WHEN 0 THEN 'PUBLIC' ELSE g.grantee::regrole::text END,
+       g.grantor::regrole::text
+FROM pg_class c, aclexplode(c.relacl) g
 WHERE c.oid = to_regclass(?) AND g.grantee <> c.relowner
 UNION ALL
-SELECT g.grantee::regrole::text FROM pg_attribute a, aclexplode(a.attacl) g, pg_class c
+SELECT CASE g.grantee WHEN 0 THEN 'PUBLIC' ELSE g.grantee::regrole::text END,
+       g.grantor::regrole::text
+FROM pg_attribute a, aclexplode(a.attacl) g, pg_class c
 WHERE a.attrelid = to_regclass(?) AND c.oid = a.attrelid AND a.attnum > 0
   AND NOT a.attisdropped AND g.grantee <> c.relowner
 """
@@ -1117,12 +1155,14 @@ async def require_logins_made_by_owner(session: "Session", schema: str) -> None:
             "search_path. Another role may have created them first. As the owner role, drop "
             "them and run install_postgres_schema again."
         )
-    grantees = [row[0] for row in await session.execute(_LOGINS_ACL_SQL, (table, table))]
-    if grantees:
+    grants = [(row[0], row[1]) for row in await session.execute(_LOGINS_ACL_SQL, (table, table))]
+    if grants:
+        grantees = ", ".join(sorted({grantee for grantee, _ in grants}))
+        grantors = ", ".join(sorted({grantor for _, grantor in grants}))
         raise ConfigError(
-            f"{', '.join(sorted(set(grantees)))} holds a privilege on the login mapping table in "
-            f"{schema}, directly, by column or by default privileges. Only the owner may. As the "
-            "owner role, REVOKE ALL on it from them."
+            f"{grantees} holds a privilege on the login mapping table in {schema}, directly, by "
+            f"column or by default privileges. Only the owner may. Revoke it as the role that "
+            f"granted it ({grantors}): the owner's REVOKE removes only the owner's own grants."
         )
 
 

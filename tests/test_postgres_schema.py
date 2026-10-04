@@ -73,20 +73,28 @@ def stamp(moment: datetime) -> str:
     return moment.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
 
 
-NOW = datetime.now(UTC)
-COLUMNS_FOR_STATE: dict[str, dict[str, str | None]] = {
-    "pending": {},
-    "approved": {"decision": "approve", "resolved_by": "user-17", "resolved_at": stamp(NOW)},
-    "rejected": {"decision": "reject", "resolved_by": "user-17", "resolved_at": stamp(NOW)},
-    "consumed": {
-        "decision": "approve",
-        "resolved_by": "user-17",
-        "resolved_at": stamp(NOW),
-        "consumed_at": stamp(NOW),
-    },
-    "cancelled": {"closed_at": stamp(NOW)},
-    "expired": {"closed_at": stamp(NOW)},
-}
+def now() -> datetime:
+    """The clock when asked, never at import: the guard accepts a decision time only within
+    five minutes of the database's clock, and a full run lasts longer than that."""
+    return datetime.now(UTC)
+
+
+def columns_for_state(status: str) -> dict[str, str | None]:
+    moment = stamp(now())
+    by_state: dict[str, dict[str, str | None]] = {
+        "pending": {},
+        "approved": {"decision": "approve", "resolved_by": "user-17", "resolved_at": moment},
+        "rejected": {"decision": "reject", "resolved_by": "user-17", "resolved_at": moment},
+        "consumed": {
+            "decision": "approve",
+            "resolved_by": "user-17",
+            "resolved_at": moment,
+            "consumed_at": moment,
+        },
+        "cancelled": {"closed_at": moment},
+        "expired": {"closed_at": moment},
+    }
+    return by_state[status]
 
 
 def literal(value: str | None) -> str:
@@ -96,7 +104,7 @@ def literal(value: str | None) -> str:
 def planted(database: ControlDatabase, status: str, *, expired: bool = False) -> str:
     """A request in `status`, written past the guard as a superuser replicating rows."""
     request_id = str(uuid4())
-    created = NOW - timedelta(hours=3 if expired else 0)
+    created = now() - timedelta(hours=3 if expired else 0)
     expires = created + timedelta(hours=1)
     columns = {
         "id": request_id,
@@ -109,7 +117,7 @@ def planted(database: ControlDatabase, status: str, *, expired: bool = False) ->
         "created_at": stamp(created),
         "expires_at": stamp(expires),
         "status": status,
-        **COLUMNS_FOR_STATE[status],
+        **columns_for_state(status),
     }
     database.superuser_raw(
         "SET session_replication_role = replica; "
@@ -142,11 +150,11 @@ def as_role(database: ControlDatabase, role: str) -> Raw:
 
 def transition_sql(request_id: str, to: str, *, status_only: bool) -> str:
     extra: dict[str, dict[str, str | None]] = {
-        "approved": COLUMNS_FOR_STATE["approved"],
-        "rejected": COLUMNS_FOR_STATE["rejected"],
-        "consumed": {"consumed_at": stamp(NOW)},
-        "cancelled": {"closed_at": stamp(NOW)},
-        "expired": {"closed_at": stamp(NOW)},
+        "approved": columns_for_state("approved"),
+        "rejected": columns_for_state("rejected"),
+        "consumed": {"consumed_at": stamp(now())},
+        "cancelled": {"closed_at": stamp(now())},
+        "expired": {"closed_at": stamp(now())},
         "pending": {},
     }
     changes: dict[str, str | None] = {"status": to}
@@ -207,7 +215,7 @@ def test_an_approver_cannot_approve_on_the_requesters_behalf(pg: ControlDatabase
     assert refused(
         pg.approver_raw,
         "UPDATE agent_core_approvals SET status = 'approved', decision = 'approve', "
-        f"resolved_by = 'agent-intake', resolved_at = '{stamp(NOW)}' WHERE id = '{request_id}'",
+        f"resolved_by = 'agent-intake', resolved_at = '{stamp(now())}' WHERE id = '{request_id}'",
     )
 
 
@@ -255,8 +263,8 @@ def test_the_requester_role_cannot_approve_by_any_route(pg: ControlDatabase, att
     sql = attack.format(
         id=request_id,
         new=uuid4(),
-        now=stamp(NOW),
-        later=stamp(NOW + timedelta(hours=1)),
+        now=stamp(now()),
+        later=stamp(now() + timedelta(hours=1)),
         hash="a" * 64,
     )
 
@@ -284,10 +292,10 @@ def test_a_new_request_must_be_pending_short_lived_and_not_future_dated(
             ),
         )
 
-    assert not insert(NOW, NOW + timedelta(hours=1))
-    assert insert(NOW, NOW + timedelta(days=8))
-    assert insert(NOW, NOW - timedelta(seconds=1))
-    assert insert(NOW + timedelta(hours=1), NOW + timedelta(hours=2))
+    assert not insert(now(), now() + timedelta(hours=1))
+    assert insert(now(), now() + timedelta(days=8))
+    assert insert(now(), now() - timedelta(seconds=1))
+    assert insert(now() + timedelta(hours=1), now() + timedelta(hours=2))
 
 
 # The approver role
@@ -317,8 +325,8 @@ def test_the_approver_role_can_only_decide(pg: ControlDatabase, attack: str) -> 
         pending=pending,
         approved=approved,
         new=uuid4(),
-        now=stamp(NOW),
-        later=stamp(NOW + timedelta(hours=1)),
+        now=stamp(now()),
+        later=stamp(now() + timedelta(hours=1)),
         other="b" * 64,
     )
 
@@ -337,7 +345,7 @@ def test_no_update_changes_what_was_requested_even_with_a_broad_grant(
         "GRANT SELECT, UPDATE ON agent_core_approvals TO {role}",
     )
     request_id = planted(pg, "pending")
-    value = {"created_at": stamp(NOW - timedelta(minutes=1)), "expires_at": stamp(NOW)}.get(
+    value = {"created_at": stamp(now() - timedelta(minutes=1)), "expires_at": stamp(now())}.get(
         column, "changed"
     )
 
@@ -347,7 +355,7 @@ def test_no_update_changes_what_was_requested_even_with_a_broad_grant(
     ):
         connection.execute(
             f"UPDATE agent_core_approvals SET status = 'approved', decision = 'approve', "
-            f"resolved_by = 'user-17', resolved_at = '{stamp(NOW)}', "
+            f"resolved_by = 'user-17', resolved_at = '{stamp(now())}', "
             f"{column} = {literal(value)} WHERE id = '{request_id}'"
         )
 
@@ -391,7 +399,7 @@ def test_the_database_records_who_wrote_each_audit_row(pg: ControlDatabase) -> N
     pg.requester_raw(
         "INSERT INTO agent_core_audit (seq, schema_version, event_id, occurred_at, action, "
         "actor_id, payload, prev_hash, record_hash, db_role, db_login) VALUES (1, 4, "
-        f"'{uuid4()}', '{stamp(NOW)}', 'approval.resolved', 'user-17', '{{}}', '{'0' * 64}', "
+        f"'{uuid4()}', '{stamp(now())}', 'approval.resolved', 'user-17', '{{}}', '{'0' * 64}', "
         f"'{'0' * 64}', '{APPROVER_ROLE}', '{APPROVER_ROLE}')"
     )
 
@@ -513,7 +521,7 @@ def test_a_non_default_schema_holds_everything() -> None:
         assert database.approver_raw is not None
         database.approver_raw(
             "UPDATE tenant_a.agent_core_approvals SET status = 'approved', decision = 'approve', "
-            f"resolved_by = 'user-17', resolved_at = '{stamp(NOW)}' WHERE id = '{request_id}'"
+            f"resolved_by = 'user-17', resolved_at = '{stamp(now())}' WHERE id = '{request_id}'"
         )
         assert status_of(database, request_id) == "approved"
 
@@ -534,7 +542,7 @@ def a2_audit_record() -> AuditRecord:
         schema_version=2,
         seq=1,
         event_id=uuid4(),
-        occurred_at=NOW,
+        occurred_at=now(),
         action="model.call",
         actor_id="svc-triage",
         subject_id=None,
@@ -560,13 +568,14 @@ async def test_an_a2_schema_is_upgraded_in_place() -> None:
         assert database.legacy_raw is not None
         load_a2_schema(database)
         legacy_id = str(uuid4())
+        moment = now()  # once: the installer's reason quotes the decision time
         # What a2 allowed: the app role writes an approved row with plain SQL.
         database.legacy_raw(
             "INSERT INTO agent_core_approvals (id, action, summary, payload_sha256, requested_by, "
             "required_role, created_at, expires_at, status, decision, resolved_by, resolved_at) "
             f"VALUES ('{legacy_id}', 'crm.update_contact', 's', '{'a' * 64}', 'agent-intake', "
-            f"'ops.approver', '{stamp(NOW)}', '{stamp(NOW + timedelta(hours=1))}', 'approved', "
-            f"'approve', 'user-17', '{stamp(NOW)}')"
+            f"'ops.approver', '{stamp(moment)}', '{stamp(moment + timedelta(hours=1))}', "
+            f"'approved', 'approve', 'user-17', '{stamp(moment)}')"
         )
 
         legacy_record = a2_audit_record()
@@ -640,7 +649,7 @@ async def test_an_a2_schema_is_upgraded_in_place() -> None:
         database.requester_raw(
             "INSERT INTO agent_core_audit (seq, schema_version, event_id, occurred_at, action, "
             "actor_id, subject_id, payload, prev_hash, record_hash) VALUES "
-            f"({next_seq}, 4, '{uuid4()}', '{stamp(NOW)}', 'approval.resolved', 'user-17', "
+            f"({next_seq}, 4, '{uuid4()}', '{stamp(now())}', 'approval.resolved', 'user-17', "
             f'\'{legacy_id}\', \'{{"approval_action":"crm.update_contact","decision":'
             f"\"approve\"}}', '{head_hash}', '{'0' * 64}')"
         )
@@ -659,7 +668,7 @@ async def test_an_a2_schema_is_upgraded_in_place() -> None:
             f"SELECT reason FROM agent_core_approvals WHERE id = '{legacy_id}'"
         ) == [
             (
-                f"Cancelled by install_postgres_schema: approved by user-17 at {stamp(NOW)}, "
+                f"Cancelled by install_postgres_schema: approved by user-17 at {stamp(moment)}, "
                 "with no approval.resolved audit event from the approver side.",
             )
         ]
@@ -685,8 +694,8 @@ def insert_sql(**overrides: str) -> str:
         "payload_sha256": f"'{'a' * 64}'",
         "requested_by": "'agent-intake'",
         "required_role": "'ops.approver'",
-        "created_at": f"'{stamp(NOW)}'",
-        "expires_at": f"'{stamp(NOW + timedelta(hours=1))}'",
+        "created_at": f"'{stamp(now())}'",
+        "expires_at": f"'{stamp(now() + timedelta(hours=1))}'",
         "status": "'pending'",
         **overrides,
     }
@@ -699,7 +708,7 @@ def insert_sql(**overrides: str) -> str:
 @pytest.mark.parametrize(
     "overrides",
     [
-        {"created_at": f"'{NOW:%Y-%m-%d %H:%M:%S}'"},
+        {"created_at": f"'{now():%Y-%m-%d %H:%M:%S}'"},
         {"expires_at": "'infinity'"},
         {"id": "'not-a-uuid'"},
         {"action": "'Not An Action'"},
@@ -713,9 +722,9 @@ def insert_sql(**overrides: str) -> str:
         {"run_context": '\'{"run_id": "r1", "extra": 1}\''},
         {"run_context": '\'{"run_id": "r1", "external_ids": {"Bad": "x"}}\''},
         {"run_context": "'[1]'"},
-        {"expires_at": f"'{(NOW + timedelta(days=1)):%Y-%m-%d}T24:00:00.000000Z'"},
-        {"expires_at": f"'{(NOW + timedelta(days=1)):%Y-%m-%d}T23:59:60.000000Z'"},
-        {"expires_at": f"'{NOW.year + 1}-02-30T00:00:00.000000Z'"},
+        {"expires_at": f"'{(now() + timedelta(days=1)):%Y-%m-%d}T24:00:00.000000Z'"},
+        {"expires_at": f"'{(now() + timedelta(days=1)):%Y-%m-%d}T23:59:60.000000Z'"},
+        {"expires_at": f"'{now().year + 1}-02-30T00:00:00.000000Z'"},
     ],
     ids=[
         "created-at-local-time",
@@ -749,7 +758,7 @@ def test_the_guard_refuses_rows_of_the_wrong_shape(
 def test_a_session_time_zone_cannot_stretch_a_lifetime(pg: ControlDatabase) -> None:
     # Without an offset, a timestamp would be read in the session's time zone.
     assert pg.requester_raw is not None
-    local = (NOW + timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%S.%f")
+    local = (now() + timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%S.%f")
 
     assert refused(
         pg.requester_raw,
@@ -773,7 +782,7 @@ def test_a_decision_of_the_wrong_shape_is_refused(pg: ControlDatabase, assignmen
     sql = (
         "UPDATE agent_core_approvals SET status = 'approved', decision = 'approve', "
         + ("resolved_by = 'user-17', " if "resolved_by" not in assignments else "")
-        + assignments.format(now=stamp(NOW), day=f"{NOW:%Y-%m-%d}")
+        + assignments.format(now=stamp(now()), day=f"{now():%Y-%m-%d}")
         + f" WHERE id = '{request_id}'"
     )
 
@@ -789,7 +798,7 @@ def test_a_row_with_an_overlong_lifetime_can_be_neither_decided_nor_used(
     pending = planted(pg, "pending")
     pg.superuser_raw(
         "SET session_replication_role = replica; UPDATE agent_core_approvals "
-        f"SET expires_at = '{stamp(NOW + timedelta(days=3650))}'"
+        f"SET expires_at = '{stamp(now() + timedelta(days=3650))}'"
     )
     assert pg.requester_raw is not None
     assert pg.approver_raw is not None
@@ -811,7 +820,7 @@ def test_closing_is_refused_when_the_audit_log_lives_elsewhere(
         pg.requester_raw(
             "INSERT INTO agent_core_audit (seq, schema_version, event_id, occurred_at, action, "
             "actor_id, subject_id, payload, prev_hash, record_hash) VALUES "
-            f"(1, 4, '{uuid4()}', '{stamp(NOW)}', 'approval.resolved', 'user-17', "
+            f"(1, 4, '{uuid4()}', '{stamp(now())}', 'approval.resolved', 'user-17', "
             f"'{uuid4()}', '{{}}', '{'0' * 64}', '{'0' * 64}')"
         )
 

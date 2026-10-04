@@ -1,3 +1,32 @@
+# Upgrading from 0.1.0a6 or 0.1.0a7 to 0.1.0
+
+Release 0.1.0 follows 0.1.0a7. The sections below, newest first, describe each earlier step.
+
+**From 0.1.0a7: change the tag, then run the installer once.** One schema object changed: the login mapping table's guard function (revision 2) now refuses an INSERT or UPDATE unless `session_user` and `current_user` are both the table's owner. In 0.1.0a7 a member of the built-in `pg_write_all_data` role could write the mapping with no grant. The audit schema (version 4), the approvals guard (same revision, 7, and same behaviour), the audit insert trigger (revision 6), the table layouts and the recording format (2) are the same. The installer also now sets the mapping table's two triggers to fire always, so a session running with `session_replication_role = replica` cannot skip them.
+
+1. Install 0.1.0.
+2. As the owner role, run `install_postgres_schema` with the same requester and approver roles. It is idempotent and replaces the guard function; no data or configuration changes. Do it for every Postgres deployment. With login binding on, a 0.1.0 queue refuses the a7 guard with a `ConfigError` until you have. With binding off nothing checks, but the `pg_write_all_data` gap stays until you do.
+3. **Check the mappings written while 0.1.0a7 ran.** Re-running the installer stops new writes; it does not remove a mapping a `pg_write_all_data` member wrote earlier, and the table records no author. List the active rows (`SELECT login, principal, mapped_at FROM agent_core_approver_logins WHERE removed_at IS NULL`), compare each with the mapping you intended, and for anything unexpected run `unbind_approver_login` and map the login again under a new principal id (a principal can never be reused).
+4. Start the 0.1.0 processes. On SQLite there is nothing to do.
+
+`bind_approver_login` and `unbind_approver_login` must now connect as the owner login itself: a session that reaches the owner through `SET ROLE` is refused by the guard, as is a data restore run as a superuser unless it disables triggers.
+
+Not verified: the installer step under load, and an a7 process against the new guard.
+
+**From 0.1.0a6: do the 0.1.0a7 steps.** One installer run does both the a7 change and the 0.1.0 guard revision:
+
+1. Stop every 0.1.0a6 process. One that keeps running writes audit schema version 3, which the new insert trigger refuses.
+2. As the owner role, run `install_postgres_schema` from 0.1.0 with the same requester and approver roles. This installs guard revision 7, audit insert trigger revision 6, the audit column `db_login` and the login mapping table with its guard (revision 2). Do it for every Postgres deployment, whether or not you use login binding; an 0.1.0 queue refuses an a6 schema with a `ConfigError` until you have.
+3. Start the 0.1.0 processes. On SQLite there is nothing to do: the `db_login` column is added in place on first use.
+
+The steps in full, including how to turn login binding on, are in "Operators (0.1.0a7)" below. From 0.1.0a4 or earlier, go through the a6 section and the sections after it first.
+
+Login binding stays off unless the operator turns it on. If you turn it on, `db_login` and the mapping table are append-only, so use pseudonymous database login names.
+
+What was not verified for this step: a reinstall on a large or busy database, an a6 process against an a7 or 0.1.0 schema, a pooler, and Postgres versions other than 16 and 17 (see "What is not verified (0.1.0a7)").
+
+---
+
 # Upgrading from 0.1.0a6 to 0.1.0a7
 
 Release 0.1.0a7 follows 0.1.0a6. (0.1.0a5 was tagged but never released; the upgrade from 0.1.0a4 is described further down.) It adds three things and one operator step. The audit table records the login that wrote a row (`db_login`). The approvals guard can bind `resolved_by` to the database login that decides a request; this is off unless the operator turns it on. `wait_for_decision` waits for a request to leave `pending`. `SQLAuditLog.verify_report` lists every problem in a chain instead of stopping at the first.
@@ -72,7 +101,7 @@ This part of the page has an operator section, one for project 03 (its own backe
    - `login` is the primary key, `principal` is unique and `login_oid` is unique. The OID is the role's OID when it was mapped, so a role dropped and recreated under the same name inherits nothing, and a rename cannot move a mapping.
    - Rows are never deleted: a trigger refuses DELETE and TRUNCATE. A mapping ends only when `removed_at` is set, once.
    - Both uniques cover removed rows. In practice a login or a principal is never reused after removal: to bring a person back, create a new role under a new name and map it to a new principal id.
-   - Only the owner can touch the table. The installer revokes everything on it (table and column privileges) from the requester and approver roles, and a queue refuses to start if any other role holds a privilege on it, or if the table or the function was made by a role other than the approvals table's owner. The guard reads it through a SECURITY DEFINER function, `agent_core_bound_principal()`, with its `search_path` pinned and EXECUTE granted only to the approver role. The function returns only the connecting login's own principal.
+   - Writes to the table go through a guard that refuses an INSERT or UPDATE unless `session_user` and `current_user` are both the owner (guard revision 2, 0.1.0; 0.1.0a7 checked grants only, so a member of `pg_write_all_data` could write it). The owner role, its members and superusers are trusted: they can disable the guard. The installer revokes the owner's own grants on it (table and column privileges) from the requester and approver roles, and a queue refuses to start if any other role holds an ACL privilege on it (the error names the grantor to revoke as), or if the table or the function was made by a role other than the approvals table's owner. Members of `pg_read_all_data` can still read it. The guard reads it through a SECURITY DEFINER function, `agent_core_bound_principal()`, with its `search_path` pinned and EXECUTE granted only to the approver role. The function returns only the connecting login's own principal.
 
 7. **What a queue checks when binding is on.** `SQLApprovalQueue` raises `ConfigError` (from `side()` or the first call) if the mapping table, the lookup function or the table's triggers are missing; if the requester role, the approver role or any role the connection can switch to can write the mapping table; or, on the approver side only, if the connecting login has no active mapping (the message names the login). `resolve` compares `principal.id` with the mapped principal before it writes and raises `NotAuthorizedToResolveError`, audited as `approval.resolve_denied` with the new `DenialReason.LOGIN_BINDING` (`"login_binding"`). That check is a courtesy for a clear error: the guard is the enforcement, and it also refuses plain SQL.
 
