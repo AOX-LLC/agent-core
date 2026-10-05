@@ -1,5 +1,46 @@
 # agent-core
 
+[![CI](https://github.com/AOX-LLC/agent-core/actions/workflows/ci.yml/badge.svg)](https://github.com/AOX-LLC/agent-core/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-blue.svg)
+
+Model-driven work needs the same plumbing every time: routed calls with a cost budget, validated outputs, traces with tokens and cost, a way to run and test with no API key, a human approval step for agent actions, and an audit log with a verifiable hash chain. agent-core is that plumbing as one small Python library, installed by git tag. On Postgres, once the owner role has installed the schema, the database refuses an approval from the agent's role. The example below runs on a throwaway SQLite file with no key and no Docker, where the library's own checks are all there is.
+
+```sh
+pip install "aox-agent-core @ git+https://github.com/AOX-LLC/agent-core@v0.1.0"
+```
+
+![A terminal running examples/approval_flow.py in replay mode: a traced call with its cost, an approval refusing an agent and a second use, and the audit log verifying](docs/media/approval-flow.gif)
+
+The output of `uv run --extra otel python examples/approval_flow.py` in replay mode (a recorded call, so no key; ids differ per run). It shows the traced call and its cost, the approval refusing an agent and a second use, and the audit log verifying. [MP4 of the same run](docs/media/approval-flow.mp4).
+
+```text
+invoice: INV-1042 from Northwind Paper Supply, total 244.08
+trace id: 7733bb5ed8d91babb8241f85e8de4ad0
+span: agent_core.model_call
+  agent_core.prompt.id = invoices.extract
+  agent_core.tier = small
+  agent_core.mode = replay
+  agent_core.run_id = example-run-1
+cost: $0.002364
+
+Approval:
+submitted by agent-extract: pending
+refused, as it should be: Request 18840830-231b-4b48-bf7d-39b1adcf4b57 cannot be resolved: not_human.
+resolved by user-21: approved
+consumed by agent-extract: consumed
+second use refused: Request 18840830-231b-4b48-bf7d-39b1adcf4b57 is consumed.
+
+Audit log:
+   1  model.call               agent-extract
+   2  approval.requested       agent-extract
+   3  approval.resolve_denied  agent-extract (not_human)
+   4  approval.resolved        user-21
+   5  approval.consumed        agent-extract
+   6  approval.consume_denied  agent-extract (not_open)
+audit log verified: 6 records, head seq 6
+```
+
 agent-core is a Python library for routed Claude model calls, structured outputs, tracing with cost, human approvals, an append-only audit log, and evals. Models are chosen by cost tier. A record/replay mode lets a project run and test with no API key. Projects install it by git tag.
 
 - **Model calls:** cost-based tiers, structured outputs with retries, versioned prompts (`PromptRef`), PNG, JPEG and PDF attachments, a per-call budget, and OpenTelemetry spans with token and cost attributes.

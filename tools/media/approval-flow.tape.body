@@ -1,0 +1,12 @@
+# Clip: approval_flow.py in replay mode. Real output, no key, no model call, no Docker.
+Hide
+Type "bash --noprofile --norc" Enter
+Type "export PS1='$ ' && cd @REPO@" Enter
+Type "export UV_NO_PROGRESS=1 PYTHONWARNINGS=ignore && unset VIRTUAL_ENV" Enter
+Type "clear" Enter
+Sleep 300ms
+Show
+Sleep 800ms
+Type "uv run --extra otel python examples/approval_flow.py" Sleep 600ms Enter
+Wait+Screen@120s /audit log verified/
+Sleep 14s

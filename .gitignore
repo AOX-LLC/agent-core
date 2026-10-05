@@ -49,3 +49,6 @@ CLAUDE.local.md
 
 # Local SQLite databases (audit logs, demos)
 *.sqlite3
+
+# Local media-check term list; never commit
+.denylist.local
