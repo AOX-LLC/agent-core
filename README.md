@@ -10,7 +10,11 @@ Model-driven work needs the same plumbing every time: routed calls with a cost b
 pip install "aox-agent-core @ git+https://github.com/AOX-LLC/agent-core@v0.1.0"
 ```
 
-![A terminal running examples/approval_flow.py in replay mode: a traced call with its cost, an approval refusing an agent and a second use, and the audit log verifying](docs/media/approval-flow.gif)
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/media/approval-flow-dark.gif">
+  <source media="(prefers-color-scheme: light)" srcset="docs/media/approval-flow-light.gif">
+  <img src="docs/media/approval-flow.gif" alt="A terminal running examples/approval_flow.py in replay mode: a traced call with its cost, an approval refusing an agent and a second use, and the audit log verifying">
+</picture>
 
 The output of `uv run --extra otel python examples/approval_flow.py` in replay mode (a recorded call, so no key; ids differ per run). It shows the traced call and its cost, the approval refusing an agent and a second use, and the audit log verifying. [MP4 of the same run](docs/media/approval-flow.mp4).
 
@@ -39,6 +43,20 @@ Audit log:
    5  approval.consumed        agent-extract
    6  approval.consume_denied  agent-extract (not_open)
 audit log verified: 6 records, head seq 6
+```
+
+The triage eval (`uv run python evals/run_triage_eval.py`, replay mode, 10 synthetic tickets) prints this scorecard:
+
+```markdown
+## Eval scorecard: triage
+
+Mode: replay. Responses came from recordings, so no latency is reported; costs are what the recorded calls cost.
+
+| Cases | Passed | Accuracy | p50 latency | p95 latency | Total cost | Cost per case |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 10 | 10 | 100.0% | n/a | n/a | $0.004791 | $0.000479 |
+
+No failed cases.
 ```
 
 agent-core is a Python library for routed Claude model calls, structured outputs, tracing with cost, human approvals, an append-only audit log, and evals. Models are chosen by cost tier. A record/replay mode lets a project run and test with no API key. Projects install it by git tag.
@@ -217,4 +235,4 @@ Releases are git tags: `vX.Y.Z` for releases and `vX.Y.ZaN` for pre-releases. Se
 
 ## License
 
-MIT. See [LICENSE](LICENSE).
+MIT. See [LICENSE](LICENSE). Fonts in the media and the synthetic-data statement are in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
