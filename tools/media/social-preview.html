@@ -1,0 +1,23 @@
+<!doctype html>
+<meta charset="utf-8">
+<style>
+  html, body { margin: 0; }
+  body { width: 1280px; height: 640px; box-sizing: border-box; padding: 64px 72px; background: #0e1012; color: #e6e8ea;
+         font-family: "DejaVu Sans", sans-serif; display: flex; flex-direction: column; justify-content: space-between; }
+  h1 { margin: 0; font-size: 84px; letter-spacing: -1px; }
+  h1 span { color: #3fc1b0; }
+  p { margin: 18px 0 0; font-size: 31px; line-height: 1.35; color: #c3c8cd; max-width: 1000px; }
+  pre { margin: 0; padding: 22px 28px; background: #15181b; border-left: 4px solid #3fc1b0; border-radius: 4px;
+        font: 22px/1.45 "DejaVu Sans Mono", monospace; color: #e6e8ea; }
+  .dim { color: #6b747d; }
+  .ok { color: #6ed79c; }
+  .no { color: #f58a96; }
+</style>
+<div>
+  <h1>agent-<span>core</span></h1>
+  <p>Routed Claude calls with cost traces, human approvals an agent cannot bypass, and an audit log that verifies.</p>
+</div>
+<pre><span class="dim">  3  approval.resolve_denied  agent-extract</span> <span class="no">(not_human)</span>
+<span class="dim">  4  approval.resolved        user-21</span>
+<span class="dim">  6  approval.consume_denied  agent-extract</span> <span class="no">(not_open)</span>
+<span class="ok">audit log verified: 6 records, head seq 6</span></pre>
