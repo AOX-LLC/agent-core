@@ -1,6 +1,6 @@
 """Check media files for anything that could carry a name outside the picture or the sound.
 
-The public-safety hook reads text and skips binary media, because a short term matches the
+A text scan skips binary media, because a short term matches the
 compressed bytes of a picture or a video by chance. What can carry a name in a media file is
 everything that is not pixels or samples, so this allows only known-safe structure and fails on
 the rest:

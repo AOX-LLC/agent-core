@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 # Render the approval_flow terminal clip: tools/media/render.sh
+# The social preview is tools/media/social-preview.html shot at 1280x640 (chromium --headless --screenshot), then stripped and checked the same way.
 # Needs vhs, ttyd (on PATH or in $TOOLS_BIN), ffmpeg and ffprobe. Writes docs/media/approval-flow.{gif,mp4},
 # then strips and checks their metadata. The repo path appears only inside the hidden block of the tape body.
 set -euo pipefail
@@ -29,10 +30,14 @@ mkdir -p "$out"
   sed "s|@REPO@|$repo|g" "$here/$clip.tape.body"
 } > "$work/$clip.tape"
 
+# Run the command once off screen first: abort if its output would put a path or user name in the frame.
+dry=$(cd "$repo" && env -u VIRTUAL_ENV UV_NO_PROGRESS=1 PYTHONWARNINGS=ignore uv run --extra otel python examples/approval_flow.py 2>&1)
+if grep -q -F -e "$repo" -e "$HOME" -e "$USER" <<<"$dry"; then echo "output contains a path or user name; not recording" >&2; exit 1; fi
+
 (cd "$repo" && vhs "$work/$clip.tape")
 
 ffmpeg -v error -y -i "$work/$clip.webm" -vf "fps=30,format=yuv420p" \
-  -c:v libx264 -crf 27 -preset slow -movflags +faststart -an "$out/$clip.mp4"
+  -c:v libx264 -crf 27 -preset slow -movflags +faststart -an -bsf:v filter_units=remove_types=6 "$out/$clip.mp4"
 # GIF: 900 px wide, palette method; halve the frame rate once if it lands over 3 MB.
 for fps in 15 10; do
   ffmpeg -v error -y -i "$work/$clip.webm" \
